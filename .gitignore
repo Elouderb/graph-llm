@@ -1,0 +1,40 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.pyo
+
+# Data & checkpoints (downloaded/generated at runtime).
+# Anchored to the repo root so they do NOT match the source package
+# src/graph_llm/data/ — an unanchored "data/" would exclude it from the repo.
+/data/
+/checkpoints/
+
+# Experiment tracking
+wandb/
+runs/
+*.log
+
+# Test cache
+.pytest_cache/
+.ruff_cache/
+
+# Generated code-graph artifacts (produced by `graphify update .`, not source)
+graphify-out/
+
+# Pyright
+pyrightconfig.json
+.pyright/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

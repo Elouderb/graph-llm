@@ -1,0 +1,36 @@
+# Smoke config — runs on CPU in well under 1 minute.
+# Tiny vocab/depth/width/seq_len intentionally.
+
+model:
+  name: transformer
+  vocab_size: 256          # byte-level
+  d_model: 64
+  n_heads: 4
+  n_layers: 2
+  d_ff: 256
+  max_seq_len: 64
+  dropout: 0.0
+  tie_embeddings: true
+  use_rope: true
+  activation_checkpointing: false
+
+data:
+  source: synthetic        # "synthetic" | "enwik8" | "tinystories"
+  data_dir: data/
+  seq_len: 64
+  batch_size: 4
+  val_fraction: 0.1
+
+train:
+  seed: 42
+  max_steps: 10
+  grad_accumulation_steps: 1
+  grad_clip: 1.0
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 2
+  lr_schedule: cosine      # "cosine" | "constant"
+  mixed_precision: "no"    # "no" | "fp16" | "bf16" (CPU only supports "no")
+  checkpoint_dir: checkpoints/
+  resume_from: null
+  log_every: 1

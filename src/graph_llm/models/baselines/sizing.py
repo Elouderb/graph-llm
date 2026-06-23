@@ -54,13 +54,15 @@ def count_params_for_config(cfg: Config) -> int:
 
 
 def _round_d_model(d_model: int, n_heads: int) -> int:
-    """Round *d_model* to the nearest positive multiple of *n_heads*.
+    """Round *d_model* to the nearest positive multiple of ``2 * n_heads``.
 
-    The Transformer baseline asserts ``d_model % n_heads == 0``; keeping the
-    width on that grid means every candidate the search proposes is buildable.
+    The Transformer baseline asserts ``d_model % n_heads == 0``, AND its RoPE
+    needs an EVEN head_dim (= d_model / n_heads) because it rotates dimension
+    pairs. Snapping to a multiple of ``2 * n_heads`` guarantees both, so every
+    candidate the search proposes is buildable (an odd head_dim crashes RoPE).
     """
-    d_model = max(n_heads, round(d_model / n_heads) * n_heads)
-    return d_model
+    step = 2 * n_heads
+    return max(step, round(d_model / step) * step)
 
 
 def _best_width_for_depth(

@@ -73,6 +73,25 @@ class ModelConfig:
     materialized_reduce_dim: int = 32
     materialized_cnn_channels: int = 32  # 2-D CNN hidden channels over the interaction map
 
+    # --- Gated-DeltaNet delta-rule matrix memory hyperparameters (card e2c6ea95) ---
+    # Ignored by the baselines + bilinear_lm; consumed by
+    # models/components/delta_memory.py and models/delta_memory_lm.py.  The memory
+    # is a fixed-size per-head matrix S of shape (d_k, d_v) updated by a delta rule
+    # + forget gate; its size is INDEPENDENT of sequence length (the bounded-memory
+    # property).  Scale params via delta_n_heads x delta_layers x delta_head_*_dim.
+    delta_layers: int = 6              # depth of the GatedDeltaMemory stack
+    delta_n_heads: int = 8             # number of independent memory heads per layer
+    delta_head_k_dim: int = 64         # per-head key/query dim d_k (memory capacity <= d_k)
+    delta_head_v_dim: int = 64         # per-head value dim d_v (state S is d_k x d_v)
+    # Feature map phi applied to keys/queries: "l2" (L2-normalise, the Gated-DeltaNet
+    # choice — bounds ||phi(k)||=1 so the delta step is a well-scaled GD step) or
+    # "silu_l2" (SiLU then L2-normalise) or "identity" (no map; for the math tests).
+    delta_feature_map: str = "l2"
+    delta_use_forget_gate: bool = True  # scalar per-head forget gate alpha_t (Gated-DeltaNet);
+    #                                     False == ungated DeltaNet (alpha_t == 1).
+    delta_ff_mult: int = 4             # gated-MLP inner expansion between memory layers
+    delta_dropout: float = 0.0         # dropout inside the memory mixer + MLP
+
 
 @dataclass
 class DataConfig:

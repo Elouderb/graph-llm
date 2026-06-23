@@ -1,8 +1,9 @@
 """Novel architecture components.
 
-Currently houses the Phase 2 factorized bilinear (MFB) front-end
-(:class:`BilinearFrontEnd`).  Future components (reasoning GNN, memory GNN)
-belong here too.
+Houses the Phase 2 factorized bilinear (MFB) front-end
+(:class:`BilinearFrontEnd`) and the Phase 3 Gated-DeltaNet delta-rule matrix
+memory (:class:`GatedDeltaMemory`).  Future components (reasoning GNN) belong
+here too.
 
 Each component is a plain ``torch.nn.Module`` and must NOT be imported by the
 Trainer; the Trainer is model-agnostic and interacts only through the
@@ -13,5 +14,6 @@ changes.
 """
 
 from .bilinear_frontend import BilinearFrontEnd
+from .delta_memory import GatedDeltaMemory
 
-__all__ = ["BilinearFrontEnd"]
+__all__ = ["BilinearFrontEnd", "GatedDeltaMemory"]

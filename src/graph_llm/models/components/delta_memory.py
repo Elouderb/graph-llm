@@ -53,18 +53,33 @@ bindings without interference (rank argument).  Hence per-head capacity is
 ``d_k`` conservatively; scale the model via ``heads x layers x width`` instead of
 inflating a single head's ``d_k``.
 
-Implementation note (v1: sequential pure-PyTorch, validate-first)
------------------------------------------------------------------
-v1 implements the recurrence as a **clean sequential scan in plain PyTorch** —
-correctness over speed, exactly like the Mamba baseline's ``_selective_scan``.
+Implementation note (sequential reference + chunkwise-parallel fast path)
+------------------------------------------------------------------------
+The recurrence is implemented two ways, selected by ``cfg.delta_scan``:
+
+* ``"sequential"`` — a **clean sequential scan in plain PyTorch** (``O(T)``
+  Python iterations over the time axis, exactly like the Mamba baseline's
+  ``_selective_scan``).  This is the **trusted oracle**: the delta-rule math is
+  proven exact against a by-hand reference, so it is the ground truth the fast
+  path is validated against.  Kept as a config-selectable fallback.
+
+* ``"chunkwise"`` (default) — the **chunkwise-parallel DeltaNet scan** (Yang et
+  al., arXiv:2406.06484; gated variant arXiv:2412.06464): split the sequence into
+  chunks of size ``C``; do the intra-chunk delta corrections in parallel via the
+  WY / UT-transform (batched triangular solve + matmuls) and carry the state
+  matrix ``S`` between chunks recurrently — ``T/C`` sequential steps instead of
+  ``T``.  The per-step forget gate ``alpha`` is folded in via its cumulative
+  product within each chunk, kept entirely as **bounded ``(0, 1]`` decay ratios**
+  so no ``1/cumprod`` term ever overflows fp32.  This path is proven equivalent
+  to the sequential oracle within tolerance (see
+  ``tests/test_delta_memory.py::test_chunkwise_matches_sequential*``), so the two
+  produce the **same ``(loss, logits)``** — ``delta_scan`` only selects the
+  internal scan.
+
 We deliberately do **not** depend on the ``fla-hub`` /
-``flash-linear-attention`` Triton/CUDA kernels for v1: those carry the same
-build/toolchain risk on the 3060 that made us hand-roll Mamba.  The scan is
-``O(T)`` Python iterations and materialises the per-token state, so it is slower
-than the chunkwise-parallel DeltaNet kernel — but it is mathematically the same
-recurrence.  The chunkwise-parallel kernel is a documented follow-up
-optimisation (see ``docs/memory_stage.md``); a vectorised path, if added, must
-match this sequential reference within tolerance.
+``flash-linear-attention`` Triton/CUDA kernels: those carry the same
+build/toolchain risk on the 3060 that made us hand-roll Mamba.  The chunkwise
+path here is a **self-contained pure-PyTorch** implementation kept in fp32.
 """
 
 from __future__ import annotations
@@ -80,6 +95,7 @@ if TYPE_CHECKING:
     from graph_llm.config import ModelConfig
 
 VALID_FEATURE_MAPS = ("l2", "silu_l2", "identity")
+VALID_DELTA_SCANS = ("sequential", "chunkwise", "auto")
 
 
 def _feature_map(x: Tensor, kind: str) -> Tensor:
@@ -136,6 +152,19 @@ class GatedDeltaMemory(nn.Module):
         self.d_v = cfg.delta_head_v_dim
         self.feature_map = cfg.delta_feature_map
         self.use_forget_gate = cfg.delta_use_forget_gate
+        # Scan implementation selector (card 18b14615).  "auto" resolves to the
+        # fast chunkwise path (it is bit-equivalent to the sequential oracle).
+        scan = cfg.delta_scan
+        if scan not in VALID_DELTA_SCANS:
+            raise ValueError(
+                f"delta_scan={scan!r} not in {VALID_DELTA_SCANS}."
+            )
+        self.delta_scan = "chunkwise" if scan == "auto" else scan
+        if cfg.delta_chunk_size < 1:
+            raise ValueError(
+                f"delta_chunk_size must be >= 1, got {cfg.delta_chunk_size}"
+            )
+        self.chunk_size = cfg.delta_chunk_size
 
         if self.n_heads < 1:
             raise ValueError(f"delta_n_heads must be >= 1, got {self.n_heads}")
@@ -229,6 +258,146 @@ class GatedDeltaMemory(nn.Module):
 
         return torch.stack(outputs, dim=2)  # (B, H, T, d_v)
 
+    # ------------------------------------------------------------------
+    # The chunkwise-parallel delta-rule scan (the fast path)
+    # ------------------------------------------------------------------
+
+    def _delta_scan_chunkwise(
+        self, q: Tensor, k: Tensor, v: Tensor, beta: Tensor, alpha: Tensor
+    ) -> Tensor:
+        """Chunkwise-parallel Gated-DeltaNet recurrence (the fast path).
+
+        Mathematically identical to :meth:`_delta_scan` (validated bit-for-bit
+        within tolerance by the equivalence tests), but instead of ``T`` Python
+        iterations it runs ``T/C`` chunk steps with the intra-chunk delta
+        corrections done in parallel as batched matmuls (DeltaNet WY / UT
+        transform, Yang et al. arXiv:2406.06484).
+
+        Per chunk of length ``C`` (local 1-based index ``t``), with incoming
+        state ``S0`` (the state before the chunk) and the same recurrence
+        ``S_t = alpha_t S_{t-1} + beta_t k_t (v_t - S_{t-1}^T k_t)^T``,
+        ``o_t = S_{t-1}^T q_t``:
+
+        Let the within-chunk cumulative forget-gate decay be
+        ``D_t = prod_{j<=t} alpha_j`` (inclusive) and ``d_t = D_{t-1}``
+        (exclusive, ``d_1 = 1``).  Substituting the decay-normalised state
+        ``Stil_t = S_t / D_t`` turns the gated recurrence into a plain (ungated)
+        delta rule whose every decay coefficient is a **bounded ratio in
+        ``(0, 1]``** — ``d_t/D_s`` for ``s < t`` is ``prod_{s<j<t} alpha`` and the
+        state carry ``D_C/D_t`` is ``prod_{j>t} alpha`` — so no ``1/cumprod``
+        term is ever materialised and the scan is fp32-stable:
+
+            u_t   = v_t - Stil_{t-1}^T (d_t k_t)
+            (I + tril(M, -1)) U = V - (d k) S0 ,
+                  M[t, s] = beta_s (d_t / D_s) <k_t, k_s>          # bounded
+            o_t   = (d_t q_t)^T S0 + sum_{s<t} beta_s (d_t/D_s) <q_t,k_s> u_s
+            S_end = D_C S0 + sum_t (D_C / D_t) beta_t k_t u_t^T     # bounded
+
+        ``U`` (the per-token deltas ``u_t``) is recovered by a single batched
+        unit-lower-triangular solve per chunk.  Sequences whose length is not a
+        multiple of ``C`` are right-padded (keys/values/beta with zeros, alpha
+        with ones so padded steps neither read, write, nor decay); the padded
+        tail is sliced off the output.
+
+        Args:
+            q: ``(B, H, T, d_k)``  feature-mapped queries phi(q).
+            k: ``(B, H, T, d_k)``  feature-mapped keys phi(k).
+            v: ``(B, H, T, d_v)``  values.
+            beta: ``(B, H, T)``    write strengths in (0, 1].
+            alpha: ``(B, H, T)``   forget gates in (0, 1] (all-ones when ungated).
+
+        Returns:
+            ``(B, H, T, d_v)`` per-head memory outputs (same as ``_delta_scan``).
+        """
+        B, H, T, d_k = q.shape
+        d_v = v.shape[-1]
+        dtype, device = q.dtype, q.device
+        C = self.chunk_size
+
+        # Right-pad to a whole number of chunks.  Padded keys/values/beta are zero
+        # (no read / no write) and padded alpha is 1 (no extra decay); the padded
+        # output tail is discarded below.
+        pad = (C - T % C) % C
+        if pad:
+            q = F.pad(q, (0, 0, 0, pad))
+            k = F.pad(k, (0, 0, 0, pad))
+            v = F.pad(v, (0, 0, 0, pad))
+            beta = F.pad(beta, (0, pad))
+            alpha = F.pad(alpha, (0, pad), value=1.0)
+        t_pad = T + pad
+        n_chunks = t_pad // C
+
+        def _chunk(x: Tensor) -> Tensor:
+            return x.reshape(B, H, n_chunks, C, *x.shape[3:])
+
+        q, k, v, beta, alpha = (_chunk(t) for t in (q, k, v, beta, alpha))
+
+        # Cumulative log-decay within each chunk.  log_d_incl = log D_t,
+        # log_d_excl = log d_t = log D_{t-1} (d_1 = 1 -> log_d_excl[..., 0] = 0).
+        log_alpha = torch.log(alpha)
+        log_d_incl = torch.cumsum(log_alpha, dim=-1)          # (B,H,nc,C)
+        log_d_excl = log_d_incl - log_alpha                   # (B,H,nc,C)
+        chunk_total = torch.exp(log_d_incl[..., -1])          # (B,H,nc) == D_C
+
+        eye = torch.eye(C, dtype=dtype, device=device)
+        # Strict lower-triangular causal mask (s < t).
+        strict_lower = torch.tril(
+            torch.ones(C, C, dtype=dtype, device=device), diagonal=-1
+        )
+        neg_inf = torch.finfo(dtype).min
+
+        S = torch.zeros(B, H, d_k, d_v, dtype=dtype, device=device)
+        outputs = []
+        for c in range(n_chunks):
+            k_c = k[:, :, c]                                  # (B,H,C,d_k)
+            q_c = q[:, :, c]
+            v_c = v[:, :, c]                                  # (B,H,C,d_v)
+            beta_c = beta[:, :, c]                            # (B,H,C)
+            log_incl = log_d_incl[:, :, c]                    # (B,H,C)
+            log_excl = log_d_excl[:, :, c]                    # (B,H,C)
+            d_total = chunk_total[:, :, c]                    # (B,H)
+
+            d_excl = torch.exp(log_excl)                      # (B,H,C) in (0,1]
+            k_hat = k_c * d_excl[..., None]                   # decayed read key
+            q_hat = q_c * d_excl[..., None]                   # decayed read query
+
+            # Bounded decay ratio[t, s] = d_t / D_s for s < t (== prod_{s<j<t} a),
+            # else 0.  Mask in LOG-space (set to -inf) BEFORE exp so the upper
+            # triangle is exactly 0 and never overflows to inf.
+            ratio_log = log_excl[..., :, None] - log_incl[..., None, :]
+            ratio = torch.exp(
+                torch.where(strict_lower.bool(), ratio_log, neg_inf)
+            )                                                 # (B,H,C,C)
+
+            kk = torch.einsum("bhtk,bhsk->bhts", k_c, k_c)    # <k_t, k_s>
+            mat = beta_c[..., None, :] * ratio * kk           # M[t,s], strict lower
+            rhs = v_c - torch.einsum("bhtk,bhkv->bhtv", k_hat, S)
+            # u_t solve: (I + tril(M,-1)) U = V - (d k) S0 .  Unit lower triangular.
+            u = torch.linalg.solve_triangular(
+                eye + mat, rhs, upper=False, unitriangular=True
+            )                                                 # (B,H,C,d_v)
+
+            # READ: inter-chunk (decayed S0 via q_hat) + intra-chunk (strict lower).
+            qk = torch.einsum("bhtk,bhsk->bhts", q_c, k_c)    # <q_t, k_s>
+            mat_o = beta_c[..., None, :] * ratio * qk
+            o = torch.einsum("bhtk,bhkv->bhtv", q_hat, S) + torch.einsum(
+                "bhts,bhsv->bhtv", mat_o, u
+            )
+            outputs.append(o)
+
+            # STATE carry: S_end = D_C S0 + sum_t (D_C/D_t) beta_t k_t u_t^T.
+            # carry[t] = D_C / D_t = prod_{j>t} alpha in (0,1] (bounded).
+            carry = torch.exp(
+                torch.log(d_total[..., None].clamp_min(1e-30)) - log_incl
+            )                                                 # (B,H,C)
+            k_write = k_c * (beta_c * carry)[..., None]       # (B,H,C,d_k)
+            S = d_total[..., None, None] * S + torch.einsum(
+                "bhtk,bhtv->bhkv", k_write, u
+            )
+
+        out = torch.stack(outputs, dim=2)                    # (B,H,nc,C,d_v)
+        return out.reshape(B, H, t_pad, d_v)[:, :, :T]        # drop padded tail
+
     def forward(self, x: Tensor) -> Tensor:
         """Run the memory over a sequence.
 
@@ -259,7 +428,14 @@ class GatedDeltaMemory(nn.Module):
         # The recurrence is run in fp32 for numerical stability (the state can
         # accumulate over long sequences), mirroring the Mamba scan; cast back
         # to the input dtype afterwards so bf16/amp paths see the right dtype.
-        out = self._delta_scan(q.float(), k.float(), v.float(), beta.float(), alpha.float())
+        # The chunkwise fast path is the default; the sequential scan is the
+        # validated reference/fallback.  Both return the SAME (B, H, T, d_v).
+        scan = (
+            self._delta_scan_chunkwise
+            if self.delta_scan == "chunkwise"
+            else self._delta_scan
+        )
+        out = scan(q.float(), k.float(), v.float(), beta.float(), alpha.float())
         out = out.to(x.dtype)
 
         out = out.transpose(1, 2).reshape(B, T, H * d_v)  # (B, T, H*d_v)

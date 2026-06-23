@@ -26,6 +26,7 @@ from graph_llm.data.loader import (
 from graph_llm.eval.metrics import bits_per_byte, perplexity
 from graph_llm.models import build_model
 from graph_llm.models.baselines import count_params, match_params
+from graph_llm.models.baselines.mamba import MambaBlock
 
 BASELINES = ["transformer", "mamba"]
 
@@ -88,6 +89,111 @@ def test_baseline_eval_mode_zero_loss_without_targets(name: str) -> None:
         loss, logits = model(x)
     assert float(loss.sum()) == 0.0
     assert logits.shape[-1] == cfg.model.vocab_size
+
+
+# ---------------------------------------------------------------------------
+# Mamba chunkwise scan == sequential oracle (card 18b14615, LOAD-BEARING)
+# ---------------------------------------------------------------------------
+#
+# mamba_scan="chunkwise" is now the DEFAULT, so the fast chunked selective scan
+# must reproduce the original sequential _selective_scan numerically — including
+# sequence lengths that are NOT a multiple of the chunk size.  A mismatch here is
+# a real bug in the chunked scan, not a tolerance to relax.
+
+
+def _mamba_block(scan: str, *, chunk_size: int = 32, d_model: int = 64) -> MambaBlock:
+    torch.manual_seed(0)
+    return MambaBlock(
+        d_model=d_model, d_state=16, d_conv=4, expand=2, dt_rank="auto",
+        dt_min=0.001, dt_max=0.1, scan=scan, chunk_size=chunk_size,
+    )
+
+
+def _mamba_scan_inputs(block: MambaBlock, B: int, T: int, seed: int) -> tuple[torch.Tensor, ...]:
+    """Realistic (u, delta, B, C) for a direct selective-scan call, in fp32.
+
+    delta is softplus'd (strictly positive, like the model); B, C random.
+    """
+    torch.manual_seed(seed)
+    d_inner, n = block.d_inner, block.d_state
+    u = torch.randn(B, T, d_inner)
+    delta = torch.nn.functional.softplus(torch.randn(B, T, d_inner) * 0.5 - 3.0)  # ~ model range
+    Bm = torch.randn(B, T, n)
+    Cm = torch.randn(B, T, n)
+    return u.float(), delta.float(), Bm.float(), Cm.float()
+
+
+@pytest.mark.parametrize("T", [1, 31, 32, 33, 64, 65, 100, 128, 257])
+def test_mamba_chunkwise_scan_matches_sequential(T: int) -> None:
+    """Chunked selective scan == sequential oracle within 1e-4 (fp32), incl. T % C != 0."""
+    seq_block = _mamba_block("sequential")
+    chunk_block = _mamba_block("chunkwise", chunk_size=32)
+    chunk_block.load_state_dict(seq_block.state_dict())  # identical A_log / D
+
+    u, delta, Bm, Cm = _mamba_scan_inputs(seq_block, B=2, T=T, seed=T)
+    ref = seq_block._selective_scan(u, delta, Bm, Cm)
+    fast = chunk_block._selective_scan_chunkwise(u, delta, Bm, Cm)
+
+    assert fast.shape == ref.shape == (2, T, seq_block.d_inner)
+    assert torch.isfinite(fast).all(), "chunked selective scan produced non-finite values"
+    max_diff = (fast - ref).abs().max().item()
+    assert max_diff <= 1e-4, (
+        f"mamba chunkwise != sequential oracle (T={T}): max abs diff {max_diff:.3e} > 1e-4"
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [1, 8, 16, 64])
+def test_mamba_chunkwise_scan_matches_across_chunk_sizes(chunk_size: int) -> None:
+    seq_block = _mamba_block("sequential")
+    chunk_block = _mamba_block("chunkwise", chunk_size=chunk_size)
+    chunk_block.load_state_dict(seq_block.state_dict())
+    u, delta, Bm, Cm = _mamba_scan_inputs(seq_block, B=2, T=70, seed=7)  # 70 % chunk != 0
+    ref = seq_block._selective_scan(u, delta, Bm, Cm)
+    fast = chunk_block._selective_scan_chunkwise(u, delta, Bm, Cm)
+    max_diff = (fast - ref).abs().max().item()
+    assert max_diff <= 1e-4, f"C={chunk_size}: max diff {max_diff:.3e} > 1e-4"
+
+
+def test_mamba_block_forward_chunkwise_matches_sequential() -> None:
+    """Full MambaBlock forward agrees between the two scans (shared weights, T % C != 0)."""
+    seq_block = _mamba_block("sequential", d_model=64)
+    chunk_block = _mamba_block("chunkwise", chunk_size=16, d_model=64)
+    chunk_block.load_state_dict(seq_block.state_dict())
+    seq_block.eval()
+    chunk_block.eval()
+    x = torch.randn(2, 50, 64)  # 50 not a multiple of 16
+    with torch.no_grad():
+        out_seq = seq_block(x)
+        out_fast = chunk_block(x)
+    max_diff = (out_seq - out_fast).abs().max().item()
+    assert max_diff <= 1e-4, f"mamba forward seq vs chunkwise max diff {max_diff:.3e} > 1e-4"
+
+
+def test_mamba_chunkwise_block_is_causal_by_perturbation() -> None:
+    """Causality probe on the FAST Mamba path: perturb token t+1; outputs <= t unchanged."""
+    torch.manual_seed(0)
+    block = _mamba_block("chunkwise", chunk_size=4, d_model=32)
+    block.eval()
+    assert block.scan == "chunkwise"
+    B, T = 2, 13  # not a multiple of the chunk size (4)
+    x = torch.randn(B, T, 32)
+    with torch.no_grad():
+        out = block(x)
+    t = 5
+    x_pert = x.clone()
+    x_pert[:, t + 1] += torch.randn_like(x_pert[:, t + 1])  # perturb a FUTURE token
+    with torch.no_grad():
+        out_pert = block(x_pert)
+    max_diff = (out[:, : t + 1] - out_pert[:, : t + 1]).abs().max().item()
+    assert max_diff < 1e-5, (
+        f"chunkwise Mamba leaked future info: perturbing token {t + 1} changed "
+        f"outputs at positions <= {t} by {max_diff:.2e}"
+    )
+
+
+def test_mamba_invalid_scan_raises() -> None:
+    with pytest.raises(ValueError):
+        _mamba_block("nonsense")
 
 
 # ---------------------------------------------------------------------------

@@ -13,12 +13,23 @@ We deliberately do **not** depend on the ``mamba-ssm`` package.  Its
 ``selective_scan`` is a hand-written fused CUDA kernel that must be compiled
 against a matching CUDA toolchain; this build environment is CPU-only, so that
 kernel is impractical and would make the recurrent baseline silently
-unavailable.  Instead we implement the selective scan as a readable **sequential
-recurrence in plain PyTorch**.  It is mathematically equivalent to the reference
-(same discretisation and gating); it is just slower because it materialises the
-scan as a Python loop over the time axis instead of a parallel associative scan.
-The throughput caveat is documented in ``docs/baselines.md``.  Correctness and
-architecture parity over speed — that is the right trade for a research baseline.
+unavailable.  Instead we implement the selective scan in plain PyTorch, in two
+forms selected by ``cfg.mamba_scan`` (both mathematically equivalent — same
+discretisation and gating — and validated bit-for-bit against each other):
+
+* ``"sequential"`` — the readable ``O(T)`` Python-loop recurrence; the
+  **trusted reference / oracle**.
+* ``"chunkwise"`` (default) — a **chunked parallel scan** (card 18b14615): the
+  selective SSM is a diagonal linear recurrence, so within each chunk the
+  contributions combine via cumulative-decay matmuls and only the chunk *state*
+  is carried recurrently — ``T/C`` sequential steps instead of ``T``.  This is
+  the effective throughput fix: ``torch.compile`` on the raw ``T``-loop is
+  impractical (it unrolls the data-dependent loop, giving pathological compile
+  time), whereas the chunked form cuts the Python loop length directly.
+
+The throughput caveat / fix is documented in ``docs/baselines.md``.  Correctness
+and architecture parity over speed — that is the right trade for a research
+baseline.
 
 Block structure (matches ``mamba_ssm.Mamba``, confirmed against the reference):
 
@@ -84,6 +95,8 @@ class MambaBlock(nn.Module):
         dt_rank: int | str,
         dt_min: float,
         dt_max: float,
+        scan: str = "chunkwise",
+        chunk_size: int = 32,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -91,6 +104,14 @@ class MambaBlock(nn.Module):
         self.d_conv = d_conv
         self.d_inner = expand * d_model
         self.dt_rank = _resolve_dt_rank(dt_rank, d_model)
+        if scan not in ("sequential", "chunkwise"):
+            raise ValueError(
+                f"mamba_scan={scan!r} not in ('sequential', 'chunkwise')."
+            )
+        self.scan = scan
+        if chunk_size < 1:
+            raise ValueError(f"mamba_chunk_size must be >= 1, got {chunk_size}")
+        self.chunk_size = chunk_size
 
         # in_proj produces the SSM input branch (x) and the gate branch (z).
         self.in_proj = nn.Linear(d_model, 2 * self.d_inner, bias=False)
@@ -193,6 +214,83 @@ class MambaBlock(nn.Module):
         y = y + u * self.D  # per-channel skip connection
         return y
 
+    def _selective_scan_chunkwise(
+        self, u: Tensor, delta: Tensor, B: Tensor, C: Tensor
+    ) -> Tensor:
+        """Chunked parallel selective-scan (the fast path).
+
+        Mathematically identical to :meth:`_selective_scan` (validated against it
+        within tolerance), but runs ``T/CH`` chunk steps instead of ``T`` Python
+        iterations.  The selective SSM is a **diagonal linear recurrence**
+        ``h_t = dA_t * h_{t-1} + dB_u_t`` (``dA_t = exp(delta_t A)`` with
+        ``A < 0``, so ``dA_t in (0, 1)``), which has a clean chunked closed form:
+        within a chunk, with inclusive cumulative log-decay ``lP_t = sum_{j<=t}
+        delta_j A``,
+
+            h_t   = exp(lP_t) h0 + sum_{s<=t} exp(lP_t - lP_s) dB_u_s
+            y_t   = sum_n C_t * h_t
+
+        Every decay coefficient ``exp(lP_t - lP_s)`` for ``s <= t`` is a product
+        of ``dA in (0, 1]`` and so is bounded — fp32-safe.  ``lP`` is accumulated
+        from ``delta * A`` directly (never round-tripped through ``exp`` then
+        ``log``), so a strongly-decayed step cannot underflow ``dA`` to ``0`` and
+        poison the cumulative sum with ``-inf``.  The masked ``s > t`` region is
+        set to ``-inf`` in log-space before ``exp`` (-> exactly 0, never
+        ``inf * 0 = NaN``).  Sequences not a multiple of ``CH`` are right-padded
+        (zero input, zero log-decay == ``dA = 1``); the tail is sliced off.
+
+        Args:
+            u:     ``(B, T, d_inner)``  input sequence (post-conv, activated).
+            delta: ``(B, T, d_inner)``  positive time-steps (already softplus'd).
+            B:     ``(B, T, d_state)``  selective input matrix.
+            C:     ``(B, T, d_state)``  selective output matrix.
+
+        Returns:
+            ``(B, T, d_inner)`` output sequence (same as ``_selective_scan``).
+        """
+        bsz, seq_len, d_inner = u.shape
+        n = self.d_state
+        dtype, device = u.dtype, u.device
+        ch = self.chunk_size
+        A = -torch.exp(self.A_log.float())  # (d_inner, d_state), strictly < 0
+
+        # log-decay per step: log dA = delta * A  (<= 0, finite — no exp/log round-trip).
+        log_dA = delta.unsqueeze(-1) * A                       # (B, T, d_inner, d_state)
+        dB_u = delta.unsqueeze(-1) * B.unsqueeze(2) * u.unsqueeze(-1)
+
+        pad = (ch - seq_len % ch) % ch
+        if pad:
+            log_dA = F.pad(log_dA, (0, 0, 0, 0, 0, pad))       # 0 == dA 1 on pad
+            dB_u = F.pad(dB_u, (0, 0, 0, 0, 0, pad))           # zero input on pad
+            C = F.pad(C, (0, 0, 0, pad))
+        t_pad = seq_len + pad
+        n_chunks = t_pad // ch
+
+        log_dA = log_dA.reshape(bsz, n_chunks, ch, d_inner, n)
+        dB_u = dB_u.reshape(bsz, n_chunks, ch, d_inner, n)
+        C = C.reshape(bsz, n_chunks, ch, n)
+        log_cum = torch.cumsum(log_dA, dim=2)                  # lP_t, (B,nc,CH,d,n)
+
+        lower = torch.tril(torch.ones(ch, ch, dtype=dtype, device=device))  # s <= t
+        neg_inf = torch.finfo(dtype).min
+
+        h0 = torch.zeros(bsz, d_inner, n, dtype=dtype, device=device)
+        ys = []
+        for c in range(n_chunks):
+            lp = log_cum[:, c]                                 # (B,CH,d,n)
+            p = torch.exp(lp)                                  # P_t in (0,1]
+            # ratio[t, s] = P_t / P_s = exp(lP_t - lP_s) for s <= t, else 0.
+            ratio_log = lp.unsqueeze(2) - lp.unsqueeze(1)      # (B,CH,CH,d,n) [t,s]
+            ratio = torch.exp(
+                torch.where(lower.bool()[None, :, :, None, None], ratio_log, neg_inf)
+            )
+            intra = torch.einsum("btsdn,bsdn->btdn", ratio, dB_u[:, c])
+            h = p * h0.unsqueeze(1) + intra                    # (B,CH,d,n)
+            ys.append(torch.einsum("btdn,btn->btd", h, C[:, c]))
+            h0 = h[:, -1]                                      # carry state to next chunk
+        y = torch.stack(ys, dim=1).reshape(bsz, t_pad, d_inner)[:, :seq_len]
+        return y + u * self.D                                  # per-channel skip
+
     def forward(self, x: Tensor) -> Tensor:
         """Run the Mamba block.
 
@@ -212,7 +310,12 @@ class MambaBlock(nn.Module):
         dt, B, C = torch.split(dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         delta = F.softplus(self.dt_proj(dt))  # (B, T, d_inner), strictly positive
 
-        y = self._selective_scan(x_in.float(), delta.float(), B.float(), C.float())
+        scan = (
+            self._selective_scan_chunkwise
+            if self.scan == "chunkwise"
+            else self._selective_scan
+        )
+        y = scan(x_in.float(), delta.float(), B.float(), C.float())
         y = y.to(x.dtype)
         y = y * F.silu(z)  # gating branch
         return self.out_proj(y)
@@ -232,6 +335,8 @@ class MambaResidualBlock(nn.Module):
             dt_rank=m.dt_rank,
             dt_min=m.dt_min,
             dt_max=m.dt_max,
+            scan=m.mamba_scan,
+            chunk_size=m.mamba_chunk_size,
         )
 
     def forward(self, x: Tensor) -> Tensor:

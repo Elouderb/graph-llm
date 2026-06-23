@@ -37,6 +37,7 @@ from graph_llm.config import Config, DataConfig, ModelConfig, TrainConfig
 from graph_llm.models import build_model
 from graph_llm.models.baselines import count_params, match_params
 from graph_llm.models.components.delta_memory import (
+    VALID_DELTA_SCANS,
     VALID_FEATURE_MAPS,
     GatedDeltaMemory,
     _feature_map,
@@ -244,8 +245,17 @@ def test_state_size_is_independent_of_sequence_length() -> None:
     different sequence lengths and asserts it is identical and equal to the
     fixed ``(B, H, d_k, d_v)`` — the bounded-memory guarantee that distinguishes
     this from an attention KV cache.
+
+    Pins ``delta_scan="sequential"`` so ``forward`` routes through the per-step
+    ``_delta_scan`` the spy patches.  (The chunkwise fast path keeps the SAME
+    fixed-size ``(B, H, d_k, d_v)`` state — carried between chunks recurrently —
+    but iterates per chunk, not per token, so this per-step spy targets the
+    reference scan directly.)
     """
-    cfg = _mem_cfg(d_model=16, delta_n_heads=3, delta_head_k_dim=8, delta_head_v_dim=5)
+    cfg = _mem_cfg(
+        d_model=16, delta_n_heads=3, delta_head_k_dim=8, delta_head_v_dim=5,
+        delta_scan="sequential",
+    )
     mem = GatedDeltaMemory(cfg)
     mem.eval()
 
@@ -472,4 +482,188 @@ def test_delta_memory_lm_respects_embedding_init_hook() -> None:
     assert torch.allclose(model.embed.weight, expected), (
         "embedding-init hook was overwritten by _init_weights(); the hook must "
         "run last so the phonological init (card e1644700) takes effect."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chunkwise-parallel scan == sequential oracle (card 18b14615, LOAD-BEARING)
+# ---------------------------------------------------------------------------
+#
+# The sequential _delta_scan is the trusted, hand-verified oracle.  The fast
+# chunkwise path must reproduce it within tolerance on randomized inputs —
+# INCLUDING sequence lengths that are not a multiple of the chunk size, and both
+# constant and varying alpha/beta.  This is the central correctness gate: a
+# mismatch here means the fast path silently changes the model's behaviour.
+
+
+def _make_mem(
+    *, gate: bool, fmap: str = "l2", d_k: int = 16, d_v: int = 12, n_heads: int = 3,
+    chunk_size: int = 32,
+) -> GatedDeltaMemory:
+    cfg = _mem_cfg(
+        d_model=24, delta_n_heads=n_heads, delta_head_k_dim=d_k,
+        delta_head_v_dim=d_v, delta_feature_map=fmap, delta_use_forget_gate=gate,
+        delta_chunk_size=chunk_size,
+    )
+    mem = GatedDeltaMemory(cfg)
+    mem.eval()
+    return mem
+
+
+def _rand_scan_inputs(
+    mem: GatedDeltaMemory, B: int, T: int, *, alpha_mode: str, seed: int
+) -> tuple[torch.Tensor, ...]:
+    """Feature-mapped (q, k, v, beta, alpha) for a direct scan call, in fp32.
+
+    alpha_mode: "ungated" (alpha == 1), "const" (one decay per head, repeated over
+    T — the constant-alpha case), or "varying" (the model's per-token
+    exp(-softplus(.)) gate — the varying-alpha case).
+    """
+    torch.manual_seed(seed)
+    H, d_k, d_v = mem.n_heads, mem.d_k, mem.d_v
+    q = _feature_map(torch.randn(B, H, T, d_k), mem.feature_map).float()
+    k = _feature_map(torch.randn(B, H, T, d_k), mem.feature_map).float()
+    v = torch.randn(B, H, T, d_v).float()
+    beta = torch.sigmoid(torch.randn(B, H, T)).float()  # varying beta in (0,1)
+    if alpha_mode == "ungated":
+        alpha = torch.ones(B, H, T)
+    elif alpha_mode == "const":
+        a = torch.sigmoid(torch.randn(B, H, 1)).clamp(0.3, 0.999)
+        alpha = a.expand(B, H, T).contiguous()
+    elif alpha_mode == "varying":
+        alpha = torch.exp(-torch.nn.functional.softplus(torch.randn(B, H, T)))
+    else:  # pragma: no cover - guard
+        raise ValueError(alpha_mode)
+    return q, k, v, beta, alpha.float()
+
+
+@pytest.mark.parametrize("alpha_mode", ["ungated", "const", "varying"])
+@pytest.mark.parametrize("T", [1, 31, 32, 33, 64, 65, 100, 128, 257])
+def test_chunkwise_matches_sequential(alpha_mode: str, T: int) -> None:
+    """Chunkwise scan == sequential oracle within 1e-4 (fp32), incl. T % C != 0.
+
+    T sweeps multiples and explicit NON-multiples of the chunk size (C=32: 31, 33,
+    65, 100, 257) to exercise the right-pad boundary handling; alpha_mode covers
+    ungated, constant-alpha and varying-alpha.  beta varies per token in all cases.
+    """
+    gate = alpha_mode != "ungated"
+    mem = _make_mem(gate=gate, chunk_size=32)
+    q, k, v, beta, alpha = _rand_scan_inputs(mem, B=2, T=T, alpha_mode=alpha_mode, seed=T)
+
+    ref = mem._delta_scan(q, k, v, beta, alpha)
+    fast = mem._delta_scan_chunkwise(q, k, v, beta, alpha)
+
+    assert fast.shape == ref.shape == (2, mem.n_heads, T, mem.d_v)
+    assert torch.isfinite(fast).all(), "chunkwise scan produced non-finite values"
+    max_diff = (fast - ref).abs().max().item()
+    assert max_diff <= 1e-4, (
+        f"chunkwise != sequential oracle (alpha={alpha_mode}, T={T}): "
+        f"max abs diff {max_diff:.3e} exceeds 1e-4"
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [1, 4, 16, 64])
+def test_chunkwise_matches_sequential_across_chunk_sizes(chunk_size: int) -> None:
+    """The equivalence holds for several chunk sizes (boundary handling is generic)."""
+    mem = _make_mem(gate=True, chunk_size=chunk_size)
+    T = 70  # not a multiple of 4 / 16 / 64
+    q, k, v, beta, alpha = _rand_scan_inputs(mem, B=2, T=T, alpha_mode="varying", seed=7)
+    ref = mem._delta_scan(q, k, v, beta, alpha)
+    fast = mem._delta_scan_chunkwise(q, k, v, beta, alpha)
+    max_diff = (fast - ref).abs().max().item()
+    assert max_diff <= 1e-4, f"C={chunk_size}: max diff {max_diff:.3e} > 1e-4"
+
+
+def test_chunkwise_matches_sequential_long_sequence_finite() -> None:
+    """At T=1024 the chunkwise scan stays finite and matches the oracle (fp32)."""
+    mem = _make_mem(gate=True, d_k=64, d_v=64, n_heads=2, chunk_size=32)
+    q, k, v, beta, alpha = _rand_scan_inputs(mem, B=1, T=1024, alpha_mode="varying", seed=1024)
+    ref = mem._delta_scan(q, k, v, beta, alpha)
+    fast = mem._delta_scan_chunkwise(q, k, v, beta, alpha)
+    assert torch.isfinite(fast).all()
+    assert (fast - ref).abs().max().item() <= 1e-4
+
+
+def test_chunkwise_forward_matches_sequential_forward() -> None:
+    """Full-layer forward agrees between the two scans (same weights, same input).
+
+    Guards the end-to-end (loss, logits)-relevant path: the only difference is the
+    config selector, so the layer output must be identical within tolerance.
+    """
+    torch.manual_seed(0)
+    cfg_seq = _mem_cfg(d_model=32, delta_n_heads=4, delta_head_k_dim=16,
+                       delta_head_v_dim=16, delta_scan="sequential")
+    mem_seq = GatedDeltaMemory(cfg_seq)
+    mem_seq.eval()
+
+    cfg_fast = _mem_cfg(d_model=32, delta_n_heads=4, delta_head_k_dim=16,
+                        delta_head_v_dim=16, delta_scan="chunkwise", delta_chunk_size=16)
+    mem_fast = GatedDeltaMemory(cfg_fast)
+    mem_fast.load_state_dict(mem_seq.state_dict())  # identical weights
+    mem_fast.eval()
+
+    x = torch.randn(2, 50, cfg_seq.d_model)  # 50 not a multiple of 16
+    with torch.no_grad():
+        out_seq = mem_seq(x)
+        out_fast = mem_fast(x)
+    max_diff = (out_seq - out_fast).abs().max().item()
+    assert max_diff <= 1e-4, f"forward seq vs chunkwise max diff {max_diff:.3e} > 1e-4"
+
+
+def test_chunkwise_layer_is_causal_by_perturbation() -> None:
+    """Causality probe on the FAST path: perturb token t+1; outputs <= t unchanged."""
+    torch.manual_seed(0)
+    cfg = _mem_cfg(d_model=16, delta_n_heads=2, delta_head_k_dim=8,
+                   delta_head_v_dim=8, delta_scan="chunkwise", delta_chunk_size=4)
+    mem = GatedDeltaMemory(cfg)
+    mem.eval()
+    assert mem.delta_scan == "chunkwise"
+
+    B, T = 2, 13  # not a multiple of the chunk size (4)
+    x = torch.randn(B, T, cfg.d_model)
+    with torch.no_grad():
+        out = mem(x)
+    t = 5
+    x_pert = x.clone()
+    x_pert[:, t + 1] += torch.randn_like(x_pert[:, t + 1])  # perturb a FUTURE token
+    with torch.no_grad():
+        out_pert = mem(x_pert)
+    max_diff = (out[:, : t + 1] - out_pert[:, : t + 1]).abs().max().item()
+    assert max_diff < 1e-6, (
+        f"chunkwise path leaked future info: perturbing token {t + 1} changed "
+        f"outputs at positions <= {t} by {max_diff:.2e} (must be < 1e-6)."
+    )
+
+
+@pytest.mark.parametrize("scan", ["sequential", "chunkwise", "auto"])
+def test_delta_scan_selector_builds_and_runs(scan: str) -> None:
+    """All valid delta_scan modes build and run; "auto" resolves to chunkwise."""
+    cfg = _mem_cfg(delta_scan=scan)
+    mem = GatedDeltaMemory(cfg)
+    resolved = "chunkwise" if scan == "auto" else scan
+    assert mem.delta_scan == resolved
+    x = torch.randn(2, 20, cfg.d_model)
+    out = mem(x)
+    assert out.shape == (2, 20, cfg.d_model)
+    assert torch.isfinite(out).all()
+
+
+def test_invalid_delta_scan_raises() -> None:
+    with pytest.raises(ValueError):
+        GatedDeltaMemory(_mem_cfg(delta_scan="nonsense"))
+    assert "chunkwise" in VALID_DELTA_SCANS and "sequential" in VALID_DELTA_SCANS
+
+
+def test_chunkwise_forward_backward_finite() -> None:
+    """The fast path is differentiable: finite grads flow to inputs and params."""
+    cfg = _mem_cfg(delta_scan="chunkwise", delta_chunk_size=8)
+    mem = GatedDeltaMemory(cfg)
+    x = torch.randn(2, 19, cfg.d_model, requires_grad=True)  # 19 % 8 != 0
+    out = mem(x)
+    assert out.shape == (2, 19, cfg.d_model)
+    out.sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    grads = [p.grad for p in mem.parameters() if p.requires_grad]
+    assert any(
+        g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in grads
     )

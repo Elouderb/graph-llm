@@ -45,6 +45,21 @@ class ModelConfig:
     dt_rank: int | str = "auto"        # rank of the dt projection ("auto" = ceil(d_model/16))
     dt_min: float = 0.001              # min init value for dt softplus bias
     dt_max: float = 0.1                # max init value for dt softplus bias
+    # Selective-scan implementation (card 18b14615): "chunkwise" (default — the
+    # fast chunked parallel scan: cumulative-decay matmuls within each chunk +
+    # inter-chunk state recurrence, T/C sequential steps instead of T) or
+    # "sequential" (the original O(T) Python-loop recurrence, kept as the
+    # validated reference/oracle).  Both produce the SAME (loss, logits); this
+    # only selects the internal scan.  torch.compile is impractical on the raw
+    # T-loop (it unrolls the data-dependent loop -> pathological compile time),
+    # so chunking is the effective fix.
+    mamba_scan: str = "chunkwise"
+    # Chunk size for the chunked selective scan.  Smaller than the delta scan's C
+    # because the chunked SSM materialises a dense (B, C, C, d_inner, d_state)
+    # decay-ratio tensor per chunk — peak VRAM grows ~linearly in C, so C=8 keeps
+    # memory modest (fits an 8 GB card at seq 1024, where C=32 OOMs) while still
+    # cutting the Python loop length 8x.  Raise it on larger GPUs for more speed.
+    mamba_chunk_size: int = 8
 
     # --- Factorized bilinear (MFB) front-end hyperparameters (card 86347418) ---
     # Ignored by the baselines; consumed by models/components/bilinear_frontend.py
@@ -91,6 +106,19 @@ class ModelConfig:
     #                                     False == ungated DeltaNet (alpha_t == 1).
     delta_ff_mult: int = 4             # gated-MLP inner expansion between memory layers
     delta_dropout: float = 0.0         # dropout inside the memory mixer + MLP
+    # Scan implementation (card 18b14615): "chunkwise" (default — the fast
+    # chunkwise-parallel DeltaNet scan: intra-chunk parallel matmuls + inter-chunk
+    # state recurrence, T/C sequential steps instead of T), "sequential" (the
+    # original O(T) Python-loop recurrence kept as the validated reference/oracle —
+    # the chunkwise path is proven bit-equivalent to it within tolerance), or
+    # "auto" (== "chunkwise"; alias kept for forward-compat).  Both produce the
+    # SAME (loss, logits); this only selects the internal scan.
+    delta_scan: str = "chunkwise"
+    # Chunk size C for the chunkwise scan.  T/C sequential steps; intra-chunk work
+    # is batched matmuls.  32 keeps the per-chunk cumulative forget-gate decay in a
+    # safe fp32 dynamic range (the gated WY math divides by cumulative decay) while
+    # cutting the sequential loop length by 32x.
+    delta_chunk_size: int = 32
 
 
 @dataclass

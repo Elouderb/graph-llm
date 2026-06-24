@@ -46,10 +46,16 @@ from torch import Tensor
 
 from graph_llm.models.baselines.transformer import RMSNorm
 from graph_llm.models.components.delta_memory import GatedDeltaMemory
+from graph_llm.models.components.multiscale_conv_embed import MultiScaleConvEmbedding
 from graph_llm.models.registry import get_embedding_init, register_model
 
 if TYPE_CHECKING:
     from graph_llm.config import Config, ModelConfig
+
+# Valid input-stage front-ends (card ed853f9c).  "none" is the byte-for-byte
+# no-op default (no module is constructed, no behaviour changes); "multiscale_conv"
+# inserts the cheap local combiner after the embedding, before the memory layers.
+VALID_FRONT_ENDS = ("none", "multiscale_conv")
 
 
 class GatedMLP(nn.Module):
@@ -109,6 +115,19 @@ class DeltaMemoryLM(nn.Module):
         self.embed = nn.Embedding(m.vocab_size, m.d_model)
         self.embed_drop = nn.Dropout(m.dropout)
 
+        # Optional multi-scale conv front-end (card ed853f9c): a cheap causal
+        # local combiner inserted AFTER the embedding (+ phonological hook), BEFORE
+        # the memory layers, enriching each token with trailing local context.
+        # ``front_end="none"`` (default) builds NOTHING here -> the committed
+        # backbone is byte-for-byte unchanged (no extra params / RNG draws), so it
+        # is a clean one-flag A/B.
+        front_end = getattr(m, "front_end", "none")
+        if front_end not in VALID_FRONT_ENDS:
+            raise ValueError(f"front_end={front_end!r} not in {VALID_FRONT_ENDS}.")
+        self.front_end: MultiScaleConvEmbedding | None = (
+            MultiScaleConvEmbedding(m) if front_end == "multiscale_conv" else None
+        )
+
         # Depth-scalable stack of delta-memory blocks.
         self.blocks = nn.ModuleList([DeltaMemoryBlock(m) for _ in range(m.delta_layers)])
         self.norm_out = RMSNorm(m.d_model)
@@ -138,6 +157,14 @@ class DeltaMemoryLM(nn.Module):
         nn.init.normal_(self.embed.weight, mean=0.0, std=std)
         for module in self.modules():
             if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Conv1d):
+                # The optional multi-scale conv front-end's bank (depthwise +
+                # pointwise convs).  Only present when front_end="multiscale_conv";
+                # when "none" this branch never fires, so the no-op path is
+                # untouched.
                 nn.init.normal_(module.weight, mean=0.0, std=std)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
@@ -172,6 +199,12 @@ class DeltaMemoryLM(nn.Module):
             ``logits``.
         """
         h = self.embed_drop(self.embed(x))
+        # Optional cheap local combiner (card ed853f9c): enrich each token with
+        # multi-scale causal local context before the memory layers.  ``None`` when
+        # front_end="none" -> this line is a pure pass-through (the committed
+        # backbone, unchanged).
+        if self.front_end is not None:
+            h = self.front_end(h)
         h = self._forward_blocks(h)
         h = self.norm_out(h)
         logits = self.lm_head(h)

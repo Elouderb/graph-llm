@@ -15,5 +15,6 @@ changes.
 
 from .bilinear_frontend import BilinearFrontEnd
 from .delta_memory import GatedDeltaMemory
+from .multiscale_conv_embed import MultiScaleConvEmbedding
 
-__all__ = ["BilinearFrontEnd", "GatedDeltaMemory"]
+__all__ = ["BilinearFrontEnd", "GatedDeltaMemory", "MultiScaleConvEmbedding"]

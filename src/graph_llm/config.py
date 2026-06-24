@@ -120,6 +120,36 @@ class ModelConfig:
     # cutting the sequential loop length by 32x.
     delta_chunk_size: int = 32
 
+    # --- Multi-scale conv front-end (cheap local combiner) hyperparameters
+    # (card ed853f9c, realises design note 8b5341f0) ---
+    # An OPTIONAL causal multi-scale local-context input stage inserted into
+    # delta_memory_lm after the embedding (+ phonological hook), before the memory
+    # layers.  A bank of causal depthwise-separable 1-D convs at dyadic widths
+    # enriches each token embedding with trailing local context, then a 1x1
+    # condense (a per-position projection SHARED across all positions) collapses the
+    # scales back to ONE d_model vector per token.  Ignored by every model except
+    # delta_memory_lm; default "none" is a byte-for-byte no-op (no module is even
+    # constructed), preserving the committed backbone exactly so it is a clean
+    # one-flag A/B.
+    #
+    # "none" (default) == the committed backbone, untouched.
+    # "multiscale_conv" == enable the front-end described above.
+    front_end: str = "none"
+    # Dyadic conv widths {1,2,4,8,16}: width-1 is the pointwise/identity scale (the
+    # plain per-token embedding); larger widths each summarise a trailing window.
+    # ~log(W) kernels capture multi-scale structure for a fraction of the cost of
+    # all contiguous widths 1..16.  Every width must be >= 1.
+    conv_widths: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16])
+    # Condense mode collapsing the (B, T, S, d) scale stack to (B, T, d):
+    # "concat_proj" (default — reshape to (B, T, S*d) then a shared Linear(S*d, d);
+    # mixes across scales AND dims) or "soft_select" (GBST-style: a shared
+    # Linear(S*d, S) -> softmax over the S scales -> convex blend of the
+    # scale-embeddings, staying in embedding space; interpretable granularity).
+    conv_condense: str = "concat_proj"
+    # Depthwise-separable convs (depthwise over the window + pointwise channel mix)
+    # for cheapness when True; a single full 1-D conv per scale when False.
+    conv_depthwise: bool = True
+
 
 @dataclass
 class DataConfig:

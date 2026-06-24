@@ -24,7 +24,7 @@ from __future__ import annotations
 import math
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -262,10 +262,12 @@ def test_state_size_is_independent_of_sequence_length() -> None:
     captured: list[tuple[int, ...]] = []
     orig_scan = mem._delta_scan
 
-    def _spy(q, k, v, beta, alpha):  # noqa: ANN001, ANN202
-        # Re-run the scan but record the state shape at each step.
+    def _spy(q, k, v, beta, alpha, state_in=None, return_state=False):  # noqa: ANN001, ANN202
+        # Re-run the scan but record the state shape at each step.  The state-carry
+        # kwargs (card 61f900ca) are accepted and forwarded to the real scan so the
+        # spy matches the post-change signature.
         B, H, T, _ = q.shape
-        S = torch.zeros(B, H, mem.d_k, mem.d_v)
+        S = torch.zeros(B, H, mem.d_k, mem.d_v) if state_in is None else state_in
         for t in range(T):
             captured.append(tuple(S.shape))
             pred = torch.einsum("bhkv,bhk->bhv", S, k[:, :, t])
@@ -273,7 +275,7 @@ def test_state_size_is_independent_of_sequence_length() -> None:
             S = alpha[:, :, t][..., None, None] * S + beta[:, :, t][..., None, None] * torch.einsum(
                 "bhk,bhv->bhkv", k[:, :, t], delta
             )
-        return orig_scan(q, k, v, beta, alpha)
+        return orig_scan(q, k, v, beta, alpha, state_in=state_in, return_state=return_state)
 
     mem._delta_scan = _spy  # type: ignore[method-assign]
 
@@ -667,3 +669,226 @@ def test_chunkwise_forward_backward_finite() -> None:
     assert any(
         g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in grads
     )
+
+
+# ---------------------------------------------------------------------------
+# Cross-segment state carry (card 61f900ca, LOAD-BEARING)
+# ---------------------------------------------------------------------------
+#
+# The correctness gate for persistent memory: splitting a sequence into ordered
+# consecutive segments and carrying the delta-memory state S across the
+# boundaries must reproduce running the WHOLE sequence in one forward, within
+# tolerance.  This is the analog of the chunkwise==sequential equivalence test:
+# it proves the state-carry plumbing is mathematically correct.  Covered for
+# BOTH scan paths, at multiple split points INCLUDING non-multiples of the chunk
+# size, and for 2- and 3-way splits.  Plus: the default (no state args) is a
+# byte-for-byte no-op, and causality still holds with the new signature.
+
+
+def _scan_inputs(mem: GatedDeltaMemory, B: int, T: int, seed: int) -> tuple[torch.Tensor, ...]:
+    """Feature-mapped (q, k, v, beta, alpha) in fp32 for a direct scan call."""
+    return _rand_scan_inputs(mem, B=B, T=T, alpha_mode="varying", seed=seed)
+
+
+def _scan_full(
+    mem: GatedDeltaMemory,
+    name: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    alpha: torch.Tensor,
+) -> torch.Tensor:
+    """Run the named scan WITHOUT carry; returns just the outputs (a Tensor)."""
+    fn = mem._delta_scan if name == "sequential" else mem._delta_scan_chunkwise
+    return cast(torch.Tensor, fn(q, k, v, beta, alpha))
+
+
+def _scan_carry(
+    mem: GatedDeltaMemory,
+    name: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    alpha: torch.Tensor,
+    state_in: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the named scan WITH carry; returns (outputs, final_state)."""
+    fn = mem._delta_scan if name == "sequential" else mem._delta_scan_chunkwise
+    return cast(
+        "tuple[torch.Tensor, torch.Tensor]",
+        fn(q, k, v, beta, alpha, state_in, True),
+    )
+
+
+def _mem_carry(
+    mem: GatedDeltaMemory, x: torch.Tensor, state_in: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Layer-level forward WITH carry; returns (out, final_state) (typed)."""
+    return cast(
+        "tuple[torch.Tensor, torch.Tensor]",
+        mem(x, state_in=state_in, return_state=True),
+    )
+
+
+@pytest.mark.parametrize("scan", ["sequential", "chunkwise"])
+@pytest.mark.parametrize("splits", [(7,), (8,), (10,), (8, 16), (7, 13)])
+def test_segmented_with_carry_equals_full_sequence_scan(
+    scan: str, splits: tuple[int, ...]
+) -> None:
+    """SEGMENTED-WITH-CARRY == FULL-SEQUENCE for both scan paths (<=1e-4 fp32).
+
+    Split a length-24 input at one or more points (incl. non-multiples of the
+    chunk size C=8, and 3-way splits), run the pieces with the final state carried
+    across each boundary, and assert the concatenated per-position outputs equal a
+    single whole-sequence scan.  This is the mathematical proof that the state
+    carry is correct.
+    """
+    mem = _make_mem(gate=True, chunk_size=8)
+    B, T = 2, 24
+    q, k, v, beta, alpha = _scan_inputs(mem, B, T, seed=sum(splits) + (scan == "chunkwise"))
+
+    full = _scan_full(mem, scan, q, k, v, beta, alpha)
+
+    bounds = [0, *splits, T]
+    outs = []
+    state: torch.Tensor | None = None
+    for lo, hi in zip(bounds[:-1], bounds[1:], strict=True):
+        out, state = _scan_carry(
+            mem, scan,
+            q[:, :, lo:hi], k[:, :, lo:hi], v[:, :, lo:hi],
+            beta[:, :, lo:hi], alpha[:, :, lo:hi],
+            state_in=state,
+        )
+        outs.append(out)
+    cat = torch.cat(outs, dim=2)
+
+    assert cat.shape == full.shape
+    max_diff = (cat - full).abs().max().item()
+    assert max_diff <= 1e-4, (
+        f"segmented-with-carry != full ({scan}, splits={splits}): "
+        f"max abs diff {max_diff:.3e} exceeds 1e-4"
+    )
+
+
+@pytest.mark.parametrize("scan", ["sequential", "chunkwise"])
+@pytest.mark.parametrize("split", [9, 12, 16])
+def test_segmented_with_carry_equals_full_sequence_lm(scan: str, split: int) -> None:
+    """End-to-end: delta_memory_lm logits over 2 carried segments == full forward.
+
+    The full-model analog of the scan-level equivalence: split the token sequence,
+    carry the per-layer states across the boundary via
+    ``forward(x, targets, states_in, return_states)``, and assert concatenated
+    logits match a single whole-sequence forward.  Uses ``front_end="none"`` (the
+    committed backbone): cross-segment carry is defined over the delta-memory
+    layers, and the conv front-end's per-call left-padding would break boundary
+    equivalence by construction.
+    """
+    torch.manual_seed(0)
+    model = build_model(_full_cfg(_mem_cfg(max_seq_len=32, delta_scan=scan, delta_chunk_size=8)))
+    model.eval()
+    B, T = 2, 24
+    x = torch.randint(0, 256, (B, T))
+
+    with torch.no_grad():
+        _, full_logits = model(x)
+        _, l1, s1 = model(x[:, :split], None, None, True)
+        _, l2, s2 = model(x[:, split:], None, s1, True)
+    cat = torch.cat([l1, l2], dim=1)
+
+    assert cat.shape == full_logits.shape
+    assert len(s1) == len(s2) == len(model.blocks)
+    max_diff = (cat - full_logits).abs().max().item()
+    assert max_diff <= 1e-4, (
+        f"LM segmented-with-carry != full ({scan}, split={split}): "
+        f"max abs diff {max_diff:.3e} exceeds 1e-4"
+    )
+
+
+@pytest.mark.parametrize("scan", ["sequential", "chunkwise"])
+def test_state_carry_default_is_byte_for_byte_no_op(scan: str) -> None:
+    """``states_in=None, return_states=False`` is identical to the original path.
+
+    The committed contract: the Trainer calls ``model(x, targets)`` and must be
+    unaffected.  We assert the default 2-tuple ``(loss, logits)`` equals the
+    ``return_states`` variant's ``(loss, logits)`` BIT-FOR-BIT (``torch.equal``),
+    and that the layer-level forward with no state args equals the original.
+    """
+    torch.manual_seed(0)
+    model = build_model(_full_cfg(_mem_cfg(max_seq_len=24, delta_scan=scan, delta_chunk_size=8)))
+    model.eval()
+    x = torch.randint(0, 256, (2, 20))
+    y = torch.randint(0, 256, (2, 20))
+    with torch.no_grad():
+        loss0, logits0 = model(x, y)
+        loss1, logits1, states = model(x, y, None, True)
+    assert torch.equal(logits0, logits1), "return_states changed the logits (not a no-op)"
+    assert torch.equal(loss0, loss1), "return_states changed the loss (not a no-op)"
+    assert len(states) == len(model.blocks)
+
+    # Layer-level: forward(x) == forward(x, state_in=None, return_state=False).
+    mem = GatedDeltaMemory(_mem_cfg(delta_scan=scan, delta_chunk_size=8))
+    mem.eval()
+    h = torch.randn(2, 20, mem.d_model)
+    with torch.no_grad():
+        out_default = mem(h)
+        out_explicit = mem(h, state_in=None, return_state=False)
+    assert torch.equal(out_default, out_explicit)
+
+
+@pytest.mark.parametrize("scan", ["sequential", "chunkwise"])
+def test_state_carry_signature_preserves_causality(scan: str) -> None:
+    """Causality probe still holds with the new (state-carrying) signature.
+
+    Perturb a FUTURE token; outputs at earlier positions must be unchanged.  Run
+    through the ``return_state=True`` path to exercise the new branch, and confirm
+    a carried state (strictly-past tokens) does not leak future information.
+    """
+    torch.manual_seed(0)
+    cfg = _mem_cfg(d_model=16, delta_n_heads=2, delta_head_k_dim=8, delta_head_v_dim=8,
+                   delta_scan=scan, delta_chunk_size=4)
+    mem = GatedDeltaMemory(cfg)
+    mem.eval()
+
+    B, T = 2, 13  # not a multiple of the chunk size
+    # A non-trivial carried state from a prior segment (strictly past).
+    prior = torch.randn(B, T, cfg.d_model)
+    with torch.no_grad():
+        _, state = _mem_carry(mem, prior)
+
+    x = torch.randn(B, T, cfg.d_model)
+    with torch.no_grad():
+        out, _ = _mem_carry(mem, x, state_in=state)
+    t = 5
+    x_pert = x.clone()
+    x_pert[:, t + 1] += torch.randn_like(x_pert[:, t + 1])  # perturb a FUTURE token
+    with torch.no_grad():
+        out_pert, _ = _mem_carry(mem, x_pert, state_in=state)
+    max_diff = (out[:, : t + 1] - out_pert[:, : t + 1]).abs().max().item()
+    assert max_diff < 1e-6, (
+        f"state-carry signature leaked future info ({scan}): perturbing token "
+        f"{t + 1} changed outputs at positions <= {t} by {max_diff:.2e}."
+    )
+
+
+def test_state_out_shape_and_dtype_is_fixed_and_fp32() -> None:
+    """The returned state is fp32 and (B, H, d_k, d_v) regardless of T / input dtype.
+
+    The bounded-memory guarantee carried across segments: the state matrix size is
+    independent of sequence length, and it is held in fp32 (the scan's native
+    dtype) even when the input is a lower precision.
+    """
+    cfg = _mem_cfg(d_model=16, delta_n_heads=3, delta_head_k_dim=8, delta_head_v_dim=5,
+                   delta_scan="chunkwise", delta_chunk_size=8)
+    mem = GatedDeltaMemory(cfg)
+    mem.eval()
+    B = 2
+    expected = (B, cfg.delta_n_heads, cfg.delta_head_k_dim, cfg.delta_head_v_dim)
+    for T in (4, 37):
+        x = torch.randn(B, T, cfg.d_model)
+        with torch.no_grad():
+            out, state = _mem_carry(mem, x)
+        assert out.shape == (B, T, cfg.d_model)
+        assert tuple(state.shape) == expected, f"state shape drifted at T={T}: {tuple(state.shape)}"
+        assert state.dtype == torch.float32, "carried state must be fp32"

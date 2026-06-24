@@ -84,7 +84,7 @@ path here is a **self-contained pure-PyTorch** implementation kept in fp32.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, cast, overload
 
 import torch
 import torch.nn as nn
@@ -207,9 +207,40 @@ class GatedDeltaMemory(nn.Module):
     # The sequential delta-rule scan (the pure-PyTorch core)
     # ------------------------------------------------------------------
 
+    @overload
     def _delta_scan(
-        self, q: Tensor, k: Tensor, v: Tensor, beta: Tensor, alpha: Tensor
-    ) -> Tensor:
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        beta: Tensor,
+        alpha: Tensor,
+        state_in: Tensor | None = ...,
+        return_state: Literal[False] = ...,
+    ) -> Tensor: ...
+
+    @overload
+    def _delta_scan(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        beta: Tensor,
+        alpha: Tensor,
+        state_in: Tensor | None,
+        return_state: Literal[True],
+    ) -> tuple[Tensor, Tensor]: ...
+
+    def _delta_scan(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        beta: Tensor,
+        alpha: Tensor,
+        state_in: Tensor | None = None,
+        return_state: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Sequential Gated-DeltaNet recurrence (the load-bearing math).
 
         Per head, maintaining ``S`` of shape ``(d_k, d_v)``::
@@ -221,19 +252,39 @@ class GatedDeltaMemory(nn.Module):
         Implemented batched over ``(B, H)`` with ``einsum``; the only Python loop
         is over the time axis ``T`` (like Mamba's selective scan).
 
+        **Cross-segment state carry (card 61f900ca).**  By default the state is
+        seeded at zero — the standard within-sequence DeltaNet, identical to the
+        original behaviour.  Passing ``state_in`` seeds the recurrence from a
+        *carried* state representing strictly-past tokens (e.g. the final state of
+        the previous segment), so the read at ``t = 0`` already sees that history.
+        Because the carried state is purely past, causality is preserved.  With
+        ``return_state=True`` the final ``S`` (after token ``T-1``'s write) is
+        returned alongside the outputs so it can be threaded into the next
+        segment.
+
         Args:
             q: ``(B, H, T, d_k)``  feature-mapped queries phi(q).
             k: ``(B, H, T, d_k)``  feature-mapped keys phi(k).
             v: ``(B, H, T, d_v)``  values.
             beta: ``(B, H, T)``    write strengths in (0, 1].
             alpha: ``(B, H, T)``   forget gates in (0, 1] (all-ones when ungated).
+            state_in: Optional initial state ``(B, H, d_k, d_v)`` to seed the
+                recurrence (default: a fresh zero state — reset-per-sequence).
+            return_state: When ``True`` also return the final state ``S``.
 
         Returns:
-            ``(B, H, T, d_v)`` per-head memory outputs.
+            ``(B, H, T, d_v)`` per-head memory outputs, or — when
+            ``return_state`` — a ``(outputs, final_state)`` tuple whose
+            ``final_state`` has shape ``(B, H, d_k, d_v)``.
         """
         B, H, T, _ = q.shape
         # Fixed-size state: (B, H, d_k, d_v) — INDEPENDENT of T (bounded memory).
-        S = torch.zeros(B, H, self.d_k, self.d_v, device=q.device, dtype=q.dtype)
+        # Seed from the carried state when given (cross-segment persistence);
+        # otherwise start at zero (the reset-per-sequence default).
+        if state_in is None:
+            S = torch.zeros(B, H, self.d_k, self.d_v, device=q.device, dtype=q.dtype)
+        else:
+            S = state_in
 
         outputs = []
         for t in range(T):
@@ -256,15 +307,49 @@ class GatedDeltaMemory(nn.Module):
             )
             S = alpha_t[..., None, None] * S + write
 
-        return torch.stack(outputs, dim=2)  # (B, H, T, d_v)
+        out = torch.stack(outputs, dim=2)  # (B, H, T, d_v)
+        if return_state:
+            return out, S
+        return out
 
     # ------------------------------------------------------------------
     # The chunkwise-parallel delta-rule scan (the fast path)
     # ------------------------------------------------------------------
 
+    @overload
     def _delta_scan_chunkwise(
-        self, q: Tensor, k: Tensor, v: Tensor, beta: Tensor, alpha: Tensor
-    ) -> Tensor:
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        beta: Tensor,
+        alpha: Tensor,
+        state_in: Tensor | None = ...,
+        return_state: Literal[False] = ...,
+    ) -> Tensor: ...
+
+    @overload
+    def _delta_scan_chunkwise(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        beta: Tensor,
+        alpha: Tensor,
+        state_in: Tensor | None,
+        return_state: Literal[True],
+    ) -> tuple[Tensor, Tensor]: ...
+
+    def _delta_scan_chunkwise(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        beta: Tensor,
+        alpha: Tensor,
+        state_in: Tensor | None = None,
+        return_state: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Chunkwise-parallel Gated-DeltaNet recurrence (the fast path).
 
         Mathematically identical to :meth:`_delta_scan` (validated bit-for-bit
@@ -299,15 +384,30 @@ class GatedDeltaMemory(nn.Module):
         with ones so padded steps neither read, write, nor decay); the padded
         tail is sliced off the output.
 
+        **Cross-segment state carry (card 61f900ca).**  The scan already threads
+        the carried state ``S0`` between chunks recurrently (``rhs`` subtracts the
+        decayed-state read, ``o`` adds it back, and ``S`` is carried out at the
+        end of each chunk).  Seeding ``S0`` from a non-zero ``state_in`` is the
+        *same* operation the inter-chunk carry performs, so it is correct by
+        construction.  Because the right-padded tail neither writes (``beta = 0``)
+        nor decays (``alpha = 1``), the post-loop state equals the true final
+        state after the real tokens — so it is safe to return even when
+        ``T % C != 0``.
+
         Args:
             q: ``(B, H, T, d_k)``  feature-mapped queries phi(q).
             k: ``(B, H, T, d_k)``  feature-mapped keys phi(k).
             v: ``(B, H, T, d_v)``  values.
             beta: ``(B, H, T)``    write strengths in (0, 1].
             alpha: ``(B, H, T)``   forget gates in (0, 1] (all-ones when ungated).
+            state_in: Optional initial state ``(B, H, d_k, d_v)`` to seed the
+                recurrence (default: a fresh zero state — reset-per-sequence).
+            return_state: When ``True`` also return the final state ``S``.
 
         Returns:
-            ``(B, H, T, d_v)`` per-head memory outputs (same as ``_delta_scan``).
+            ``(B, H, T, d_v)`` per-head memory outputs (same as ``_delta_scan``),
+            or — when ``return_state`` — a ``(outputs, final_state)`` tuple whose
+            ``final_state`` has shape ``(B, H, d_k, d_v)``.
         """
         B, H, T, d_k = q.shape
         d_v = v.shape[-1]
@@ -346,7 +446,13 @@ class GatedDeltaMemory(nn.Module):
         )
         neg_inf = torch.finfo(dtype).min
 
-        S = torch.zeros(B, H, d_k, d_v, dtype=dtype, device=device)
+        # Seed from the carried state when given (cross-segment persistence);
+        # otherwise start at zero (the reset-per-sequence default).  Seeding a
+        # non-zero S0 is exactly the inter-chunk carry the loop already performs.
+        if state_in is None:
+            S = torch.zeros(B, H, d_k, d_v, dtype=dtype, device=device)
+        else:
+            S = state_in
         outputs = []
         for c in range(n_chunks):
             k_c = k[:, :, c]                                  # (B,H,C,d_k)
@@ -396,16 +502,34 @@ class GatedDeltaMemory(nn.Module):
             )
 
         out = torch.stack(outputs, dim=2)                    # (B,H,nc,C,d_v)
-        return out.reshape(B, H, t_pad, d_v)[:, :, :T]        # drop padded tail
+        out = out.reshape(B, H, t_pad, d_v)[:, :, :T]        # drop padded tail
+        if return_state:
+            return out, S
+        return out
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        state_in: Tensor | None = None,
+        return_state: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Run the memory over a sequence.
 
         Args:
             x: ``(B, T, d_model)``.
+            state_in: Optional carried initial state ``(B, H, d_k, d_v)`` from a
+                previous segment (cross-segment persistence, card 61f900ca).
+                ``None`` (the default) resets the state to zero — the standard
+                within-sequence DeltaNet, byte-for-byte the original behaviour.
+                The state is held in fp32 (the scan's native dtype); a ``state_in``
+                of another dtype is cast to fp32 on entry.
+            return_state: When ``True`` also return the final state matrix so it
+                can be threaded into the next segment.
 
         Returns:
-            ``(B, T, d_model)``.
+            ``(B, T, d_model)``, or — when ``return_state`` — a
+            ``(out, state_out)`` tuple whose ``state_out`` is the fp32 final state
+            of shape ``(B, H, d_k, d_v)``.
         """
         B, T, _ = x.shape
         H, d_k, d_v = self.n_heads, self.d_k, self.d_v
@@ -430,13 +554,38 @@ class GatedDeltaMemory(nn.Module):
         # to the input dtype afterwards so bf16/amp paths see the right dtype.
         # The chunkwise fast path is the default; the sequential scan is the
         # validated reference/fallback.  Both return the SAME (B, H, T, d_v).
+        # The carried state is kept in fp32 throughout for the same reason.
         scan = (
             self._delta_scan_chunkwise
             if self.delta_scan == "chunkwise"
             else self._delta_scan
         )
-        out = scan(q.float(), k.float(), v.float(), beta.float(), alpha.float())
-        out = out.to(x.dtype)
+        # Carried state enters in fp32 (the scan's native dtype).  Note: this
+        # casts dtype only, not device — a carried ``state_in`` is assumed to be
+        # on the same device as ``x`` (true for all current call sites, which keep
+        # the state alongside the running segment).
+        state_in_f = None if state_in is None else state_in.float()
 
-        out = out.transpose(1, 2).reshape(B, T, H * d_v)  # (B, T, H*d_v)
-        return self.dropout(self.out_proj(out))
+        def _readout(out_raw: Tensor) -> Tensor:
+            """Cast back to the input dtype + per-head readout projection."""
+            out_raw = out_raw.to(x.dtype)
+            out_raw = out_raw.transpose(1, 2).reshape(B, T, H * d_v)  # (B,T,H*d_v)
+            return self.dropout(self.out_proj(out_raw))
+
+        if return_state:
+            raw, state_out = cast(
+                "tuple[Tensor, Tensor]",
+                scan(
+                    q.float(), k.float(), v.float(), beta.float(), alpha.float(),
+                    state_in=state_in_f, return_state=True,
+                ),
+            )
+            return _readout(raw), state_out
+        raw = cast(
+            Tensor,
+            scan(
+                q.float(), k.float(), v.float(), beta.float(), alpha.float(),
+                state_in=state_in_f, return_state=False,
+            ),
+        )
+        return _readout(raw)

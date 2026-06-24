@@ -24,9 +24,10 @@ changing the probe logic.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TypedDict
+from typing import TypedDict, cast
 
 import numpy as np
 import torch
@@ -326,3 +327,398 @@ def position_loss_curve(
         loss_sum += per_tok.sum(dim=0).double().cpu()
         count += per_tok.shape[0]
     return (loss_sum / max(1, count)).numpy()
+
+
+# ---------------------------------------------------------------------------
+# Cross-segment persistent-memory harness (card 61f900ca)
+# ---------------------------------------------------------------------------
+#
+# These probes drive ``delta_memory_lm`` over ORDERED consecutive segments,
+# carrying the per-layer delta-memory state across segment boundaries via the
+# piece-1 API ``forward(x, targets, states_in, return_states)``.  They are the
+# eval side of the "memory replaces the context window" thesis: with the state
+# CARRIED, information from an EARLIER segment is retrievable in a LATER segment
+# even though it lies outside that later segment's own window; with the state
+# RESET per segment, it cannot be.  Carry is defined over the delta-memory layers
+# only and assumes ``front_end="none"`` (the committed backbone) — see
+# ``DeltaMemoryLM.forward``.
+
+
+@dataclass
+class SegmentRun:
+    """Outcome of running a model over an ordered list of segments.
+
+    Attributes:
+        carried: Whether the per-layer state was carried across boundaries
+            (``True``) or reset per segment (``False``).
+        per_segment_logits: One ``(B, T_i, vocab)`` logits tensor per segment.
+        final_states: The per-block final states after the last segment when
+            ``carried`` (each ``(B, H, d_k, d_v)``), else ``None``.
+    """
+
+    carried: bool
+    per_segment_logits: list[Tensor]
+    final_states: list[Tensor] | None
+
+
+def _supports_state_carry(model: nn.Module) -> bool:
+    """Heuristic: does ``model.forward`` accept ``states_in`` / ``return_states``?
+
+    ``delta_memory_lm`` does (card 61f900ca); the baselines do not.  The harness
+    falls back to plain per-segment forwards for models without the API, so the
+    reset-mode comparison still runs for any model.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(model.forward).parameters
+    except (TypeError, ValueError):  # pragma: no cover - exotic forwards
+        return False
+    return "states_in" in params and "return_states" in params
+
+
+@torch.no_grad()
+def run_segments(
+    model: nn.Module,
+    segments: Sequence[Tensor],
+    carry: bool = True,
+    device: torch.device | None = None,
+) -> SegmentRun:
+    """Run *model* over ordered *segments*, optionally carrying per-layer state.
+
+    Each segment is a ``(B, T_i)`` (or ``(T_i,)``) block of token ids; the
+    segments are consecutive pieces of one stream.  When ``carry`` is ``True``
+    and the model exposes the state-carry API (``delta_memory_lm``), the per-block
+    final delta-memory state from each segment seeds the next — so a later
+    segment sees the whole prior stream through the bounded memory, not just its
+    own ``T_i`` tokens.  When ``carry`` is ``False`` (or the model lacks the API)
+    each segment is run independently (state reset) — the control condition.
+
+    Args:
+        model: Registered model.  ``delta_memory_lm`` carries state; others are
+            run per segment (reset) regardless of ``carry``.
+        segments: Ordered consecutive token-id blocks (``(B, T_i)`` or ``(T_i,)``).
+        carry: Carry the per-layer state across boundaries (default ``True``).
+        device: Inference device (defaults to CPU).
+
+    Returns:
+        A :class:`SegmentRun` with one logits tensor per segment and the final
+        per-block states (when carried).
+    """
+    if device is None:
+        device = torch.device("cpu")
+    model.eval()
+    if not segments:
+        raise ValueError("segments must be non-empty")
+
+    use_carry = carry and _supports_state_carry(model)
+    states: list[Tensor] | None = None
+    per_segment_logits: list[Tensor] = []
+    for seg in segments:
+        ids = seg.to(device)
+        if ids.dim() == 1:
+            ids = ids.unsqueeze(0)
+        if use_carry:
+            _, logits, states = cast(
+                "tuple[Tensor, Tensor, list[Tensor]]",
+                model(ids, None, states, True),
+            )
+        else:
+            _, logits = model(ids)
+        per_segment_logits.append(logits)
+
+    return SegmentRun(
+        carried=use_carry,
+        per_segment_logits=per_segment_logits,
+        final_states=states if use_carry else None,
+    )
+
+
+@dataclass
+class CrossSegmentPasskey:
+    """A multi-segment passkey example whose answer is OUTSIDE the query segment.
+
+    The passkey lives in segment 0; segments ``1..k-2`` are semantically-empty
+    filler; the query ("What is the pass key? ...") is in the final segment ``k-1``.
+    A model that processes the segments INDEPENDENTLY (reset state) cannot answer
+    — the key is not in the final segment's own window.  Only a CARRIED bounded
+    memory can retrieve it, which is exactly the property under test.
+
+    Attributes:
+        segment_ids: One ``(T_i,)`` LongTensor of token ids per segment.
+        answer: The ground-truth passkey string.
+        query_segment_index: Index of the segment holding the query (the last).
+        passkey_segment_index: Index of the segment holding the key (0).
+        total_tokens: Total token count across all segments.
+    """
+
+    segment_ids: list[Tensor]
+    answer: str
+    query_segment_index: int
+    passkey_segment_index: int
+    total_tokens: int
+
+
+def make_cross_segment_passkey(
+    passkey: str,
+    n_segments: int,
+    segment_tokens: int,
+    vocab_size: int = 256,
+    encode: EncodeFn = _byte_encode,
+) -> CrossSegmentPasskey:
+    """Build a multi-segment passkey example (key in seg 0, query in the last seg).
+
+    Segment 0 holds the preamble + passkey sentence padded to ``segment_tokens``;
+    segments ``1..n-2`` are pure filler of ``segment_tokens`` each; the final
+    segment holds the question.  Each segment is independently tokenised so the
+    pieces tile a single stream when run in order.
+
+    Args:
+        passkey: The secret to hide in segment 0 and score against.
+        n_segments: Number of segments (``>= 2``: at least key-segment + query).
+        segment_tokens: Approximate token length of each non-final segment.
+        vocab_size: Token vocab (ids are taken mod ``vocab_size`` for byte mode).
+        encode: String -> token-id encoder (default byte-level).
+
+    Returns:
+        A :class:`CrossSegmentPasskey`.
+
+    Raises:
+        ValueError: If ``n_segments < 2`` or ``segment_tokens < 1``.
+    """
+    if n_segments < 2:
+        raise ValueError(f"n_segments must be >= 2, got {n_segments}")
+    if segment_tokens < 1:
+        raise ValueError(f"segment_tokens must be >= 1, got {segment_tokens}")
+
+    def _to_ids(text: str) -> Tensor:
+        return torch.tensor([t % vocab_size for t in encode(text)], dtype=torch.long)
+
+    def _pad_text_to(base: str, target: int) -> str:
+        """Repeat filler after *base* until it reaches ~*target* encoded tokens."""
+        text = base
+        while len(encode(text)) < target:
+            text += _FILLER
+        return text
+
+    passkey_sentence = _PASSKEY_TEMPLATE.format(key=passkey)
+    seg0_text = _pad_text_to(_PREAMBLE + passkey_sentence, segment_tokens)
+
+    segment_texts = [seg0_text]
+    for _ in range(n_segments - 2):
+        segment_texts.append(_pad_text_to(_FILLER, segment_tokens))
+    segment_texts.append(_QUESTION)  # final query segment
+
+    segment_ids = [_to_ids(t) for t in segment_texts]
+    total = int(sum(int(s.numel()) for s in segment_ids))
+    return CrossSegmentPasskey(
+        segment_ids=segment_ids,
+        answer=passkey,
+        query_segment_index=n_segments - 1,
+        passkey_segment_index=0,
+        total_tokens=total,
+    )
+
+
+class CrossSegmentPasskeyResult(TypedDict):
+    """Outcome of a cross-segment passkey probe in one mode (carry or reset)."""
+
+    carried: bool
+    retrieved: bool
+    generated: str
+    query_segment_tokens: int
+    answer_outside_query_window: bool
+
+
+@torch.no_grad()
+def score_cross_segment_passkey(
+    model: nn.Module,
+    example: CrossSegmentPasskey,
+    carry: bool = True,
+    vocab_size: int = 256,
+    decode: Callable[[Sequence[int]], str] | None = None,
+    device: torch.device | None = None,
+) -> CrossSegmentPasskeyResult:
+    """Score cross-segment passkey retrieval in carry or reset mode.
+
+    Feeds segments ``0..k-2`` to build up (carry) or discard (reset) the memory
+    state, then greedily decodes the answer from the FINAL (query) segment seeded
+    with the carried (or fresh) state, and scores exact-match retrieval.  In reset
+    mode the query segment sees none of the earlier segments, so retrieval is
+    impossible by construction — the discriminating control.
+
+    Args:
+        model: Registered model (carry only takes effect for ``delta_memory_lm``).
+        example: A :class:`CrossSegmentPasskey`.
+        carry: Carry the state across the priming segments (default ``True``).
+        vocab_size: Token vocab.
+        decode: Token-id -> string decoder (default: byte decode).
+        device: Inference device.
+
+    Returns:
+        A :class:`CrossSegmentPasskeyResult`.
+    """
+    if device is None:
+        device = torch.device("cpu")
+    model.eval()
+
+    def _default_byte_decode(ids: Sequence[int]) -> str:
+        return bytes(int(i) % 256 for i in ids).decode("utf-8", errors="replace")
+
+    decode_fn: Callable[[Sequence[int]], str] = decode or _default_byte_decode
+
+    segments = example.segment_ids
+    prime, query = segments[:-1], segments[-1]
+    use_carry = carry and _supports_state_carry(model)
+
+    # Prime the memory over the leading segments (key + filler).  In reset mode we
+    # simply do not carry the resulting state into the query segment.
+    states: list[Tensor] | None = None
+    if use_carry:
+        primed = run_segments(model, prime, carry=True, device=device)
+        states = primed.final_states
+
+    # Greedy-decode the answer from the query segment, seeded with the carried
+    # state (carry) or a fresh state (reset).
+    query_ids = query.to(device).unsqueeze(0)
+    generated_ids = _greedy_generate_with_state(
+        model,
+        query_ids,
+        max_new_tokens=len(example.answer) + 2,
+        states_in=states,
+        device=device,
+    )
+    generated = decode_fn(generated_ids)
+    retrieved = score_passkey_retrieval(generated, example.answer)
+    return {
+        "carried": use_carry,
+        "retrieved": retrieved,
+        "generated": generated,
+        "query_segment_tokens": int(query.numel()),
+        # The key is in segment 0; the query segment is the last one, so the
+        # answer is always outside the query segment's own window.
+        "answer_outside_query_window": example.query_segment_index
+        != example.passkey_segment_index,
+    }
+
+
+@torch.no_grad()
+def _greedy_generate_with_state(
+    model: nn.Module,
+    prompt_ids: Tensor,
+    max_new_tokens: int,
+    states_in: list[Tensor] | None,
+    device: torch.device,
+) -> list[int]:
+    """Greedy-decode from *prompt_ids* seeded with carried per-layer *states_in*.
+
+    Re-runs the growing query segment from ``states_in`` each step (the carried
+    state represents the PRIOR segments, which never change), so the decode is
+    causal and the carried memory is visible at every generated position.  Falls
+    back to the stateless :func:`greedy_generate` when the model lacks the API.
+
+    Cost: O(T^2) in the query-segment length (the full query is re-run per
+    generated token), like :func:`greedy_generate`.  Fine for the eval harness
+    (short answers); do NOT reuse on a latency-sensitive path without an
+    incremental decode.
+    """
+    if not _supports_state_carry(model) or states_in is None:
+        return greedy_generate(model, prompt_ids, max_new_tokens, device=device)
+
+    ids = prompt_ids.to(device)
+    if ids.dim() == 1:
+        ids = ids.unsqueeze(0)
+    generated: list[int] = []
+    for _ in range(max_new_tokens):
+        _, logits, _ = cast(
+            "tuple[Tensor, Tensor, list[Tensor]]",
+            model(ids, None, states_in, True),
+        )
+        next_id = int(logits[0, -1].argmax().item())
+        generated.append(next_id)
+        ids = torch.cat([ids, torch.tensor([[next_id]], device=device)], dim=1)
+    return generated
+
+
+@torch.no_grad()
+def carried_stream_bpb(
+    model: nn.Module,
+    stream: Tensor,
+    segment_len: int,
+    carry: bool = True,
+    device: torch.device | None = None,
+) -> float:
+    """Bits-per-byte of a long byte *stream* run in ordered segments.
+
+    Splits the ``(L,)`` (or ``(1, L)``) byte stream into consecutive
+    ``segment_len`` chunks and runs them in order.  With ``carry`` the per-layer
+    delta-memory state threads across segment boundaries (so each segment is
+    scored *with* the prior stream in memory); with ``carry=False`` each segment
+    is scored independently (reset) — the control.  Each segment contributes its
+    ``T_i - 1`` within-segment next-token positions (predict ``ids[1:]`` from
+    ``ids[:-1]``); these positions are where the carried memory shows up.  The
+    cross-boundary prediction of each segment's first token (the discarded last
+    logit of the previous forward) is NOT explicitly scored, so carry and reset
+    are scored over the same positions and differ only in the state those
+    positions see.  The summed loss is converted to bits per byte.
+
+    Args:
+        model: Registered model (carry only takes effect for ``delta_memory_lm``).
+        stream: ``(L,)`` or ``(1, L)`` byte-id stream, ``L >= 2``.
+        segment_len: Tokens per segment (``>= 1``).
+        carry: Carry state across segments (default ``True``).
+        device: Inference device.
+
+    Returns:
+        Mean bits-per-byte over all scored next-token positions.
+    """
+    if device is None:
+        device = torch.device("cpu")
+    model.eval()
+    if segment_len < 1:
+        raise ValueError(f"segment_len must be >= 1, got {segment_len}")
+    if stream.dim() == 2 and stream.shape[0] == 1:
+        stream = stream[0]
+    if stream.dim() != 1:
+        raise ValueError(f"stream must be 1-D (L,) or (1, L), got {tuple(stream.shape)}")
+    L = int(stream.numel())
+    if L < 2:
+        raise ValueError(f"stream must have length >= 2, got L={L}")
+
+    stream = stream.to(device)
+    use_carry = carry and _supports_state_carry(model)
+    states: list[Tensor] | None = None
+    nats_sum = 0.0
+    tokens = 0
+
+    for start in range(0, L, segment_len):
+        seg = stream[start : start + segment_len]
+        if seg.numel() < 2:
+            # A length-1 tail has no in-segment next-token target; still feed it
+            # so the carried state advances, but it contributes no scored tokens.
+            if use_carry and seg.numel() == 1:
+                _, _, states = cast(
+                    "tuple[Tensor, Tensor, list[Tensor]]",
+                    model(seg.unsqueeze(0), None, states, True),
+                )
+            continue
+        ids = seg.unsqueeze(0)
+        if use_carry:
+            _, logits, states = cast(
+                "tuple[Tensor, Tensor, list[Tensor]]",
+                model(ids, None, states, True),
+            )
+        else:
+            _, logits = model(ids)
+
+        # In-segment next-token positions: predict ids[1:] from ids[:-1].  With
+        # carry these positions see the prior stream through the threaded state;
+        # under reset they see only the current segment — that is the comparison.
+        in_logits = logits[0, :-1]              # (T-1, vocab)
+        in_tgt = seg[1:]                        # (T-1,)
+        nats = nn.functional.cross_entropy(in_logits, in_tgt, reduction="sum")
+        nats_sum += float(nats)
+        tokens += int(in_tgt.numel())
+
+    mean_nats = nats_sum / max(1, tokens)
+    return mean_nats / math.log(2.0)

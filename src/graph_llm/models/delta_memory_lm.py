@@ -36,7 +36,7 @@ Contracts honoured (zero trainer changes):
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast, overload
 
 import torch
 import torch.nn as nn
@@ -89,7 +89,34 @@ class DeltaMemoryBlock(nn.Module):
         self.norm2 = RMSNorm(m.d_model)
         self.mlp = GatedMLP(m.d_model, m.delta_ff_mult * m.d_model, m.delta_dropout)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        state_in: Tensor | None = None,
+        return_state: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        """Pre-norm residual block forward.
+
+        Args:
+            x: ``(B, T, d_model)``.
+            state_in: Optional carried delta-memory state ``(B, H, d_k, d_v)`` for
+                the mixer (cross-segment persistence, card 61f900ca).  ``None`` is
+                the reset default — byte-for-byte the original behaviour.
+            return_state: When ``True`` also return the mixer's final state.
+
+        Returns:
+            ``(B, T, d_model)``, or — when ``return_state`` — a
+            ``(out, mixer_state_out)`` tuple.  Only the token-mixer carries a
+            cross-segment state; the gated MLP is per-position.
+        """
+        if return_state:
+            mixed, state_out = cast(
+                "tuple[Tensor, Tensor]",
+                self.mixer(self.norm1(x), state_in=state_in, return_state=True),
+            )
+            x = x + mixed
+            x = x + self.mlp(self.norm2(x))
+            return x, state_out
         x = x + self.mixer(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
@@ -174,18 +201,79 @@ class DeltaMemoryLM(nn.Module):
             nn.init.normal_(block.mixer.out_proj.weight, mean=0.0, std=residual_std)
             nn.init.normal_(block.mlp.down_proj.weight, mean=0.0, std=residual_std)
 
-    def _forward_blocks(self, x: Tensor) -> Tensor:
-        for block in self.blocks:
-            if self.activation_checkpointing and self.training:
-                x = cast(
-                    Tensor,
-                    torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False),
-                )
-            else:
-                x = block(x)
-        return x
+    def _forward_blocks(
+        self,
+        x: Tensor,
+        states_in: list[Tensor] | None = None,
+        return_states: bool = False,
+    ) -> Tensor | tuple[Tensor, list[Tensor]]:
+        """Run the block stack, optionally threading per-layer carried states.
 
-    def forward(self, x: Tensor, targets: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        The default path (``states_in=None, return_states=False``) is unchanged:
+        each block resets its delta-memory state, with activation checkpointing
+        when training.  When carrying state (card 61f900ca) each block is seeded
+        from its entry in ``states_in`` and its final state collected into
+        ``states_out``; this is an eval-time path, so checkpointing is bypassed
+        (it is a no-op under ``no_grad`` anyway and complicates multi-output
+        checkpointing).
+
+        Args:
+            x: ``(B, T, d_model)``.
+            states_in: Optional list of per-block carried states (length =
+                ``len(self.blocks)``), each ``(B, H, d_k, d_v)`` or ``None`` for a
+                reset block.
+            return_states: When ``True`` also return the per-block final states.
+
+        Returns:
+            ``(B, T, d_model)``, or — when ``return_states`` — a
+            ``(out, states_out)`` tuple with one final state per block.
+        """
+        if states_in is None and not return_states:
+            for block in self.blocks:
+                if self.activation_checkpointing and self.training:
+                    x = cast(
+                        Tensor,
+                        torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False),
+                    )
+                else:
+                    x = cast(Tensor, block(x))
+            return x
+
+        states_out: list[Tensor] = []
+        for i, block in enumerate(self.blocks):
+            state_in = states_in[i] if states_in is not None else None
+            x, state_out = cast(
+                "tuple[Tensor, Tensor]",
+                block(x, state_in=state_in, return_state=True),
+            )
+            states_out.append(state_out)
+        return x, states_out
+
+    @overload
+    def forward(
+        self,
+        x: Tensor,
+        targets: Tensor | None = ...,
+        states_in: list[Tensor] | None = ...,
+        return_states: Literal[False] = ...,
+    ) -> tuple[Tensor, Tensor]: ...
+
+    @overload
+    def forward(
+        self,
+        x: Tensor,
+        targets: Tensor | None,
+        states_in: list[Tensor] | None,
+        return_states: Literal[True],
+    ) -> tuple[Tensor, Tensor, list[Tensor]]: ...
+
+    def forward(
+        self,
+        x: Tensor,
+        targets: Tensor | None = None,
+        states_in: list[Tensor] | None = None,
+        return_states: bool = False,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, list[Tensor]]:
         """Forward pass.
 
         Args:
@@ -193,10 +281,27 @@ class DeltaMemoryLM(nn.Module):
             targets: Target token ids, shape ``(B, T)``.  If provided, the
                 cross-entropy loss is computed over the full sequence; if
                 ``None`` a zero loss tensor is returned (eval / generation).
+            states_in: Optional list of per-block carried delta-memory states
+                (length = ``delta_layers``), each ``(B, H, d_k, d_v)`` or ``None``
+                to reset that block.  Enables cross-segment persistence (card
+                61f900ca): seed each block's memory from the previous segment's
+                final state.  Default ``None`` resets every block — byte-for-byte
+                the committed within-sequence behaviour.
+            return_states: When ``True`` the per-block final states are returned
+                as a third element so they can be threaded into the next segment.
 
         Returns:
-            ``(loss, logits)`` — scalar ``loss`` and ``(B, T, vocab_size)``
-            ``logits``.
+            ``(loss, logits)`` by default — scalar ``loss`` and
+            ``(B, T, vocab_size)`` ``logits``; the only contract the Trainer
+            depends on.  When ``return_states=True``, ``(loss, logits,
+            states_out)`` with one final state per block.
+
+        Note:
+            Cross-segment carry assumes ``front_end="none"`` (the committed
+            backbone): the optional ``multiscale_conv`` front-end left-zero-pads
+            each call, so a naive per-segment forward would not match a single
+            full-sequence forward at segment boundaries.  The carried state covers
+            the delta-memory layers only.
         """
         h = self.embed_drop(self.embed(x))
         # Optional cheap local combiner (card ed853f9c): enrich each token with
@@ -205,7 +310,15 @@ class DeltaMemoryLM(nn.Module):
         # backbone, unchanged).
         if self.front_end is not None:
             h = self.front_end(h)
-        h = self._forward_blocks(h)
+
+        states_out: list[Tensor] | None = None
+        if return_states:
+            h, states_out = cast(
+                "tuple[Tensor, list[Tensor]]",
+                self._forward_blocks(h, states_in=states_in, return_states=True),
+            )
+        else:
+            h = cast(Tensor, self._forward_blocks(h, states_in=states_in))
         h = self.norm_out(h)
         logits = self.lm_head(h)
 
@@ -214,6 +327,8 @@ class DeltaMemoryLM(nn.Module):
         else:
             loss = torch.zeros(1, device=x.device)
 
+        if states_out is not None:
+            return loss, logits, states_out
         return loss, logits
 
     def num_parameters(self, trainable_only: bool = True) -> int:

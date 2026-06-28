@@ -16,6 +16,32 @@ exercise the pipeline.
 
 from __future__ import annotations
 
-from .loader import ByteLevelEncoder, SyntheticDataset, build_dataloaders
+from .loader import (
+    ByteLevelEncoder,
+    OrderedSegment,
+    OrderedSegmentStream,
+    SyntheticDataset,
+    build_dataloaders,
+    iter_ordered_segments,
+    load_text8_bytes,
+)
+from .synthetic_tasks import (
+    CrossSegmentTask,
+    CrossSegmentTaskSampler,
+    make_cross_segment_task,
+    masked_token_loss,
+)
 
-__all__ = ["build_dataloaders", "SyntheticDataset", "ByteLevelEncoder"]
+__all__ = [
+    "build_dataloaders",
+    "SyntheticDataset",
+    "ByteLevelEncoder",
+    "OrderedSegment",
+    "OrderedSegmentStream",
+    "iter_ordered_segments",
+    "load_text8_bytes",
+    "CrossSegmentTask",
+    "CrossSegmentTaskSampler",
+    "make_cross_segment_task",
+    "masked_token_loss",
+]

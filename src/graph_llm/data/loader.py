@@ -6,6 +6,7 @@ The smoke path (source="synthetic") is fully offline and deterministic.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -101,6 +102,155 @@ class _TextChunkDataset(Dataset):
         start = idx * self._seq_len
         chunk = self._tokens[start : start + self._seq_len + 1]
         return chunk[:-1], chunk[1:]
+
+
+# ---------------------------------------------------------------------------
+# Ordered-segment stream (cross-segment persistent-memory training — card
+# 61f900ca, piece 3)
+# ---------------------------------------------------------------------------
+#
+# The standard ``_TextChunkDataset`` + shuffled ``DataLoader`` above deliberately
+# SHUFFLES chunks, which destroys cross-chunk continuity — fine for the committed
+# within-sequence training, useless for teaching the delta-memory state to carry
+# across boundaries.  The ordered stream below is the contrast: it yields ORDERED
+# CONTIGUOUS segments so consecutive segments tile a single continuous stream, and
+# the SegmentedTrainer carries the per-layer memory state across them.  It is
+# additive — the shuffled path is untouched.
+
+
+@dataclass
+class OrderedSegment:
+    """One ordered contiguous segment of the byte stream.
+
+    Attributes:
+        inputs: ``(B, segment_len)`` input token ids.
+        targets: ``(B, segment_len)`` next-token targets (the stream shifted by 1).
+        stream_reset: ``True`` iff this segment begins a fresh stream window and the
+            carried per-layer memory state must be DROPPED (reset) before it — a
+            simulated document boundary, or the very first segment.  ``False`` means
+            the carried state from the previous segment continues into this one.
+    """
+
+    inputs: torch.Tensor
+    targets: torch.Tensor
+    stream_reset: bool
+
+
+class OrderedSegmentStream:
+    """Iterator over ORDERED CONTIGUOUS segments of a flat token stream.
+
+    The flat ``tokens`` array is split into ``batch_size`` equal-length parallel
+    sub-streams (strided so each row is a contiguous slice of the original stream),
+    then walked left-to-right in ``segment_len``-token segments.  Consecutive
+    segments tile each sub-stream continuously, so a model that carries its state
+    across segment boundaries sees the whole prior sub-stream through its bounded
+    memory — exactly what the cross-segment-memory training needs.  This is the
+    deliberate contrast with the shuffled ``_TextChunkDataset`` loader (kept intact).
+
+    A ``stream_reset`` flag is raised on the first segment and every
+    ``stream_reset_interval`` segments thereafter (``0`` == only the first), telling
+    the trainer to drop the carried state there (a simulated document boundary;
+    text8 is one long stream, so the default never resets within it).
+
+    Args:
+        tokens: 1-D ``int64`` token array (the whole stream).
+        segment_len: Tokens per segment ``T`` (``>= 1``).
+        batch_size: Number ``B`` of parallel sub-streams.
+        stream_reset_interval: Reset the carried state every this many segments
+            (``0`` == never reset within the stream, only the first segment resets).
+
+    Yields:
+        :class:`OrderedSegment` instances, in stream order, until each sub-stream is
+        exhausted.  The number of segments per epoch is
+        ``(len(tokens) // batch_size - 1) // segment_len``.
+    """
+
+    def __init__(
+        self,
+        tokens: np.ndarray,
+        segment_len: int,
+        batch_size: int,
+        stream_reset_interval: int = 0,
+    ) -> None:
+        if segment_len < 1:
+            raise ValueError(f"segment_len must be >= 1, got {segment_len}")
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        if stream_reset_interval < 0:
+            raise ValueError(
+                f"stream_reset_interval must be >= 0, got {stream_reset_interval}"
+            )
+        tokens = np.asarray(tokens)
+        if tokens.ndim != 1:
+            raise ValueError(f"tokens must be 1-D, got shape {tokens.shape}")
+
+        # Carve the stream into B contiguous equal-length sub-streams.  We need one
+        # extra token per row so the last input has a target.
+        per_stream = len(tokens) // batch_size
+        if per_stream < segment_len + 1:
+            raise ValueError(
+                f"stream too short: {len(tokens)} tokens / {batch_size} streams = "
+                f"{per_stream} per stream < segment_len+1 = {segment_len + 1}"
+            )
+        usable = per_stream * batch_size
+        grid = tokens[:usable].reshape(batch_size, per_stream)
+        self._grid = torch.from_numpy(np.ascontiguousarray(grid)).long()
+        self._segment_len = segment_len
+        self._batch_size = batch_size
+        self._stream_reset_interval = stream_reset_interval
+        # We can emit a segment whenever inputs [s, s+T) AND target [s+1, s+T+1) fit.
+        self._n_segments = (per_stream - 1) // segment_len
+
+    def __len__(self) -> int:
+        return self._n_segments
+
+    def __iter__(self):  # noqa: ANN204 — Iterator[OrderedSegment]
+        T = self._segment_len
+        for i in range(self._n_segments):
+            start = i * T
+            inputs = self._grid[:, start : start + T]
+            targets = self._grid[:, start + 1 : start + T + 1]
+            if self._stream_reset_interval == 0:
+                reset = i == 0
+            else:
+                reset = i % self._stream_reset_interval == 0
+            yield OrderedSegment(inputs=inputs, targets=targets, stream_reset=reset)
+
+
+def iter_ordered_segments(
+    tokens: np.ndarray,
+    segment_len: int,
+    batch_size: int,
+    stream_reset_interval: int = 0,
+):  # noqa: ANN201 — Iterator[OrderedSegment]
+    """Convenience: build and iterate an :class:`OrderedSegmentStream` in one call.
+
+    Equivalent to ``iter(OrderedSegmentStream(...))``; see that class for argument
+    semantics.
+    """
+    return iter(
+        OrderedSegmentStream(
+            tokens,
+            segment_len=segment_len,
+            batch_size=batch_size,
+            stream_reset_interval=stream_reset_interval,
+        )
+    )
+
+
+def load_text8_bytes(cfg: DataConfig) -> np.ndarray | None:
+    """Load the cached text8 byte stream as an ``int64`` token array.
+
+    Reads the lazy on-disk cache written by :func:`_load_or_fetch_bytes` (the same
+    ``data/text8.bin`` path the canonical loaders use).  Returns ``None`` when the
+    cache is absent and the corpus cannot be fetched (offline), so callers can fall
+    back to synthetic data without a hard failure.  Used by the SegmentedTrainer to
+    build an ordered-segment stream over the one long text8 stream.
+    """
+    raw = _load_or_fetch_bytes(cfg, "text8", _fetch_text8_bytes)
+    if raw is None:
+        return None
+    return _bytes_to_tokens(raw)
 
 
 # ---------------------------------------------------------------------------

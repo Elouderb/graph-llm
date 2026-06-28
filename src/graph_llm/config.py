@@ -150,6 +150,46 @@ class ModelConfig:
     # for cheapness when True; a single full 1-D conv per scale when False.
     conv_depthwise: bool = True
 
+    # --- Cross-segment persistent-memory TRAINING hyperparameters (card 61f900ca,
+    # piece 3) ---
+    # Consumed by train/segmented.py + data/loader.py (ordered-segment stream) and
+    # data/synthetic_tasks.py (cross-segment retrieval tasks).  Ignored by the
+    # standard Trainer and every model forward — these only configure the OPTIONAL
+    # SegmentedTrainer, which teaches delta_memory_lm to USE its carried
+    # cross-segment state (the piece-1 forward(x, targets, states_in, return_states)
+    # API).  The committed within-sequence training path is byte-for-byte unchanged.
+    #
+    # Length of each ordered contiguous segment (the truncated-BPTT unit).  The
+    # stream is sliced into these in order; the per-layer delta-memory state is
+    # carried across segment boundaries.
+    segment_len: int = 128
+    # Truncated-BPTT window K (Transformer-XL style): gradients flow within a window
+    # of K consecutive segments, then the carried state is DETACHED before the next
+    # window so the graph never grows past K segments.  Per arXiv 2507.02782 a SHORT
+    # window suffices — the dominant lever is EXPOSURE to realistic carried-state
+    # distributions (which the carry itself provides), not deep BPTT.  K=1 == detach
+    # every segment (pure exposure, no through-segment gradient).
+    bptt_window: int = 2
+    # Reset the carried state every this many segments (0 == never reset within the
+    # stream; text8 is one long stream so the default carries across the whole of it,
+    # periodically detached by the K-window).  >0 simulates document boundaries.
+    stream_reset_interval: int = 0
+    # Probability that a truncated-BPTT window's INITIAL carried state is replaced by
+    # a noise-perturbed version of the carried state (state-distribution exposure
+    # augmentation, arXiv 2507.02782): broadens the attainable-state distribution the
+    # model is trained to read from, so it learns to use long-accumulated states
+    # robustly.  0.0 == off (no augmentation; standard carry only).
+    state_noise_prob: float = 0.0
+    # Std of the Gaussian perturbation added to the carried state when the state-noise
+    # augmentation fires (relative to the carried state's own RMS scale).
+    state_noise_std: float = 0.1
+    # Fraction of training steps that draw a synthetic cross-segment retrieval task
+    # (key/passkey in an EARLY segment, query in a LATER segment, answer OUTSIDE the
+    # query segment's own window) instead of an ordered text-stream window.  Plain LM
+    # perplexity does not force far-back use; these tasks do.  0.0 == off (LM stream
+    # only).
+    synthetic_task_fraction: float = 0.0
+
 
 @dataclass
 class DataConfig:

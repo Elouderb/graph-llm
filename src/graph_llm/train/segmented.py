@@ -43,6 +43,7 @@ pattern from the standard Trainer (torch 2.5 API: ``GradScaler("cuda")``,
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
@@ -53,6 +54,7 @@ from torch.amp.grad_scaler import GradScaler
 
 from graph_llm.data.loader import OrderedSegmentStream
 from graph_llm.data.synthetic_tasks import CrossSegmentTaskSampler, masked_token_loss
+from graph_llm.models.components.delta_memory import DeltaMemoryState
 from graph_llm.train.optim import build_optimizer, build_scheduler
 from graph_llm.utils.logging import get_logger, log_metrics, setup_logging
 from graph_llm.utils.seed import seed_everything
@@ -65,33 +67,68 @@ if TYPE_CHECKING:
 _log = get_logger("segmented_trainer")
 
 
-def detach_states(states: list[Tensor] | None) -> list[Tensor] | None:
+# A per-layer carried state is a DeltaMemoryState (the delta-memory matrix + the
+# causal-conv tail, card 571d50ec).  A bare Tensor is still accepted for the
+# legacy pre-conv path (and tests that hand-build raw states) — both are handled
+# uniformly by mapping the detach/perturb over their constituent tensors.
+
+
+def _detach_one(s: DeltaMemoryState | Tensor) -> DeltaMemoryState | Tensor:
+    """Detach one per-layer state (a :class:`DeltaMemoryState` or a bare Tensor)."""
+    if isinstance(s, DeltaMemoryState):
+        return DeltaMemoryState(
+            memory=s.memory.detach(),
+            conv_tail=None if s.conv_tail is None else s.conv_tail.detach(),
+        )
+    return s.detach()
+
+
+def detach_states(
+    states: Sequence[DeltaMemoryState | Tensor] | None,
+) -> list[DeltaMemoryState | Tensor] | None:
     """Detach every per-layer carried state, severing the autograd graph.
 
-    Returns a NEW list of detached tensors (``requires_grad`` False, ``grad_fn``
-    ``None``), or ``None`` if ``states`` is ``None``.  Called at every truncated-BPTT
-    window boundary so the next window's gradients cannot flow back through the
-    carried state — the defining property of truncated BPTT.
+    Returns a NEW list whose tensors are detached (``requires_grad`` False,
+    ``grad_fn`` ``None``), or ``None`` if ``states`` is ``None``.  Called at every
+    truncated-BPTT window boundary so the next window's gradients cannot flow back
+    through the carried state — the defining property of truncated BPTT.  Each
+    per-layer state is a :class:`DeltaMemoryState` (both the delta-memory matrix
+    and the conv tail are detached); a bare ``Tensor`` is also accepted for the
+    pre-conv path.
     """
     if states is None:
         return None
-    return [s.detach() for s in states]
+    return [_detach_one(s) for s in states]
+
+
+def _perturb_tensor(
+    s: Tensor, noise_std: float, generator: torch.Generator | None
+) -> Tensor:
+    """RMS-scaled Gaussian perturbation of one tensor, detached."""
+    s = s.detach()
+    rms = s.pow(2).mean().clamp_min(1e-12).sqrt()
+    noise = torch.empty_like(s).normal_(generator=generator)
+    return s + noise_std * rms * noise
 
 
 def perturb_states(
-    states: list[Tensor] | None,
+    states: Sequence[DeltaMemoryState | Tensor] | None,
     noise_std: float,
     generator: torch.Generator | None = None,
-) -> list[Tensor] | None:
+) -> list[DeltaMemoryState | Tensor] | None:
     """Add RMS-scaled Gaussian noise to each carried state (exposure augmentation).
 
-    The perturbation magnitude is ``noise_std`` times each state's own RMS, so the
-    noise is meaningful regardless of the state's scale.  The result is detached
-    (it seeds a fresh window).  Returns ``None`` if ``states`` is ``None``.
+    The perturbation magnitude is ``noise_std`` times each tensor's own RMS, so the
+    noise is meaningful regardless of scale.  Both the delta-memory matrix and the
+    causal-conv tail of each :class:`DeltaMemoryState` are perturbed (the conv tail
+    is part of the carried context the model must learn to read from).  The result
+    is detached (it seeds a fresh window).  Returns ``None`` if ``states`` is
+    ``None``.
 
     Args:
-        states: Per-layer carried states (each ``(B, H, d_k, d_v)``) or ``None``.
-        noise_std: Std of the Gaussian noise relative to each state's RMS.
+        states: Per-layer carried states (each a :class:`DeltaMemoryState` or a
+            bare ``(B, H, d_k, d_v)`` tensor) or ``None``.
+        noise_std: Std of the Gaussian noise relative to each tensor's RMS.
         generator: Optional RNG for reproducible noise.
 
     Returns:
@@ -99,12 +136,21 @@ def perturb_states(
     """
     if states is None:
         return None
-    out: list[Tensor] = []
+    out: list[DeltaMemoryState | Tensor] = []
     for s in states:
-        s = s.detach()
-        rms = s.pow(2).mean().clamp_min(1e-12).sqrt()
-        noise = torch.empty_like(s).normal_(generator=generator)
-        out.append(s + noise_std * rms * noise)
+        if isinstance(s, DeltaMemoryState):
+            out.append(
+                DeltaMemoryState(
+                    memory=_perturb_tensor(s.memory, noise_std, generator),
+                    conv_tail=(
+                        None
+                        if s.conv_tail is None
+                        else _perturb_tensor(s.conv_tail, noise_std, generator)
+                    ),
+                )
+            )
+        else:
+            out.append(_perturb_tensor(s, noise_std, generator))
     return out
 
 
@@ -209,7 +255,7 @@ class SegmentedTrainer:
         segment_iter = iter(self._stream)
         # ``carried`` is the live (graph-connected) state threaded between segments
         # WITHIN a window; it is detached at each window boundary.
-        carried: list[Tensor] | None = None
+        carried: list[DeltaMemoryState | Tensor] | None = None
 
         while self.state.step < max_steps:
             use_synthetic = (
@@ -246,8 +292,8 @@ class SegmentedTrainer:
     def _train_lm_window(
         self,
         segment_iter,  # noqa: ANN001 — Iterator[OrderedSegment]
-        carried: list[Tensor] | None,
-    ) -> tuple[float, list[Tensor] | None, object]:
+        carried: list[DeltaMemoryState | Tensor] | None,
+    ) -> tuple[float, list[DeltaMemoryState | Tensor] | None, object]:
         """Run one truncated-BPTT window of up to ``K`` consecutive LM segments.
 
         Accumulates loss over the window with the carried state graph-connected, runs
@@ -298,7 +344,7 @@ class SegmentedTrainer:
 
             with self._autocast():
                 loss, _logits, states_out = cast(
-                    "tuple[Tensor, Tensor, list[Tensor]]",
+                    "tuple[Tensor, Tensor, list[DeltaMemoryState]]",
                     self.model(inputs, targets, window_state, True),
                 )
             window_loss = loss if window_loss is None else window_loss + loss
@@ -344,7 +390,9 @@ class SegmentedTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         task = self._task_sampler.sample()
 
-        states: list[Tensor] | None = None
+        # The synthetic step never detaches/perturbs (a self-contained task), so its
+        # carried state is always the model's own DeltaMemoryState list.
+        states: list[DeltaMemoryState] | None = None
         total_loss: Tensor | None = None
         with self._autocast():
             for inp, tgt, mask in zip(
@@ -357,7 +405,7 @@ class SegmentedTrainer:
                 tgt = tgt.to(self.device)
                 mask = mask.to(self.device)
                 _loss, logits, states = cast(
-                    "tuple[Tensor, Tensor, list[Tensor]]",
+                    "tuple[Tensor, Tensor, list[DeltaMemoryState]]",
                     self.model(inp, None, states, True),
                 )
                 if states is not None:

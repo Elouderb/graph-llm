@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     # synthetic_tasks imports from this module (long_context), so we guard the
     # reverse import under TYPE_CHECKING to avoid a circular-import at runtime.
     from graph_llm.data.synthetic_tasks import CrossSegmentTask
+    from graph_llm.models.components.delta_memory import DeltaMemoryState
 
 import numpy as np
 import torch
@@ -363,7 +364,7 @@ class SegmentRun:
 
     carried: bool
     per_segment_logits: list[Tensor]
-    final_states: list[Tensor] | None
+    final_states: list[DeltaMemoryState] | None
 
 
 def _supports_state_carry(model: nn.Module) -> bool:
@@ -417,7 +418,7 @@ def run_segments(
         raise ValueError("segments must be non-empty")
 
     use_carry = carry and _supports_state_carry(model)
-    states: list[Tensor] | None = None
+    states: list[DeltaMemoryState] | None = None
     per_segment_logits: list[Tensor] = []
     for seg in segments:
         ids = seg.to(device)
@@ -425,7 +426,7 @@ def run_segments(
             ids = ids.unsqueeze(0)
         if use_carry:
             _, logits, states = cast(
-                "tuple[Tensor, Tensor, list[Tensor]]",
+                "tuple[Tensor, Tensor, list[DeltaMemoryState]]",
                 model(ids, None, states, True),
             )
         else:
@@ -578,7 +579,7 @@ def score_cross_segment_passkey(
 
     # Prime the memory over the leading segments (key + filler).  In reset mode we
     # simply do not carry the resulting state into the query segment.
-    states: list[Tensor] | None = None
+    states: list[DeltaMemoryState] | None = None
     if use_carry:
         primed = run_segments(model, prime, carry=True, device=device)
         states = primed.final_states
@@ -612,7 +613,7 @@ def _greedy_generate_with_state(
     model: nn.Module,
     prompt_ids: Tensor,
     max_new_tokens: int,
-    states_in: list[Tensor] | None,
+    states_in: list[DeltaMemoryState] | None,
     device: torch.device,
 ) -> list[int]:
     """Greedy-decode from *prompt_ids* seeded with carried per-layer *states_in*.
@@ -636,7 +637,7 @@ def _greedy_generate_with_state(
     generated: list[int] = []
     for _ in range(max_new_tokens):
         _, logits, _ = cast(
-            "tuple[Tensor, Tensor, list[Tensor]]",
+            "tuple[Tensor, Tensor, list[DeltaMemoryState]]",
             model(ids, None, states_in, True),
         )
         next_id = int(logits[0, -1].argmax().item())
@@ -692,7 +693,7 @@ def carried_stream_bpb(
 
     stream = stream.to(device)
     use_carry = carry and _supports_state_carry(model)
-    states: list[Tensor] | None = None
+    states: list[DeltaMemoryState] | None = None
     nats_sum = 0.0
     tokens = 0
 
@@ -703,14 +704,14 @@ def carried_stream_bpb(
             # so the carried state advances, but it contributes no scored tokens.
             if use_carry and seg.numel() == 1:
                 _, _, states = cast(
-                    "tuple[Tensor, Tensor, list[Tensor]]",
+                    "tuple[Tensor, Tensor, list[DeltaMemoryState]]",
                     model(seg.unsqueeze(0), None, states, True),
                 )
             continue
         ids = seg.unsqueeze(0)
         if use_carry:
             _, logits, states = cast(
-                "tuple[Tensor, Tensor, list[Tensor]]",
+                "tuple[Tensor, Tensor, list[DeltaMemoryState]]",
                 model(ids, None, states, True),
             )
         else:
@@ -780,7 +781,7 @@ def cross_segment_retrieval_nll(
             device = torch.device("cpu")
     device = torch.device(device) if not isinstance(device, torch.device) else device
 
-    states: list[Tensor] | None = None
+    states: list[DeltaMemoryState] | None = None
     nll_sum = 0.0
     count = 0
 
@@ -793,7 +794,7 @@ def cross_segment_retrieval_nll(
 
         if carry:
             _, logits, states = cast(
-                "tuple[Tensor, Tensor, list[Tensor]]",
+                "tuple[Tensor, Tensor, list[DeltaMemoryState]]",
                 model(inp, None, states, True),
             )
         else:

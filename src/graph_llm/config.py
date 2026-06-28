@@ -104,6 +104,18 @@ class ModelConfig:
     delta_feature_map: str = "l2"
     delta_use_forget_gate: bool = True  # scalar per-head forget gate alpha_t (Gated-DeltaNet);
     #                                     False == ungated DeltaNet (alpha_t == 1).
+    # Short causal depthwise conv width applied to the memory INPUT before the
+    # q/k/v projections (card 571d50ec).  The delta write is token-LOCAL (k_t, v_t
+    # both from x_t), so without local mixing a value position never sees its key
+    # and the memory cannot BIND k_i->v_i — the MQAR testbed measured ~0.23 recall
+    # capped at width 1 vs ~1.0 at width >= 2.  A residual causal depthwise(+pointwise)
+    # conv supplies that local mixing.  ``1`` builds NOTHING (no module, no params,
+    # no RNG draws) -> byte-for-byte the committed backbone (back-compat / ablation);
+    # the default ``4`` matches Gated-DeltaNet and the validated MQAR recipe.  A
+    # causal conv reaches ``width-1`` tokens into the past, so at segment/chunk
+    # boundaries the conv's input tail is carried WITH the memory state (see
+    # GatedDeltaMemory / DeltaMemoryState) to keep segmented==full exact.
+    delta_conv_width: int = 4
     delta_ff_mult: int = 4             # gated-MLP inner expansion between memory layers
     delta_dropout: float = 0.0         # dropout inside the memory mixer + MLP
     # Scan implementation (card 18b14615): "chunkwise" (default — the fast

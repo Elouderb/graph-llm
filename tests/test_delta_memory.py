@@ -39,6 +39,7 @@ from graph_llm.models.baselines import count_params, match_params
 from graph_llm.models.components.delta_memory import (
     VALID_DELTA_SCANS,
     VALID_FEATURE_MAPS,
+    DeltaMemoryState,
     GatedDeltaMemory,
     _feature_map,
 )
@@ -336,6 +337,112 @@ def test_ungated_alpha_is_one() -> None:
     cfg = _mem_cfg(delta_use_forget_gate=False)
     mem = GatedDeltaMemory(cfg)
     assert mem.alpha_proj is None
+
+
+# ---------------------------------------------------------------------------
+# Short causal conv (card 571d50ec): config, back-compat, and binding mechanism
+# ---------------------------------------------------------------------------
+
+
+def test_conv_width_one_builds_no_conv_module() -> None:
+    """``delta_conv_width=1`` builds NOTHING — back-compat / ablation (no params)."""
+    mem = GatedDeltaMemory(_mem_cfg(delta_conv_width=1))
+    assert mem.conv_width == 1
+    assert mem.conv_dw is None and mem.conv_pw is None
+    # No conv parameters exist on the module at width 1.
+    assert not any("conv" in name for name, _ in mem.named_parameters())
+
+
+def test_conv_width_four_builds_depthwise_and_pointwise() -> None:
+    """``delta_conv_width=4`` (default) builds the depthwise + pointwise causal conv."""
+    mem = GatedDeltaMemory(_mem_cfg(delta_conv_width=4))
+    assert mem.conv_width == 4
+    assert mem.conv_dw is not None and mem.conv_pw is not None
+    # Depthwise: groups == channels, kernel == width; pointwise: kernel 1.
+    assert mem.conv_dw.groups == mem.d_model and mem.conv_dw.kernel_size == (4,)
+    assert mem.conv_pw.kernel_size == (1,)
+
+
+def test_invalid_conv_width_raises() -> None:
+    with pytest.raises(ValueError):
+        GatedDeltaMemory(_mem_cfg(delta_conv_width=0))
+
+
+def test_conv_width_one_layer_forward_unchanged_vs_no_conv_attr() -> None:
+    """At width 1 the conv branch is a pure pass-through (no local mixing).
+
+    The width-1 path must reproduce the pre-conv layer exactly: the q/k/v
+    projections see the raw input (the residual conv contributes nothing because
+    no conv is built).  We assert the returned conv tail is ``None`` and the output
+    is finite/shaped — the byte-for-byte committed backbone behaviour.
+    """
+    torch.manual_seed(0)
+    mem = GatedDeltaMemory(_mem_cfg(d_model=16, delta_conv_width=1))
+    mem.eval()
+    x = torch.randn(2, 11, mem.d_model)
+    with torch.no_grad():
+        out, state = _mem_carry(mem, x)
+    assert out.shape == (2, 11, mem.d_model)
+    assert state.conv_tail is None, "width-1 carries no conv tail (conv disabled)"
+
+
+def test_conv_tail_stays_graph_connected_for_within_window_bptt() -> None:
+    """The returned conv tail is NOT detached — within-window truncated BPTT.
+
+    The carried state must stay graph-connected across segments WITHIN a
+    truncated-BPTT window (the trainer severs it only at the window boundary via
+    ``detach_states``), exactly like the delta-memory matrix.  If ``_causal_conv``
+    detached its tail, the conv would get no cross-segment gradient.  Here, with a
+    grad-enabled forward, both the memory matrix and the conv tail must carry a
+    ``grad_fn``; and a carried, graph-connected tail must propagate gradient into a
+    prior segment's input.
+    """
+    torch.manual_seed(0)
+    mem = GatedDeltaMemory(_mem_cfg(d_model=16, delta_conv_width=4))
+    mem.train()
+    x0 = torch.randn(2, 6, mem.d_model, requires_grad=True)
+    out0, state = _mem_carry(mem, x0)
+    assert state.memory.grad_fn is not None, "memory matrix must stay graph-connected"
+    assert state.conv_tail is not None and state.conv_tail.grad_fn is not None, (
+        "conv tail must stay graph-connected within a BPTT window (not detached)"
+    )
+    # A second segment seeded with the connected state; its loss must reach x0
+    # THROUGH the carried conv tail (and memory), proving cross-segment gradient.
+    x1 = torch.randn(2, 6, mem.d_model)
+    out1, _ = _mem_carry(mem, x1, state_in=state)
+    out1.sum().backward()
+    assert x0.grad is not None and x0.grad.abs().sum() > 0, (
+        "gradient from segment 2 did not reach segment 1's input — the carried "
+        "state (memory + conv tail) is not graph-connected within the window."
+    )
+
+
+def test_conv_is_causal_by_perturbation() -> None:
+    """The causal conv leaks no future info: perturb token t+1; outputs <= t unchanged.
+
+    Directly probes the conv-enabled layer (default width 4): the left-pad-only
+    causal conv plus the strictly-causal delta scan must keep position ``t`` a
+    function of inputs ``<= t`` only.
+    """
+    torch.manual_seed(0)
+    cfg = _mem_cfg(d_model=16, delta_n_heads=2, delta_head_k_dim=8, delta_head_v_dim=8,
+                   delta_conv_width=4, delta_scan="chunkwise", delta_chunk_size=4)
+    mem = GatedDeltaMemory(cfg)
+    mem.eval()
+    B, T = 2, 13
+    x = torch.randn(B, T, cfg.d_model)
+    with torch.no_grad():
+        out = mem(x)
+    t = 5
+    x_pert = x.clone()
+    x_pert[:, t + 1] += torch.randn_like(x_pert[:, t + 1])  # perturb a FUTURE token
+    with torch.no_grad():
+        out_pert = mem(x_pert)
+    max_diff = (out[:, : t + 1] - out_pert[:, : t + 1]).abs().max().item()
+    assert max_diff < 1e-6, (
+        f"conv-enabled layer leaked future info: perturbing token {t + 1} changed "
+        f"outputs at positions <= {t} by {max_diff:.2e} (must be < 1e-6)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -723,11 +830,11 @@ def _scan_carry(
 
 
 def _mem_carry(
-    mem: GatedDeltaMemory, x: torch.Tensor, state_in: torch.Tensor | None = None
-) -> tuple[torch.Tensor, torch.Tensor]:
+    mem: GatedDeltaMemory, x: torch.Tensor, state_in: DeltaMemoryState | None = None
+) -> tuple[torch.Tensor, DeltaMemoryState]:
     """Layer-level forward WITH carry; returns (out, final_state) (typed)."""
     return cast(
-        "tuple[torch.Tensor, torch.Tensor]",
+        "tuple[torch.Tensor, DeltaMemoryState]",
         mem(x, state_in=state_in, return_state=True),
     )
 
@@ -769,6 +876,82 @@ def test_segmented_with_carry_equals_full_sequence_scan(
     assert max_diff <= 1e-4, (
         f"segmented-with-carry != full ({scan}, splits={splits}): "
         f"max abs diff {max_diff:.3e} exceeds 1e-4"
+    )
+
+
+@pytest.mark.parametrize("scan", ["sequential", "chunkwise"])
+@pytest.mark.parametrize("conv_width", [2, 4])
+@pytest.mark.parametrize("splits", [(7,), (8,), (10,), (8, 16), (5, 11, 19)])
+def test_conv_carry_layer_segmented_equals_full(
+    scan: str, conv_width: int, splits: tuple[int, ...]
+) -> None:
+    """LAYER-level conv-tail carry: segmented GatedDeltaMemory == full forward.
+
+    The load-bearing test for card 571d50ec's carry piece.  Run the FULL layer
+    (causal conv + delta scan) over a length-24 input split at one or more points
+    (incl. non-multiples of the chunk size C=8 and a 3-way split), threading the
+    :class:`DeltaMemoryState` — both the memory matrix AND the conv tail — across
+    each boundary, and assert the concatenated outputs equal a single
+    whole-sequence forward within 1e-4.  Without carrying the conv tail the causal
+    conv at each boundary's left edge would see zeros instead of the true preceding
+    tokens, so this is exactly what proves the conv-tail carry is correct.
+    """
+    torch.manual_seed(0)
+    cfg = _mem_cfg(d_model=24, delta_n_heads=3, delta_head_k_dim=16, delta_head_v_dim=12,
+                   delta_conv_width=conv_width, delta_scan=scan, delta_chunk_size=8)
+    mem = GatedDeltaMemory(cfg)
+    mem.eval()
+    B, T = 2, 24
+    x = torch.randn(B, T, cfg.d_model)
+
+    with torch.no_grad():
+        full = mem(x)
+        bounds = [0, *splits, T]
+        outs = []
+        state: DeltaMemoryState | None = None
+        for lo, hi in zip(bounds[:-1], bounds[1:], strict=True):
+            out, state = _mem_carry(mem, x[:, lo:hi], state_in=state)
+            outs.append(out)
+        cat = torch.cat(outs, dim=1)
+
+    assert cat.shape == full.shape
+    max_diff = (cat - full).abs().max().item()
+    assert max_diff <= 1e-4, (
+        f"conv-tail segmented-with-carry != full (scan={scan}, W={conv_width}, "
+        f"splits={splits}): max abs diff {max_diff:.3e} exceeds 1e-4"
+    )
+
+
+@pytest.mark.parametrize("scan", ["sequential", "chunkwise"])
+@pytest.mark.parametrize("first_len", [1, 2])
+def test_conv_carry_handles_segment_shorter_than_window(scan: str, first_len: int) -> None:
+    """Carrying a segment SHORTER than the conv window must not crash or corrupt.
+
+    Regression for the conv-tail carry: a width-4 conv reaches 3 tokens back, but a
+    first carried segment of length 1 or 2 supplies fewer than 3 rows of history
+    (reachable in production via ``carried_stream_bpb``'s length-1 tail feed).  The
+    carried tail must be left-zero-padded to exactly ``W-1`` rows so the next
+    segment's conv still emits ``T`` rows — and segmented-with-carry must still
+    equal the full-sequence forward (zeros == the absent pre-sequence past).
+    """
+    torch.manual_seed(0)
+    cfg = _mem_cfg(d_model=16, delta_n_heads=2, delta_head_k_dim=8, delta_head_v_dim=8,
+                   delta_conv_width=4, delta_scan=scan, delta_chunk_size=4)
+    mem = GatedDeltaMemory(cfg)
+    mem.eval()
+    B, T = 2, 9
+    x = torch.randn(B, T, cfg.d_model)
+    with torch.no_grad():
+        full = mem(x)
+        out0, state = _mem_carry(mem, x[:, :first_len])      # short first segment
+        out1, _ = _mem_carry(mem, x[:, first_len:], state_in=state)
+        cat = torch.cat([out0, out1], dim=1)
+    assert cat.shape == full.shape
+    max_diff = (cat - full).abs().max().item()
+    assert max_diff <= 1e-4, (
+        f"short-history carry != full (scan={scan}, first_len={first_len}): "
+        f"max abs diff {max_diff:.3e} exceeds 1e-4 — the conv tail must left-pad "
+        f"to W-1 rows so a short prior segment does not corrupt the carry."
     )
 
 
@@ -873,11 +1056,14 @@ def test_state_carry_signature_preserves_causality(scan: str) -> None:
 
 
 def test_state_out_shape_and_dtype_is_fixed_and_fp32() -> None:
-    """The returned state is fp32 and (B, H, d_k, d_v) regardless of T / input dtype.
+    """The returned memory matrix is fp32 and (B, H, d_k, d_v) regardless of T / dtype.
 
     The bounded-memory guarantee carried across segments: the state matrix size is
     independent of sequence length, and it is held in fp32 (the scan's native
-    dtype) even when the input is a lower precision.
+    dtype) even when the input is a lower precision.  The carried state is a
+    :class:`DeltaMemoryState` (the matrix plus the causal-conv tail, card
+    571d50ec); here the conv is enabled (default width 4) so a non-None tail of
+    shape ``(B, W-1, d_model)`` is also carried, and it tracks the input dtype.
     """
     cfg = _mem_cfg(d_model=16, delta_n_heads=3, delta_head_k_dim=8, delta_head_v_dim=5,
                    delta_scan="chunkwise", delta_chunk_size=8)
@@ -885,10 +1071,19 @@ def test_state_out_shape_and_dtype_is_fixed_and_fp32() -> None:
     mem.eval()
     B = 2
     expected = (B, cfg.delta_n_heads, cfg.delta_head_k_dim, cfg.delta_head_v_dim)
+    pad = mem.conv_width - 1
     for T in (4, 37):
         x = torch.randn(B, T, cfg.d_model)
         with torch.no_grad():
             out, state = _mem_carry(mem, x)
         assert out.shape == (B, T, cfg.d_model)
-        assert tuple(state.shape) == expected, f"state shape drifted at T={T}: {tuple(state.shape)}"
-        assert state.dtype == torch.float32, "carried state must be fp32"
+        assert isinstance(state, DeltaMemoryState)
+        assert tuple(state.memory.shape) == expected, (
+            f"state matrix shape drifted at T={T}: {tuple(state.memory.shape)}"
+        )
+        assert state.memory.dtype == torch.float32, "carried memory matrix must be fp32"
+        # Conv tail: the last (W-1) rows of the conv input, (B, W-1, d_model).
+        assert state.conv_tail is not None
+        assert tuple(state.conv_tail.shape) == (B, pad, cfg.d_model), (
+            f"conv tail shape drifted at T={T}: {tuple(state.conv_tail.shape)}"
+        )

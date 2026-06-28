@@ -45,7 +45,7 @@ import torch.utils.checkpoint
 from torch import Tensor
 
 from graph_llm.models.baselines.transformer import RMSNorm
-from graph_llm.models.components.delta_memory import GatedDeltaMemory
+from graph_llm.models.components.delta_memory import DeltaMemoryState, GatedDeltaMemory
 from graph_llm.models.components.multiscale_conv_embed import MultiScaleConvEmbedding
 from graph_llm.models.registry import get_embedding_init, register_model
 
@@ -92,16 +92,18 @@ class DeltaMemoryBlock(nn.Module):
     def forward(
         self,
         x: Tensor,
-        state_in: Tensor | None = None,
+        state_in: DeltaMemoryState | None = None,
         return_state: bool = False,
-    ) -> Tensor | tuple[Tensor, Tensor]:
+    ) -> Tensor | tuple[Tensor, DeltaMemoryState]:
         """Pre-norm residual block forward.
 
         Args:
             x: ``(B, T, d_model)``.
-            state_in: Optional carried delta-memory state ``(B, H, d_k, d_v)`` for
-                the mixer (cross-segment persistence, card 61f900ca).  ``None`` is
-                the reset default — byte-for-byte the original behaviour.
+            state_in: Optional carried :class:`DeltaMemoryState` for the mixer
+                (cross-segment persistence, cards 61f900ca + 571d50ec): the
+                delta-memory matrix plus the conv tail.  ``None`` is the reset
+                default — byte-for-byte the original behaviour when the conv is
+                disabled.
             return_state: When ``True`` also return the mixer's final state.
 
         Returns:
@@ -111,7 +113,7 @@ class DeltaMemoryBlock(nn.Module):
         """
         if return_state:
             mixed, state_out = cast(
-                "tuple[Tensor, Tensor]",
+                "tuple[Tensor, DeltaMemoryState]",
                 self.mixer(self.norm1(x), state_in=state_in, return_state=True),
             )
             x = x + mixed
@@ -204,9 +206,9 @@ class DeltaMemoryLM(nn.Module):
     def _forward_blocks(
         self,
         x: Tensor,
-        states_in: list[Tensor] | None = None,
+        states_in: list[DeltaMemoryState] | None = None,
         return_states: bool = False,
-    ) -> Tensor | tuple[Tensor, list[Tensor]]:
+    ) -> Tensor | tuple[Tensor, list[DeltaMemoryState]]:
         """Run the block stack, optionally threading per-layer carried states.
 
         The default path (``states_in=None, return_states=False``) is unchanged:
@@ -219,9 +221,9 @@ class DeltaMemoryLM(nn.Module):
 
         Args:
             x: ``(B, T, d_model)``.
-            states_in: Optional list of per-block carried states (length =
-                ``len(self.blocks)``), each ``(B, H, d_k, d_v)`` or ``None`` for a
-                reset block.
+            states_in: Optional list of per-block carried
+                :class:`DeltaMemoryState` (length = ``len(self.blocks)``), or
+                ``None`` for a reset block.
             return_states: When ``True`` also return the per-block final states.
 
         Returns:
@@ -239,11 +241,11 @@ class DeltaMemoryLM(nn.Module):
                     x = cast(Tensor, block(x))
             return x
 
-        states_out: list[Tensor] = []
+        states_out: list[DeltaMemoryState] = []
         for i, block in enumerate(self.blocks):
             state_in = states_in[i] if states_in is not None else None
             x, state_out = cast(
-                "tuple[Tensor, Tensor]",
+                "tuple[Tensor, DeltaMemoryState]",
                 block(x, state_in=state_in, return_state=True),
             )
             states_out.append(state_out)
@@ -254,7 +256,7 @@ class DeltaMemoryLM(nn.Module):
         self,
         x: Tensor,
         targets: Tensor | None = ...,
-        states_in: list[Tensor] | None = ...,
+        states_in: list[DeltaMemoryState] | None = ...,
         return_states: Literal[False] = ...,
     ) -> tuple[Tensor, Tensor]: ...
 
@@ -263,17 +265,17 @@ class DeltaMemoryLM(nn.Module):
         self,
         x: Tensor,
         targets: Tensor | None,
-        states_in: list[Tensor] | None,
+        states_in: list[DeltaMemoryState] | None,
         return_states: Literal[True],
-    ) -> tuple[Tensor, Tensor, list[Tensor]]: ...
+    ) -> tuple[Tensor, Tensor, list[DeltaMemoryState]]: ...
 
     def forward(
         self,
         x: Tensor,
         targets: Tensor | None = None,
-        states_in: list[Tensor] | None = None,
+        states_in: list[DeltaMemoryState] | None = None,
         return_states: bool = False,
-    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, list[Tensor]]:
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, list[DeltaMemoryState]]:
         """Forward pass.
 
         Args:
@@ -281,12 +283,13 @@ class DeltaMemoryLM(nn.Module):
             targets: Target token ids, shape ``(B, T)``.  If provided, the
                 cross-entropy loss is computed over the full sequence; if
                 ``None`` a zero loss tensor is returned (eval / generation).
-            states_in: Optional list of per-block carried delta-memory states
-                (length = ``delta_layers``), each ``(B, H, d_k, d_v)`` or ``None``
-                to reset that block.  Enables cross-segment persistence (card
-                61f900ca): seed each block's memory from the previous segment's
-                final state.  Default ``None`` resets every block — byte-for-byte
-                the committed within-sequence behaviour.
+            states_in: Optional list of per-block carried
+                :class:`DeltaMemoryState` (length = ``delta_layers``) or ``None``
+                to reset that block.  Enables cross-segment persistence (cards
+                61f900ca + 571d50ec): seed each block's memory matrix AND its
+                causal-conv tail from the previous segment's final state.  Default
+                ``None`` resets every block — byte-for-byte the committed
+                within-sequence behaviour when the conv is disabled.
             return_states: When ``True`` the per-block final states are returned
                 as a third element so they can be threaded into the next segment.
 
@@ -311,10 +314,10 @@ class DeltaMemoryLM(nn.Module):
         if self.front_end is not None:
             h = self.front_end(h)
 
-        states_out: list[Tensor] | None = None
+        states_out: list[DeltaMemoryState] | None = None
         if return_states:
             h, states_out = cast(
-                "tuple[Tensor, list[Tensor]]",
+                "tuple[Tensor, list[DeltaMemoryState]]",
                 self._forward_blocks(h, states_in=states_in, return_states=True),
             )
         else:

@@ -84,6 +84,7 @@ path here is a **self-contained pure-PyTorch** implementation kept in fp32.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast, overload
 
 import torch
@@ -96,6 +97,30 @@ if TYPE_CHECKING:
 
 VALID_FEATURE_MAPS = ("l2", "silu_l2", "identity")
 VALID_DELTA_SCANS = ("sequential", "chunkwise", "auto")
+
+
+@dataclass
+class DeltaMemoryState:
+    """The full cross-segment carried state of one :class:`GatedDeltaMemory` layer.
+
+    The bare delta-memory matrix ``S`` is no longer the *whole* carried state once
+    a short causal conv is added (card 571d50ec): a width-``W`` causal conv at a
+    segment boundary needs the previous segment's last ``W-1`` input rows to
+    reproduce a single full-sequence forward, so that conv tail is carried
+    alongside ``S``.
+
+    Attributes:
+        memory: The delta-memory state matrix ``S`` of shape ``(B, H, d_k, d_v)``
+            (fp32), exactly the per-head associative store the scan threads.
+        conv_tail: The last ``W-1`` rows of this layer's conv input, shape
+            ``(B, W-1, d_model)`` — the strictly-past context the next segment's
+            causal conv must see at its left edge.  ``None`` when the conv is
+            disabled (``delta_conv_width == 1``), in which case the state degrades
+            to just ``memory`` and the carry matches the pre-conv behaviour.
+    """
+
+    memory: Tensor
+    conv_tail: Tensor | None = None
 
 
 def _feature_map(x: Tensor, kind: str) -> Tensor:
@@ -202,6 +227,35 @@ class GatedDeltaMemory(nn.Module):
         # Output: per-head readout (d_v) -> back to d_model.
         self.out_proj = nn.Linear(v_dim, self.d_model, bias=False)
         self.dropout = nn.Dropout(cfg.delta_dropout)
+
+        # Short causal depthwise conv on the memory input (card 571d50ec).  The
+        # delta write is token-LOCAL (k_t, v_t both from x_t); without local mixing
+        # a value position never sees its key, so the memory cannot BIND k_i->v_i
+        # (MQAR: ~0.23 recall capped at width 1 vs ~1.0 at width >= 2).  A RESIDUAL
+        # causal depthwise(+pointwise) conv supplies that mixing before the q/k/v
+        # projections.  width == 1 builds NOTHING -> no module, no params, no RNG
+        # draws -> byte-for-byte the committed backbone (back-compat / ablation).
+        conv_width = cfg.delta_conv_width
+        if conv_width < 1:
+            raise ValueError(
+                f"delta_conv_width must be >= 1, got {conv_width}"
+            )
+        self.conv_width = conv_width
+        if conv_width > 1:
+            # Depthwise over the trailing window (per-channel, mixes across time)
+            # then a pointwise 1x1 channel mix — the same cheap separable form as
+            # the multi-scale conv front-end's scales.  Left-pad only (no future
+            # leakage); the residual keeps width=1 behaviour reachable at init.
+            self.conv_dw: nn.Conv1d | None = nn.Conv1d(
+                self.d_model, self.d_model, kernel_size=conv_width,
+                groups=self.d_model, bias=False,
+            )
+            self.conv_pw: nn.Conv1d | None = nn.Conv1d(
+                self.d_model, self.d_model, kernel_size=1, bias=True
+            )
+        else:
+            self.conv_dw = None
+            self.conv_pw = None
 
     # ------------------------------------------------------------------
     # The sequential delta-rule scan (the pure-PyTorch core)
@@ -507,32 +561,111 @@ class GatedDeltaMemory(nn.Module):
             return out, S
         return out
 
+    # ------------------------------------------------------------------
+    # Short causal conv on the memory input (card 571d50ec)
+    # ------------------------------------------------------------------
+
+    def _causal_conv(
+        self, x: Tensor, conv_tail_in: Tensor | None
+    ) -> tuple[Tensor, Tensor | None]:
+        """Residual causal depthwise(+pointwise) conv over the memory input.
+
+        Computes ``xc = x + pointwise(depthwise_causal(x))`` so each position is
+        locally mixed with its trailing ``W-1`` tokens — the binding mechanism the
+        token-local delta write lacks.  **Causal**: the conv is left-padded by
+        ``W-1`` and never right-padded, so position ``t`` sees only inputs ``<= t``.
+
+        Cross-segment / cross-chunk carry: at a boundary the left edge of ``x``
+        must see the previous segment's last ``W-1`` rows, or a segmented forward
+        would not match a single full-sequence forward.  Those rows arrive as
+        ``conv_tail_in``; they are prepended before the conv and the leading
+        ``W-1`` outputs they produce are sliced off so the output length stays
+        ``T``.  The returned tail is the last ``W-1`` rows of ``cat([tail, x])`` —
+        the strictly-past context for the *next* segment.
+
+        Args:
+            x: ``(B, T, d_model)`` memory input (the layer's pre-projection input).
+            conv_tail_in: Optional carried ``(B, W-1, d_model)`` tail from the
+                previous segment (``None`` resets to a zero left-pad, the
+                within-sequence default).
+
+        Returns:
+            ``(xc, conv_tail_out)`` — the locally-mixed input (same shape as ``x``)
+            and the ``(B, W-1, d_model)`` tail to carry forward (``None`` if the
+            conv is disabled).
+        """
+        if self.conv_dw is None:  # width == 1: disabled — pure pass-through.
+            return x, None
+        assert self.conv_pw is not None
+        pad = self.conv_width - 1  # conv_dw exists only when width > 1, so pad >= 1.
+        B, _, d = x.shape
+
+        # Normalise the carried left context to EXACTLY ``pad`` rows.  A reset
+        # (``None``) or a short prior history (fewer than ``pad`` accumulated rows —
+        # e.g. a length-1 first segment) is left-zero-padded, which is precisely the
+        # "no past tokens before the window" assumption: zeros are the absent past.
+        # This guarantees ``primed`` is always length ``pad + T``, so the conv emits
+        # exactly ``T`` rows and the residual add never broadcasts.
+        if conv_tail_in is None:
+            left_ctx = x.new_zeros(B, pad, d)
+        elif conv_tail_in.shape[1] < pad:
+            left_ctx = F.pad(conv_tail_in, (0, 0, pad - conv_tail_in.shape[1], 0))
+        else:
+            # Carry only the most recent ``pad`` rows (older context cannot reach a
+            # width-``W`` conv); keeps the carried tail fixed-size and bounded.
+            left_ctx = conv_tail_in[:, -pad:]
+
+        primed_seq = torch.cat([left_ctx, x], dim=1)          # (B, pad + T, d)
+        h = self.conv_dw(primed_seq.transpose(1, 2))          # (B, d, T)
+        h = self.conv_pw(h)
+        xc = x + h.transpose(1, 2)                            # residual local mix
+
+        # The next segment's left context = the last ``pad`` rows of THIS conv input
+        # (always exactly ``pad`` rows, since ``primed_seq`` has length ``pad + T``).
+        # NOT detached: within a truncated-BPTT window the trainer threads this state
+        # graph-connected and severs it via ``detach_states`` at the window boundary
+        # — the same treatment the delta-memory matrix ``S`` gets, so the conv shares
+        # the cross-segment gradient.
+        conv_tail_out = primed_seq[:, -pad:]
+        return xc, conv_tail_out
+
     def forward(
         self,
         x: Tensor,
-        state_in: Tensor | None = None,
+        state_in: DeltaMemoryState | None = None,
         return_state: bool = False,
-    ) -> Tensor | tuple[Tensor, Tensor]:
+    ) -> Tensor | tuple[Tensor, DeltaMemoryState]:
         """Run the memory over a sequence.
 
         Args:
             x: ``(B, T, d_model)``.
-            state_in: Optional carried initial state ``(B, H, d_k, d_v)`` from a
-                previous segment (cross-segment persistence, card 61f900ca).
-                ``None`` (the default) resets the state to zero — the standard
-                within-sequence DeltaNet, byte-for-byte the original behaviour.
-                The state is held in fp32 (the scan's native dtype); a ``state_in``
-                of another dtype is cast to fp32 on entry.
-            return_state: When ``True`` also return the final state matrix so it
-                can be threaded into the next segment.
+            state_in: Optional carried :class:`DeltaMemoryState` from a previous
+                segment (cross-segment persistence, cards 61f900ca + 571d50ec):
+                its ``memory`` seeds the delta-rule recurrence and its ``conv_tail``
+                primes the causal conv's left edge.  ``None`` (the default) resets
+                both — the standard within-sequence behaviour, byte-for-byte the
+                original when the conv is disabled.  The memory matrix is held in
+                fp32 (the scan's native dtype); a ``memory`` of another dtype is
+                cast to fp32 on entry.
+            return_state: When ``True`` also return the final
+                :class:`DeltaMemoryState` so it can be threaded into the next
+                segment.
 
         Returns:
             ``(B, T, d_model)``, or — when ``return_state`` — a
-            ``(out, state_out)`` tuple whose ``state_out`` is the fp32 final state
-            of shape ``(B, H, d_k, d_v)``.
+            ``(out, state_out)`` tuple whose ``state_out`` is a
+            :class:`DeltaMemoryState` (fp32 ``memory`` of shape
+            ``(B, H, d_k, d_v)`` plus the ``(B, W-1, d_model)`` conv tail).
         """
         B, T, _ = x.shape
         H, d_k, d_v = self.n_heads, self.d_k, self.d_v
+
+        # Local mixing FIRST (card 571d50ec): bind each value position to its
+        # trailing keys before the token-local q/k/v projections.  Carries/returns
+        # the conv tail so the binding is exact across segment boundaries.
+        mem_in = None if state_in is None else state_in.memory
+        conv_tail_in = None if state_in is None else state_in.conv_tail
+        x, conv_tail_out = self._causal_conv(x, conv_tail_in)
 
         q = self.q_proj(x).view(B, T, H, d_k).transpose(1, 2)  # (B, H, T, d_k)
         k = self.k_proj(x).view(B, T, H, d_k).transpose(1, 2)
@@ -560,11 +693,11 @@ class GatedDeltaMemory(nn.Module):
             if self.delta_scan == "chunkwise"
             else self._delta_scan
         )
-        # Carried state enters in fp32 (the scan's native dtype).  Note: this
-        # casts dtype only, not device — a carried ``state_in`` is assumed to be
-        # on the same device as ``x`` (true for all current call sites, which keep
-        # the state alongside the running segment).
-        state_in_f = None if state_in is None else state_in.float()
+        # The carried memory matrix enters the scan in fp32 (its native dtype).
+        # Note: this casts dtype only, not device — a carried state is assumed to
+        # be on the same device as ``x`` (true for all current call sites, which
+        # keep the state alongside the running segment).
+        mem_in_f = None if mem_in is None else mem_in.float()
 
         def _readout(out_raw: Tensor) -> Tensor:
             """Cast back to the input dtype + per-head readout projection."""
@@ -573,19 +706,21 @@ class GatedDeltaMemory(nn.Module):
             return self.dropout(self.out_proj(out_raw))
 
         if return_state:
-            raw, state_out = cast(
+            raw, mem_out = cast(
                 "tuple[Tensor, Tensor]",
                 scan(
                     q.float(), k.float(), v.float(), beta.float(), alpha.float(),
-                    state_in=state_in_f, return_state=True,
+                    state_in=mem_in_f, return_state=True,
                 ),
             )
-            return _readout(raw), state_out
+            # Bundle the delta-memory matrix with the conv tail so both pieces of
+            # the layer's strictly-past context cross the segment boundary together.
+            return _readout(raw), DeltaMemoryState(memory=mem_out, conv_tail=conv_tail_out)
         raw = cast(
             Tensor,
             scan(
                 q.float(), k.float(), v.float(), beta.float(), alpha.float(),
-                state_in=state_in_f, return_state=False,
+                state_in=mem_in_f, return_state=False,
             ),
         )
         return _readout(raw)

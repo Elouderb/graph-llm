@@ -32,11 +32,25 @@ from graph_llm.data.synthetic_tasks import (
     masked_token_loss,
 )
 from graph_llm.models import build_model
+from graph_llm.models.components.delta_memory import DeltaMemoryState
 from graph_llm.train.segmented import (
     SegmentedTrainer,
     detach_states,
     perturb_states,
 )
+
+
+def _state_leaves(state: DeltaMemoryState) -> list[torch.Tensor]:
+    """The differentiable tensors inside one :class:`DeltaMemoryState`.
+
+    The carried per-layer state is the delta-memory matrix plus (when the causal
+    conv is enabled, card 571d50ec) the conv tail; both must receive gradient when
+    the truncated-BPTT graph is connected and zero once detached.
+    """
+    leaves = [state.memory]
+    if state.conv_tail is not None:
+        leaves.append(state.conv_tail)
+    return leaves
 
 
 def _mem_cfg(**overrides: Any) -> ModelConfig:
@@ -87,17 +101,38 @@ def _learnable_stream(period: int = 16, vocab: int = 64, repeats: int = 3000) ->
 
 
 def test_detach_states_severs_graph() -> None:
-    """``detach_states`` returns tensors with no grad_fn and requires_grad False."""
-    live = [torch.randn(2, 4, 8, 8, requires_grad=True) * 1.0 for _ in range(2)]
-    # Make them graph-connected (have a grad_fn).
-    live = [s * 2.0 for s in live]
-    assert all(s.grad_fn is not None for s in live)
+    """``detach_states`` returns states with no grad_fn and requires_grad False.
+
+    Covers the :class:`DeltaMemoryState` carry (card 571d50ec): both the memory
+    matrix and the conv tail must be detached.
+    """
+    live = [
+        DeltaMemoryState(
+            memory=(torch.randn(2, 4, 8, 8, requires_grad=True) * 2.0),
+            conv_tail=(torch.randn(2, 3, 16, requires_grad=True) * 2.0),
+        )
+        for _ in range(2)
+    ]
+    # Both constituents are graph-connected (have a grad_fn).
+    assert all(
+        s.memory.grad_fn is not None and s.conv_tail is not None
+        and s.conv_tail.grad_fn is not None
+        for s in live
+    )
     det = detach_states(live)
     assert det is not None
     for d in det:
-        assert d.grad_fn is None
-        assert not d.requires_grad
+        assert isinstance(d, DeltaMemoryState)
+        for t in _state_leaves(d):
+            assert t.grad_fn is None
+            assert not t.requires_grad
     assert detach_states(None) is None
+
+    # A bare-tensor state (the pre-conv path / disabled conv) is still accepted.
+    bare = [torch.randn(2, 4, 8, 8, requires_grad=True) * 2.0]
+    det_bare = detach_states(bare)
+    assert det_bare is not None
+    assert det_bare[0].grad_fn is None and not det_bare[0].requires_grad  # type: ignore[union-attr]
 
 
 def test_truncated_bptt_detach_severs_gradient() -> None:
@@ -122,13 +157,25 @@ def test_truncated_bptt_detach_severs_gradient() -> None:
     # Produce a realistic carried (final) state from an earlier segment.
     _, _, state_a = model(seg_a, None, None, True)
 
-    # CONNECTED: same VALUES, but a differentiable leaf.  Gradients must reach it.
-    leaf = [s.detach().clone().requires_grad_(True) for s in state_a]
+    # CONNECTED: same VALUES, but differentiable leaves (matrix + conv tail).
+    # Gradients must reach them.
+    leaf = [
+        DeltaMemoryState(
+            memory=s.memory.detach().clone().requires_grad_(True),
+            conv_tail=(
+                None
+                if s.conv_tail is None
+                else s.conv_tail.detach().clone().requires_grad_(True)
+            ),
+        )
+        for s in state_a
+    ]
+    leaf_tensors = [t for s in leaf for t in _state_leaves(s)]
     model.zero_grad(set_to_none=True)
     loss_conn, _, _ = model(seg_b, tgt_b, leaf, True)
     loss_conn.backward()
     connected_grad = sum(
-        (lf.grad.norm().item() if lf.grad is not None else 0.0) for lf in leaf
+        (lf.grad.norm().item() if lf.grad is not None else 0.0) for lf in leaf_tensors
     )
     assert connected_grad > 1e-8, (
         "the carried state must be differentiable when the graph is connected — "
@@ -139,14 +186,16 @@ def test_truncated_bptt_detach_severs_gradient() -> None:
     detached = detach_states(leaf)
     assert detached is not None
     for d in detached:
-        assert d.grad_fn is None and not d.requires_grad
-    for lf in leaf:
+        assert isinstance(d, DeltaMemoryState)
+        for t in _state_leaves(d):
+            assert t.grad_fn is None and not t.requires_grad
+    for lf in leaf_tensors:
         lf.grad = None
     model.zero_grad(set_to_none=True)
     loss_det, _, _ = model(seg_b, tgt_b, detached, True)
     loss_det.backward()
     detached_grad = sum(
-        (lf.grad.norm().item() if lf.grad is not None else 0.0) for lf in leaf
+        (lf.grad.norm().item() if lf.grad is not None else 0.0) for lf in leaf_tensors
     )
     assert detached_grad == 0.0, (
         "no gradient may flow into a state that was detached at the window boundary"
@@ -154,13 +203,27 @@ def test_truncated_bptt_detach_severs_gradient() -> None:
 
 
 def test_perturb_states_changes_values_and_detaches() -> None:
-    """State-noise augmentation perturbs each state and returns detached tensors."""
-    states = [torch.randn(2, 4, 8, 8, requires_grad=True) for _ in range(2)]
+    """State-noise augmentation perturbs each state (matrix + conv tail) and detaches.
+
+    Both constituents of a :class:`DeltaMemoryState` are noised (card 571d50ec):
+    the conv tail is part of the carried context the model must learn to read from.
+    """
+    states = [
+        DeltaMemoryState(
+            memory=torch.randn(2, 4, 8, 8, requires_grad=True),
+            conv_tail=torch.randn(2, 3, 16, requires_grad=True),
+        )
+        for _ in range(2)
+    ]
     out = perturb_states(states, noise_std=0.3, generator=torch.Generator().manual_seed(0))
     assert out is not None
     for orig, pert in zip(states, out, strict=True):
-        assert (pert - orig.detach()).abs().max().item() > 0.0
-        assert pert.grad_fn is None and not pert.requires_grad
+        assert isinstance(pert, DeltaMemoryState)
+        assert (pert.memory - orig.memory.detach()).abs().max().item() > 0.0
+        assert pert.memory.grad_fn is None and not pert.memory.requires_grad
+        assert pert.conv_tail is not None and orig.conv_tail is not None
+        assert (pert.conv_tail - orig.conv_tail.detach()).abs().max().item() > 0.0
+        assert pert.conv_tail.grad_fn is None and not pert.conv_tail.requires_grad
     assert perturb_states(None, 0.1) is None
 
 

@@ -376,23 +376,48 @@ def test_cross_segment_retrieval_nll_returns_finite_float() -> None:
 def test_cross_segment_retrieval_nll_carry_threads_state() -> None:
     """Carry path threads states_out across boundaries; reset path does not.
 
-    After the first segment the carry path's states tensor list is non-None and
-    non-empty, while the reset path always passes None so each segment sees no
-    prior state.  We verify this indirectly: run two segments with n_segments=2
-    and confirm that the carry and reset NLLs differ (they use different states,
-    so the final-segment logits differ for any non-trivial model).
+    Intent: prove that ``carry=True`` feeds the final (query) segment a state that
+    encodes the earlier (key) segment, while ``carry=False`` feeds it nothing.
+
+    We assert this on the FULL final-segment logits, which see the carried state at
+    EVERY position — not on the answer-only NLL.  The answer-only NLL is a brittle
+    discriminator on an UNTRAINED model: the tiny untrained carried-state effect
+    decays toward zero by the late answer positions, so the answer-only NLL can
+    round equal between carry and reset even though the state genuinely threaded
+    (this is the piece-4 untrained-retrieval phenomenon, not a plumbing failure).
+    Comparing the whole-segment logits via ``run_segments`` is deterministic and
+    tests the threading directly.  ``cross_segment_retrieval_nll`` is still
+    exercised in both modes (finiteness) so its carry path stays covered.
     """
+    torch.manual_seed(0)
     model = build_model(_delta_cfg())
     model.eval()
-    # Use a deterministic passkey so the task construction is reproducible.
     task = make_cross_segment_task("99999", n_segments=2, segment_tokens=32)
+
+    # cross_segment_retrieval_nll runs end-to-end in both modes (coverage).
     nll_carry = cross_segment_retrieval_nll(model, task, carry=True)
     nll_reset = cross_segment_retrieval_nll(model, task, carry=False)
-    # The two paths produce *different* NLLs because carry threads the state
-    # from segment 0 into segment 1, while reset feeds None each time.
-    assert nll_carry != nll_reset, (
-        f"carry NLL ({nll_carry:.4f}) == reset NLL ({nll_reset:.4f}); "
-        "expected them to differ because the state inputs differ"
+    assert all(n == n and 0.0 < n < 1e6 for n in (nll_carry, nll_reset))
+
+    # The mechanical proof that carry threads state: run the task's segments in
+    # order, carrying vs resetting, and compare the QUERY (final) segment's logits.
+    # The first segment has no prior context, so carry and reset must agree on it;
+    # the final segment under carry sees the key segment through the threaded memory
+    # at every position, so its logits MUST differ from the reset run.
+    segs = [s.squeeze(0) for s in task.segment_inputs]
+    carried = run_segments(model, segs, carry=True)
+    reset = run_segments(model, segs, carry=False)
+
+    assert carried.carried is True and reset.carried is False
+    assert torch.equal(carried.per_segment_logits[0], reset.per_segment_logits[0]), (
+        "first segment has no prior context — carry and reset must agree on it"
+    )
+    final_diff = (
+        carried.per_segment_logits[-1] - reset.per_segment_logits[-1]
+    ).abs().max().item()
+    assert final_diff > 1e-5, (
+        f"query-segment logits identical between carry and reset (max diff "
+        f"{final_diff:.2e}); the carried state did not thread into the final segment."
     )
 
 

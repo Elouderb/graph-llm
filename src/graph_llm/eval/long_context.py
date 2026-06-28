@@ -819,6 +819,7 @@ def cross_segment_retrieval_nll_by_distance(
     repeats: int,
     segment_tokens: int,
     vocab_size: int = 256,
+    key_digits: int = 5,
     seed: int = 0,
     device: torch.device | str | None = None,
 ) -> dict[int, dict[str, float]]:
@@ -841,6 +842,10 @@ def cross_segment_retrieval_nll_by_distance(
         segment_tokens: Token length of each non-final segment (must match the
             segment length used during training for a fair comparison).
         vocab_size: Token vocabulary size (default 256 for byte-level).
+        key_digits: Number of decimal digits in each random passkey.  Default 5
+            (current behaviour, 100k possibilities).  Use 1 for an easy probe
+            (10 options, 1 answer token) that a 5 M-parameter bounded memory
+            can tractably solve.
         seed: RNG seed for the task sampler (ensures reproducibility across
             calls with the same arguments).
         device: Optional device override.
@@ -860,6 +865,7 @@ def cross_segment_retrieval_nll_by_distance(
             min_segments=n_seg,
             max_segments=n_seg,
             vocab_size=vocab_size,
+            key_digits=key_digits,
             seed=seed,
         )
         carry_nlls: list[float] = []

@@ -230,9 +230,12 @@ def test_cross_segment_task_structure() -> None:
 
 def test_cross_segment_task_rejects_bad_args() -> None:
     with pytest.raises(ValueError):
-        make_cross_segment_task("1", n_segments=1, segment_tokens=10)
+        make_cross_segment_task("1", n_segments=1, segment_tokens=10, key_digits=1)
     with pytest.raises(ValueError):
-        make_cross_segment_task("1", n_segments=2, segment_tokens=0)
+        make_cross_segment_task("1", n_segments=2, segment_tokens=0, key_digits=1)
+    # Mismatched key_digits: passkey "abc" has 3 chars but key_digits=5 → ValueError.
+    with pytest.raises(ValueError, match="key_digits"):
+        make_cross_segment_task("abc", n_segments=2, segment_tokens=10, key_digits=5)
 
 
 def test_task_sampler_draws_varied_valid_tasks() -> None:
@@ -244,6 +247,40 @@ def test_task_sampler_draws_varied_valid_tasks() -> None:
         assert int(task.segment_masks[-1].sum()) == len(task.answer)
         keys.add(task.answer)
     assert len(keys) > 1, "sampler should draw distinct random passkeys"
+
+
+def test_cross_segment_task_key_digits_1_produces_single_answer_token() -> None:
+    """key_digits=1: answer is exactly 1 token, mask scores exactly 1 position."""
+    # 1-digit keys run from 1–9 (single decimal digit).
+    task = make_cross_segment_task("7", n_segments=3, segment_tokens=20, key_digits=1)
+    assert task.answer == "7"
+    # Leading segments have no scored positions.
+    assert all(not bool(m.any()) for m in task.segment_masks[:-1])
+    # Final segment mask scores exactly 1 position (1 byte = 1 token).
+    final_mask = task.segment_masks[-1][0]
+    assert int(final_mask.sum()) == 1, "key_digits=1 must score exactly 1 answer token"
+    # The masked target token decodes back to the key character.
+    final_tgt = task.segment_targets[-1][0]
+    answer_ids = final_tgt[final_mask].tolist()
+    assert bytes(answer_ids).decode() == "7"
+
+
+def test_task_sampler_key_digits_1_easy_probe() -> None:
+    """CrossSegmentTaskSampler with key_digits=1 generates 1-character passkeys."""
+    sampler = CrossSegmentTaskSampler(
+        segment_tokens=16, min_segments=2, max_segments=3, key_digits=1, seed=42
+    )
+    for _ in range(10):
+        task = sampler.sample()
+        assert len(task.answer) == 1, "1-digit key must be a single character"
+        assert task.answer.isdigit(), "passkey must be a decimal digit"
+        assert task.answer_outside_query_window is True
+        # Mask scores exactly 1 position.
+        assert int(task.segment_masks[-1].sum()) == 1
+        # The masked target decodes to the key.
+        final_tgt = task.segment_targets[-1][0]
+        final_mask = task.segment_masks[-1][0]
+        assert bytes(final_tgt[final_mask].tolist()).decode() == task.answer
 
 
 def test_masked_token_loss_scores_only_masked_positions() -> None:

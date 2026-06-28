@@ -457,3 +457,29 @@ def test_cross_segment_retrieval_nll_scores_only_answer_positions() -> None:
     assert float(loss_bad_nonmasked) < 1e-3, (
         f"Non-answer positions should be ignored; got NLL {float(loss_bad_nonmasked)}"
     )
+
+
+def test_cross_segment_retrieval_nll_by_distance_key_digits_1() -> None:
+    """cross_segment_retrieval_nll_by_distance respects key_digits=1 (easy probe).
+
+    Passes key_digits=1 so each task uses a single-character passkey (1 answer
+    token).  Verifies the function runs to completion and returns finite NLLs —
+    the easy-probe code path that exercise the new key_digits parameter end-to-end.
+    """
+    model = build_model(_delta_cfg())
+    model.eval()
+    results = cross_segment_retrieval_nll_by_distance(
+        model,
+        n_segments_list=[2, 3],
+        repeats=2,
+        segment_tokens=20,
+        key_digits=1,
+        seed=0,
+    )
+    assert set(results.keys()) == {2, 3}
+    for n_seg, metrics in results.items():
+        assert "nll_carry" in metrics and "nll_reset" in metrics, f"missing keys for n_seg={n_seg}"
+        for name, val in metrics.items():
+            assert isinstance(val, float), f"{name} must be float, got {type(val)}"
+            assert val == val, f"{name} is NaN for n_seg={n_seg}"
+            assert val > 0.0, f"{name} must be positive for n_seg={n_seg}"

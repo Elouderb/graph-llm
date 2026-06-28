@@ -184,6 +184,7 @@ class SegmentedTrainer:
         self._task_sampler = CrossSegmentTaskSampler(
             segment_tokens=self._segment_len,
             vocab_size=m.vocab_size,
+            key_digits=m.synthetic_key_digits,
             seed=cfg.train.seed,
         )
         # Dedicated CPU RNG for the schedule decisions (synthetic draw, state noise)

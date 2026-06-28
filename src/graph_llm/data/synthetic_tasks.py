@@ -78,6 +78,7 @@ def make_cross_segment_task(
     segment_tokens: int,
     vocab_size: int = 256,
     encode: EncodeFn = _byte_encode,
+    key_digits: int = 5,
 ) -> CrossSegmentTask:
     """Build one supervised cross-segment retrieval task.
 
@@ -101,14 +102,22 @@ def make_cross_segment_task(
         segment_tokens: Approximate token length of each non-final segment.
         vocab_size: Token vocab (ids are taken mod ``vocab_size`` for byte mode).
         encode: String -> token-id encoder (default byte-level).
+        key_digits: Expected number of decimal digits in *passkey* (informational;
+            used to validate that the passkey length is consistent with the sampler
+            setting).  Default 5.  Pass 1 when building easy 1-digit tasks.
 
     Returns:
         A :class:`CrossSegmentTask`.
 
     Raises:
         ValueError: If ``n_segments < 2`` or ``segment_tokens < 1`` (propagated from
-            :func:`make_cross_segment_passkey`).
+            :func:`make_cross_segment_passkey`), or if *passkey* is not exactly
+            *key_digits* characters long.
     """
+    if len(passkey) != key_digits:
+        raise ValueError(
+            f"passkey {passkey!r} has {len(passkey)} digits but key_digits={key_digits}"
+        )
     base = make_cross_segment_passkey(
         passkey,
         n_segments=n_segments,
@@ -233,6 +242,7 @@ class CrossSegmentTaskSampler:
             segment_tokens=self._segment_tokens,
             vocab_size=self._vocab_size,
             encode=self._encode,
+            key_digits=self._key_digits,
         )
 
 

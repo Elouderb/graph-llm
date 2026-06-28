@@ -189,6 +189,12 @@ class ModelConfig:
     # perplexity does not force far-back use; these tasks do.  0.0 == off (LM stream
     # only).
     synthetic_task_fraction: float = 0.0
+    # Number of decimal digits in the random passkey for synthetic cross-segment tasks.
+    # Controls task difficulty: 5 digits = 100k possibilities (default, current
+    # behaviour); 1 digit = 10 options (tractable probe for a 5 M-parameter memory).
+    # Must be >= 1.  Only affects training when synthetic_task_fraction > 0 and the
+    # eval harness when key_digits is forwarded to cross_segment_retrieval_nll_by_distance.
+    synthetic_key_digits: int = 5
 
 
 @dataclass

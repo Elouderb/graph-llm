@@ -27,7 +27,12 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict, cast
+
+if TYPE_CHECKING:
+    # synthetic_tasks imports from this module (long_context), so we guard the
+    # reverse import under TYPE_CHECKING to avoid a circular-import at runtime.
+    from graph_llm.data.synthetic_tasks import CrossSegmentTask
 
 import numpy as np
 import torch
@@ -722,3 +727,153 @@ def carried_stream_bpb(
 
     mean_nats = nats_sum / max(1, tokens)
     return mean_nats / math.log(2.0)
+
+
+# ---------------------------------------------------------------------------
+# Graded cross-segment retrieval NLL (card 61f900ca, piece 4)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def cross_segment_retrieval_nll(
+    model: nn.Module,
+    task: CrossSegmentTask,
+    carry: bool,
+    device: torch.device | str | None = None,
+) -> float:
+    """Mean NLL (nats) of ONLY the answer-token positions for a :class:`CrossSegmentTask`.
+
+    Runs the task's segments in order.  When *carry* is ``True``, the per-layer
+    delta-memory states are threaded across segment boundaries (piece-1 API:
+    ``model(x, targets, states_in, return_states=True)``); when ``False`` the
+    state is reset to ``None`` before every segment so each segment is evaluated
+    in isolation.
+
+    Only the answer-token positions (where ``task.segment_masks[i]`` is ``True``)
+    contribute to the returned NLL.  A lower NLL with carry than reset indicates
+    that the model is successfully reading the key out of its carried memory even
+    though the exact-match passkey probe returns 0 for a lossy bounded memory.
+
+    Args:
+        model: A ``delta_memory_lm`` (or any model that supports the piece-1
+            state-carry API when *carry* is ``True``).
+        task: A :class:`~graph_llm.data.synthetic_tasks.CrossSegmentTask` as
+            produced by :func:`~graph_llm.data.synthetic_tasks.make_cross_segment_task`
+            or :class:`~graph_llm.data.synthetic_tasks.CrossSegmentTaskSampler`.
+        carry: When ``True`` thread the per-block states across segment
+            boundaries; when ``False`` reset to ``None`` before each segment.
+        device: Optional device override.  Defaults to the model's parameter
+            device when ``None``.
+
+    Returns:
+        Scalar float — mean cross-entropy (nats) over the answer-token
+        positions.  Returns ``0.0`` if the task has no masked positions (this
+        should never happen for a well-formed task).
+    """
+    # Deferred to break the circular import: synthetic_tasks → long_context → synthetic_tasks.
+    from graph_llm.data.synthetic_tasks import masked_token_loss  # noqa: PLC0415
+
+    model.eval()
+    if device is None:
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:
+            device = torch.device("cpu")
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+
+    states: list[Tensor] | None = None
+    nll_sum = 0.0
+    count = 0
+
+    for inp, tgt, mask in zip(
+        task.segment_inputs, task.segment_targets, task.segment_masks
+    ):
+        inp = inp.to(device)
+        tgt = tgt.to(device)
+        mask = mask.to(device)
+
+        if carry:
+            _, logits, states = cast(
+                "tuple[Tensor, Tensor, list[Tensor]]",
+                model(inp, None, states, True),
+            )
+        else:
+            _, logits = model(inp)
+
+        # logits: (B, T, vocab), tgt: (B, T), mask: (B, T)
+        # masked_token_loss returns a scalar tensor; .item() gives a Python float.
+        n_masked = int(mask.sum())
+        if n_masked > 0:
+            seg_nll = masked_token_loss(logits, tgt, mask)
+            nll_sum += float(seg_nll) * n_masked
+            count += n_masked
+
+    if count == 0:
+        return 0.0
+    return nll_sum / count
+
+
+def cross_segment_retrieval_nll_by_distance(
+    model: nn.Module,
+    *,
+    n_segments_list: list[int],
+    repeats: int,
+    segment_tokens: int,
+    vocab_size: int = 256,
+    seed: int = 0,
+    device: torch.device | str | None = None,
+) -> dict[int, dict[str, float]]:
+    """Mean carry / reset NLL as a function of retrieval distance.
+
+    Samples *repeats* tasks per distance (number of segments), evaluates
+    :func:`cross_segment_retrieval_nll` with ``carry=True`` and ``carry=False``,
+    and returns the mean NLL for each distance.
+
+    The "distance" is the number of segments: a task with ``n_segments=3`` hides
+    the key 3 segments back from the query, so a larger value means the model
+    must carry information over more segment boundaries.
+
+    Args:
+        model: A ``delta_memory_lm`` (or compatible model).
+        n_segments_list: List of segment-count values to probe (each value is
+            passed as ``max_segments`` and ``min_segments`` simultaneously so the
+            sampler always generates exactly that many segments).
+        repeats: Number of independent tasks to sample per distance value.
+        segment_tokens: Token length of each non-final segment (must match the
+            segment length used during training for a fair comparison).
+        vocab_size: Token vocabulary size (default 256 for byte-level).
+        seed: RNG seed for the task sampler (ensures reproducibility across
+            calls with the same arguments).
+        device: Optional device override.
+
+    Returns:
+        ``{n_seg: {"nll_carry": float, "nll_reset": float}}`` mapping each
+        value in *n_segments_list* to the mean carry and reset NLLs over
+        *repeats* tasks.
+    """
+    # Deferred to break the circular import: synthetic_tasks → long_context → synthetic_tasks.
+    from graph_llm.data.synthetic_tasks import CrossSegmentTaskSampler  # noqa: PLC0415
+
+    results: dict[int, dict[str, float]] = {}
+    for n_seg in n_segments_list:
+        sampler = CrossSegmentTaskSampler(
+            segment_tokens=segment_tokens,
+            min_segments=n_seg,
+            max_segments=n_seg,
+            vocab_size=vocab_size,
+            seed=seed,
+        )
+        carry_nlls: list[float] = []
+        reset_nlls: list[float] = []
+        for _ in range(repeats):
+            task = sampler.sample()
+            carry_nlls.append(
+                cross_segment_retrieval_nll(model, task, carry=True, device=device)
+            )
+            reset_nlls.append(
+                cross_segment_retrieval_nll(model, task, carry=False, device=device)
+            )
+        results[n_seg] = {
+            "nll_carry": sum(carry_nlls) / len(carry_nlls),
+            "nll_reset": sum(reset_nlls) / len(reset_nlls),
+        }
+    return results

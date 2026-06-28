@@ -17,8 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import graph_llm.models  # noqa: F401 — registers "delta_memory_lm"
 import graph_llm.models.baselines  # noqa: F401 — registers baselines
 from graph_llm.config import Config, ModelConfig
+from graph_llm.data.synthetic_tasks import make_cross_segment_task
 from graph_llm.eval.long_context import (
     carried_stream_bpb,
+    cross_segment_retrieval_nll,
+    cross_segment_retrieval_nll_by_distance,
     greedy_generate,
     make_cross_segment_passkey,
     make_passkey_example,
@@ -350,3 +353,107 @@ def test_carried_stream_bpb_accepts_2d_and_rejects_bad_shapes() -> None:
         carried_stream_bpb(model, torch.randint(0, 256, (3, 64)), segment_len=16)  # 2-D, N>1
     with pytest.raises(ValueError):
         carried_stream_bpb(model, torch.randint(0, 256, (1,)), segment_len=16)  # L < 2
+
+
+# ---------------------------------------------------------------------------
+# Graded cross-segment retrieval NLL (card 61f900ca, piece 4)
+# ---------------------------------------------------------------------------
+
+
+def test_cross_segment_retrieval_nll_returns_finite_float() -> None:
+    """cross_segment_retrieval_nll returns a finite float for both carry modes."""
+    model = build_model(_delta_cfg())
+    model.eval()
+    task = make_cross_segment_task("12345", n_segments=2, segment_tokens=32)
+    nll_carry = cross_segment_retrieval_nll(model, task, carry=True)
+    nll_reset = cross_segment_retrieval_nll(model, task, carry=False)
+    for nll in (nll_carry, nll_reset):
+        assert isinstance(nll, float), f"expected float, got {type(nll)}"
+        assert nll == nll, "NLL is NaN"  # NaN != NaN
+        assert nll > 0.0 and nll < 1e6, f"NLL {nll} not in plausible range"
+
+
+def test_cross_segment_retrieval_nll_carry_threads_state() -> None:
+    """Carry path threads states_out across boundaries; reset path does not.
+
+    After the first segment the carry path's states tensor list is non-None and
+    non-empty, while the reset path always passes None so each segment sees no
+    prior state.  We verify this indirectly: run two segments with n_segments=2
+    and confirm that the carry and reset NLLs differ (they use different states,
+    so the final-segment logits differ for any non-trivial model).
+    """
+    model = build_model(_delta_cfg())
+    model.eval()
+    # Use a deterministic passkey so the task construction is reproducible.
+    task = make_cross_segment_task("99999", n_segments=2, segment_tokens=32)
+    nll_carry = cross_segment_retrieval_nll(model, task, carry=True)
+    nll_reset = cross_segment_retrieval_nll(model, task, carry=False)
+    # The two paths produce *different* NLLs because carry threads the state
+    # from segment 0 into segment 1, while reset feeds None each time.
+    assert nll_carry != nll_reset, (
+        f"carry NLL ({nll_carry:.4f}) == reset NLL ({nll_reset:.4f}); "
+        "expected them to differ because the state inputs differ"
+    )
+
+
+def test_cross_segment_retrieval_nll_scores_only_answer_positions() -> None:
+    """NLL is computed only at the answer-token positions (mask correctness).
+
+    Strategy:
+      1. Build a task and count its total masked positions.
+      2. Replace the model's logits with a synthetic fixture that assigns
+         probability 1 to the correct token at EVERY position (not just answer
+         positions).  Under this fixture the answer-only NLL must be ~0 and the
+         number of scored positions must equal the number of True entries in the
+         masks.
+
+    We cannot monkey-patch the forward here without deep overrides, so instead
+    we use the ``masked_token_loss`` helper directly with controlled inputs to
+    confirm it scores only answer positions, and we count the expected number of
+    masked tokens from the task to confirm the masking structure.
+    """
+    import torch.nn.functional as F
+
+    from graph_llm.data.synthetic_tasks import masked_token_loss
+
+    task = make_cross_segment_task("54321", n_segments=2, segment_tokens=32)
+
+    # --- 1. Count total answer positions from the task masks ---
+    n_answer_positions = sum(int(m.sum()) for m in task.segment_masks)
+    # Only the final segment has True entries in a well-formed CrossSegmentTask.
+    assert n_answer_positions > 0, "task has no masked positions"
+    # The passkey "54321" encodes to exactly 5 bytes.
+    assert n_answer_positions == 5, (
+        f"expected 5 answer positions for a 5-digit passkey, got {n_answer_positions}"
+    )
+
+    # --- 2. Confirm masked_token_loss ignores non-answer positions ---
+    # Build a small logits tensor with vocab=256, T=10, B=1.
+    vocab = 256
+    T = 10
+    targets = torch.randint(0, vocab, (1, T))
+    # Logits that give probability 1 to the correct token at every position.
+    one_hot = F.one_hot(targets, num_classes=vocab).float() * 1e9
+    # Mask selects only the last 3 positions.
+    mask = torch.zeros(1, T, dtype=torch.bool)
+    mask[0, -3:] = True
+    loss_masked = masked_token_loss(one_hot, targets, mask)
+    assert float(loss_masked) < 1e-3, (
+        f"NLL should be ~0 when logits perfectly predict answer tokens; got {float(loss_masked)}"
+    )
+
+    # Confirm that a mask selecting ZERO positions returns 0.
+    empty_mask = torch.zeros(1, T, dtype=torch.bool)
+    loss_empty = masked_token_loss(one_hot, targets, empty_mask)
+    assert float(loss_empty) == 0.0, "empty mask should return 0 NLL"
+
+    # Confirm that non-answer positions are truly ignored: modify the logits so
+    # that non-answer positions have terrible predictions but answer positions are
+    # still perfect.  The NLL should still be ~0 because only the 3 masked
+    # positions are scored.
+    bad_logits = one_hot.clone()
+    bad_logits[0, :T - 3] = -1e9  # non-answer positions: totally wrong
+    loss_bad_nonmasked = masked_token_loss(bad_logits, targets, mask)
+    assert float(loss_bad_nonmasked) < 1e-3, (
+        f"Non-answer positions should be ignored; got NLL {float(loss_bad_nonmasked)}"
+    )

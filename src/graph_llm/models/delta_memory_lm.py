@@ -203,6 +203,16 @@ class DeltaMemoryLM(nn.Module):
             nn.init.normal_(block.mixer.out_proj.weight, mean=0.0, std=residual_std)
             nn.init.normal_(block.mlp.down_proj.weight, mean=0.0, std=residual_std)
 
+        # Forget-gate remember-by-default init (card 1e9245f4).  The generic loop above
+        # zeros ALL linear biases — including alpha_proj.bias.  We re-apply the configured
+        # bias HERE, after that loop, so it is not clobbered.  alpha_proj.weight was set to
+        # N(0, std) above (small enough that input variation barely shifts alpha at init),
+        # giving near-constant but data-dependent, fully learnable gates.
+        if m.delta_use_forget_gate:
+            for block in self.blocks:
+                if block.mixer.alpha_proj is not None:
+                    nn.init.constant_(block.mixer.alpha_proj.bias, m.delta_forget_bias_init)
+
     def _forward_blocks(
         self,
         x: Tensor,

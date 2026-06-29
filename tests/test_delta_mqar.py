@@ -234,3 +234,187 @@ def test_mqar_conv_binds_key_to_value() -> None:
         f"conv recall {recall_conv:.3f} not markedly above no-conv {recall_noconv:.3f}; "
         "the conv is supposed to be the binding mechanism, so the gap must be large."
     )
+
+
+# ---------------------------------------------------------------------------
+# Forget-gate remember-by-default init ablation (card 1e9245f4).
+# ---------------------------------------------------------------------------
+#
+# With bias=0 (old default), alpha = exp(-softplus(0)) ~= 0.5 — the memory is
+# halved every token, so bindings vanish in ~10-20 steps and recall collapses to
+# chance at distances >= 64.  With bias=-4 (new default, alpha_init ~= 0.982)
+# the gate starts near the identity and the model can learn which tokens to
+# forget; recall reaches >= 0.9 even at distance >= 128 within the same budget.
+#
+# Task layout (distance probe):
+#   [k0 v0] [filler] * distance [Q k0]
+# One binding per sequence; filler tokens are a dedicated vocab id; query position
+# is 2 + distance.  The model must hold the binding for `distance` tokens and
+# retrieve it at the query.
+
+_FILLER_ID_DIST = 0   # a dedicated filler vocab id (unused as key/value/query)
+
+
+def _make_distance_batch(
+    batch: int,
+    n_keys: int,
+    n_values: int,
+    distance: int,
+    *,
+    generator: torch.Generator,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build a MQAR distance batch: [k v filler*distance Q k] per row.
+
+    Returns ``(tokens, targets, score_mask)`` where the single answer position is
+    the last token (the query-key slot).
+    """
+    key_lo = 1                 # keys: [1, n_keys)  (0 reserved for filler)
+    val_lo = n_keys            # values: [n_keys, n_keys + n_values)
+    query_marker = n_keys + n_values
+
+    keys = torch.randint(key_lo, n_keys, (batch,), generator=generator, device=device)
+    vals = torch.randint(val_lo, val_lo + n_values, (batch,), generator=generator, device=device)
+
+    filler = torch.zeros(batch, distance, dtype=torch.long, device=device)  # id 0
+    seq_len = 2 + distance + 2   # k v [filler*d] Q k
+    tokens = torch.cat([
+        keys.unsqueeze(1),                                         # k
+        vals.unsqueeze(1),                                         # v
+        filler,                                                     # filler tokens
+        torch.full((batch, 1), query_marker, device=device),      # Q
+        keys.unsqueeze(1),                                         # k  (the query key)
+    ], dim=1)   # (B, seq_len)
+
+    targets = torch.zeros(batch, seq_len, dtype=torch.long, device=device)
+    score_mask = torch.zeros(batch, seq_len, dtype=torch.bool, device=device)
+    targets[:, -1] = vals          # answer is the value bound to that key
+    score_mask[:, -1] = True
+    return tokens, targets, score_mask
+
+
+def _gpt2_init_probe(model: _MQARProbe, forget_bias_init: float) -> None:
+    """Apply GPT-2-style init (N(0, 0.02) weights, zeros biases) to the probe.
+
+    This replicates the key portion of DeltaMemoryLM._init_weights so that the
+    probe starts from the same weight distribution as the full language model.
+    Without this, PyTorch's default kaiming init leaves alpha_proj.weight large
+    enough that the forget gate is NOT near 0.5 regardless of bias — making the
+    ablation comparison unreliable.  After zeroing all biases, we explicitly set
+    alpha_proj.bias to the requested forget_bias_init (the same order of operations
+    as _init_weights, which zeros first then applies the remembered-by-default bias).
+    """
+    std = 0.02
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+    # Re-apply the forget bias AFTER the generic zero-bias pass (same ordering
+    # constraint as _init_weights — the generic loop must not clobber it).
+    if model.mem.alpha_proj is not None:
+        nn.init.constant_(model.mem.alpha_proj.bias, forget_bias_init)
+
+
+def _train_and_eval_recall_at_distance(
+    forget_bias_init: float,
+    distance: int,
+    *,
+    device: torch.device,
+    steps: int,
+    seed: int = 0,
+) -> float:
+    """Train probe on the distance task and return recall at the query position."""
+    torch.manual_seed(seed)
+    gen = torch.Generator(device=device).manual_seed(seed)
+
+    n_keys, n_values = 16, 16
+    vocab_size = n_keys + n_values + 1   # filler(1) + keys(n_keys-1) + values + query_marker
+
+    cfg = _mqar_cfg(
+        conv_width=4,
+        vocab_size=vocab_size,
+        delta_forget_bias_init=forget_bias_init,
+    )
+    model = _MQARProbe(cfg).to(device)
+
+    # GPT-2-style init (N(0,0.02) weights, zero biases) then set forget bias.
+    # Replicates DeltaMemoryLM._init_weights so the probe's alpha gate starts
+    # near alpha=exp(-softplus(forget_bias_init)) rather than at a random kaiming value.
+    _gpt2_init_probe(model, forget_bias_init)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=2e-3)
+
+    model.train()
+    for _ in range(steps):
+        tokens, targets, mask = _make_distance_batch(
+            batch=64, n_keys=n_keys, n_values=n_values, distance=distance,
+            generator=gen, device=device,
+        )
+        logits = model(tokens)
+        scored = mask.reshape(-1)
+        loss = nn.functional.cross_entropy(
+            logits.reshape(-1, vocab_size)[scored], targets.reshape(-1)[scored]
+        )
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+    model.eval()
+    with torch.no_grad():
+        tokens, targets, mask = _make_distance_batch(
+            batch=256, n_keys=n_keys, n_values=n_values, distance=distance,
+            generator=gen, device=device,
+        )
+        logits = model(tokens)
+        pred = logits.argmax(dim=-1)
+        scored = mask
+        correct = ((pred == targets) & scored).sum().item()
+        total = int(scored.sum().item())
+    return correct / max(1, total)
+
+
+@pytest.mark.skipif(
+    not _HAS_CUDA and not _RUN_ON_CPU,
+    reason="Forget-gate init ablation needs ~2000 Adam steps; GPU-gated (set "
+    "GRAPH_LLM_TEST_DEVICE=cpu to force the slow CPU run).",
+)
+def test_forget_gate_init_ablation() -> None:
+    """PROOF: remember-by-default init (bias=-4) enables cross-distance recall.
+
+    With the new init (delta_forget_bias_init=-4.0, alpha_init~=0.982):
+      recall at distance >= 128 must reach >= 0.9.
+    With the old implicit init (bias=0.0, alpha_init~=0.5):
+      recall at distance >= 128 must be at chance (n_values=16 -> 1/16 ~= 0.0625;
+      we allow up to 0.2 to account for seed variance).
+
+    Seeded + step-capped (~2000 steps) for determinism.  The distance probe layout
+    is ``[k v filler*128 Q k]`` (131 tokens), a single binding that must survive
+    128 tokens.
+    """
+    device = _device()
+    steps = 2000
+    distance = 128
+
+    recall_new = _train_and_eval_recall_at_distance(
+        forget_bias_init=-4.0, distance=distance, device=device, steps=steps, seed=42
+    )
+    recall_old = _train_and_eval_recall_at_distance(
+        forget_bias_init=0.0, distance=distance, device=device, steps=steps, seed=42
+    )
+
+    # New init must enable strong cross-distance recall.
+    assert recall_new >= 0.9, (
+        f"NEW init (bias=-4.0) recall at distance {distance}: {recall_new:.3f} < 0.9 — "
+        f"the remember-by-default bias should let the gate preserve bindings (old init: "
+        f"{recall_old:.3f})."
+    )
+    # Old init must fail (chance = 1/16 ~= 0.0625); allow up to 0.2 for seed variance.
+    assert recall_old <= 0.2, (
+        f"OLD init (bias=0.0) recall at distance {distance}: {recall_old:.3f} > 0.2 — "
+        f"expected near-chance recall when alpha~=0.5 halves bindings every token (new "
+        f"init: {recall_new:.3f}).  If it passed, the alpha gate is not functioning as "
+        f"expected — investigate the forward path."
+    )

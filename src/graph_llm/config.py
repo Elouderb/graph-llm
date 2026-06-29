@@ -104,6 +104,12 @@ class ModelConfig:
     delta_feature_map: str = "l2"
     delta_use_forget_gate: bool = True  # scalar per-head forget gate alpha_t (Gated-DeltaNet);
     #                                     False == ungated DeltaNet (alpha_t == 1).
+    # Forget-gate bias initialisation (card 1e9245f4).  alpha = exp(-softplus(proj(x)));
+    # at init input ~0 so alpha_init = exp(-softplus(bias)).  Default -4.0 gives
+    # softplus(-4) ~= 0.018 -> alpha_init ~= 0.982 (remember-by-default; learns to
+    # forget selectively).  The old implicit default was 0.0 (alpha ~= 0.5, halve every
+    # token, bindings vanish in ~10-20 tokens — blocks cross-segment recall).
+    delta_forget_bias_init: float = -4.0
     # Short causal depthwise conv width applied to the memory INPUT before the
     # q/k/v projections (card 571d50ec).  The delta write is token-LOCAL (k_t, v_t
     # both from x_t), so without local mixing a value position never sees its key

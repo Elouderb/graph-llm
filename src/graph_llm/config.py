@@ -214,6 +214,136 @@ class ModelConfig:
     # eval harness when key_digits is forwarded to cross_segment_retrieval_nll_by_distance.
     synthetic_key_digits: int = 5
 
+    # --- Transient reasoning field (R-LM step 1) hyperparameters (card 9907dc9e) ---
+    # An OPTIONAL config-flagged transient reasoning block inserted into
+    # delta_memory_lm AFTER the memory blocks, BEFORE norm_out + the LM head.  It
+    # carries the VALIDATED iterated reasoner (cards 64ea347f/46aa2292/11ab96e7 — the
+    # R1/R1b/R2 mechanism: a small 2-D field + head doing content-address + 2-D shift
+    # + MANDATORY per-step sharpen, iterated K steps).  The field is a SEPARATE
+    # transient scratchpad — DISTINCT from the persistent delta-net memory matrix and
+    # the DeltaMemoryState carry (per the R3 finding: reason over a clean scratchpad,
+    # NOT the raw lossy memory).  The reasoner runs INDEPENDENTLY per position, seeded
+    # ONLY from that position's hidden state h_t (input-seeded local context, NOT the
+    # memory matrix — memory->scratchpad is R3b, later), so its contribution at
+    # position t depends on no other position => provably causal in an autoregressive
+    # LM, and transient (rebuilt every forward, never carried).  Its readout is added
+    # (residual) into h to refine the next-token prediction.
+    #
+    # reasoning_enabled=False (default) builds NOTHING (no module, no params, no RNG
+    # draws) -> delta_memory_lm is byte-for-byte the committed backbone, so it is a
+    # clean one-flag A/B (the (loss, logits) / (loss, logits, states) contracts and
+    # the existing test suite are untouched).
+    reasoning_enabled: bool = False
+    # Reasoner form.  "grid" == the R2-validated 2-D field/head (content-address +
+    # 2-D torus shift + sharpen).  The only supported form for now.
+    reasoning_field: str = "grid"
+    # The transient field is a reasoning_rows x reasoning_cols toroidal grid of cells
+    # (the R2 "2-D Turing machine" geometry).  Small by default (36 cells) — this is a
+    # per-position scratchpad, run once per token, so the grid stays cheap.
+    reasoning_rows: int = 6
+    reasoning_cols: int = 6
+    # Iterated reasoning depth K (weight-tied controller steps per position).  This is
+    # the iterated-computation budget; the R2 recipe ran the mechanism K steps.
+    reasoning_steps: int = 6
+    # Per-cell content width d_cell (each grid cell stores a d_cell vector, seeded
+    # from h_t).  The controller reads/writes vectors of this width.
+    reasoning_d_cell: int = 24
+    # Controller (GRUCell) hidden width.
+    reasoning_d_ctrl: int = 96
+    # Mandatory per-step sharpening floor (gamma >= this).  >= 1.0 keeps the soft head
+    # peaked against the 2-D pointer dispersion the research flagged as non-obvious +
+    # load-bearing; the R2 recipe used 1.0.
+    reasoning_gamma_floor: float = 1.0
+    # Cell (row,col) address-key width (content-addressing space).  The controller
+    # emits a key of this width; cosine-similarity to the learned per-cell keys drives
+    # the soft content address.
+    reasoning_key_dim: int = 32
+
+    # --- Tandem: causal reasoner || delta-net memory -> gated fusion (card 2dd3400f) ---
+    # An OPTIONAL config-flagged SECOND pathway for delta_memory_lm: the lead-verified
+    # v3 WIN causal reasoner (card e4e8a4dc — CausalGRUEncoder + locate-then-walk +
+    # separate locate key + gamma_floor 2.0 + walk-aux) run PER POSITION, fused with
+    # the existing delta-memory backbone by the UNSUPERVISED gate (card 31fe6b00).
+    # This is DISTINCT from the legacy per-position ``reasoning_*`` ReasoningField above
+    # (that surface is untouched).
+    #
+    # tandem_enabled=False (default) builds NOTHING (no reasoner, no gate, no params, no
+    # RNG draws) -> delta_memory_lm is byte-for-byte the committed backbone, a clean
+    # one-flag A/B (the (loss, logits) / (loss, logits, states) contracts + the existing
+    # suite are untouched).
+    tandem_enabled: bool = False
+    # The reasoner's bounded addressing window (the HARD sub-quadratic constraint): the
+    # input is chunked into windows of this length; every position addresses ONLY
+    # positions <= t WITHIN its window (never unbounded history — that is the memory's
+    # job).  Cost is O(K * reasoning_segment_len) per position -> linear in T.  For the
+    # mixed M+R reproduction this is set to the mixed segment length so the whole answer
+    # segment is one window (aux/teacher-forcing require a single window).
+    reasoning_segment_len: int = 128
+    # Iterated walk depth K per position (the WIN reasoner ran K tied steps).
+    causal_reasoner_steps: int = 12
+    # Mandatory per-step sharpen floor (gamma >= this).  The WIN used 2.0 (deeper
+    # sharpening than the legacy field's 1.0 — the extrapolation lever in card e4e8a4dc).
+    causal_reasoner_gamma_floor: float = 2.0
+    # Address/locate key width (cosine content-addressing space).
+    causal_reasoner_key_dim: int = 48
+    # CausalGRUEncoder LEFT-padded causal conv kernel width (cheap local features).
+    causal_reasoner_conv_kernel: int = 5
+    # CausalGRUEncoder unidirectional GRU depth (the content-carrying recurrence).
+    causal_reasoner_gru_layers: int = 1
+    # #positions ending at the query position the seed pools to read the local context.
+    causal_reasoner_query_window: int = 12
+    # Read the RHS-name descriptor directly into the move query (key-value pointer follow).
+    causal_reasoner_direct_ptr: bool = True
+    # Straight-through top-1 on the SEED head.  The locate-first STAGING (commit only
+    # after ``reasoning_locate_warmup`` steps) is applied ONLY by ``tandem_step`` (the
+    # reproduction trainer), which tracks the step via the ``_tandem_step`` buffer.  The
+    # plain ``forward()`` path (e.g. a SegmentedTrainer / Trainer run with tandem on, as
+    # in the text8 sanity) has no train-step signal and commits the seed from the first
+    # step (``commit_seed=True``) — the committed/eval behaviour, harmless for LM use.
+    causal_reasoner_hard_seed: bool = True
+    # Gate bias init (memory-favoring safe default): the fusion gate bias is set so
+    # ``g = sigmoid(bias) ~= 0.05`` at init -> ``h ~= h_mem``, i.e. the tandem starts
+    # CLOSE to the committed memory backbone and the reasoner has to EARN its weight
+    # (analogous to the forget-gate remember-by-default init).  This keeps plain-text
+    # bpb close to OFF (the reasoner is untrained on real text) and gives the routing a
+    # clean starting point (M already at memory; only R must climb to the reasoner).
+    tandem_gate_bias_init: float = -3.0
+    # Straight-through HARD gate during training (mechanism latitude, card 2dd3400f):
+    # the forward fusion commits g to 0/1 (per channel) so the answer depends on the
+    # DOMINANT pathway — routing an example to the wrong pathway then PRODUCES A WRONG
+    # ANSWER, so the main answer loss supplies the routing DIRECTION the label-free
+    # balance loss alone cannot (it is direction-agnostic).  Soft gradient in backward
+    # (straight-through) keeps the gate differentiable; the reported/loss gate stays the
+    # SOFT preference.  Applied post-mix-release, train-mode only.  Default False.
+    tandem_hard_gate: bool = False
+    # SCALAR per-position gate (mechanism latitude): when True the gate is a single
+    # value per position (Linear -> 1) broadcast over channels, so the WHOLE position
+    # routes to one pathway — a wrong route makes the entire fused vector wrong (a clean
+    # answer-loss direction signal), and the mean-gate == the routing decision (a crisp
+    # interpretable proof).  When False (default) the gate is per-channel (Linear ->
+    # d_model), the scratchpad form.  ``h = g (broadcast) * h_reason + (1-g) * h_mem``.
+    tandem_gate_scalar: bool = False
+
+    # --- Unsupervised gate-routing losses (card 31fe6b00, applied by TandemTrainer) ---
+    # Label-free routing: the main answer loss decides DIRECTION per example; these force
+    # DIFFERENTIATION.  The load-bearing rung is the forced-mix warmup (both pathways
+    # trained under g=0.5 first) — done IN the model forward via a train-step buffer.
+    gate_balance_weight: float = 2.0       # (batch_mean(g) - 0.5)^2 — anti-collapse
+    gate_commit_weight: float = 1.0        # mean(g*(1-g)) — per-example g -> 0/1
+    gate_commit_anneal_steps: int = 900    # ramp commitment 0 -> full from mix-release
+    gate_noise_std: float = 0.5            # Gaussian noise on gate logits (exploration)
+    gate_mix_warmup_steps: int = 600       # force g=0.5 for N train steps (both pathways train)
+
+    # --- R-synthetic reasoning-task mixing (card 2dd3400f) ---
+    # The mixed M+R stream, the R-example shape (n_chains), and the aux-loss weights
+    # (locate-CE / walk-aux) are owned by the reproduction driver's own scoped
+    # ``graph_llm.train.tandem.TandemConfig`` (n_chains, locate_weight, walk_weight),
+    # NOT by ModelConfig — so those knobs are intentionally absent here.  Only
+    # ``reasoning_locate_warmup`` lives on ModelConfig because the MODEL reads it: it
+    # gates the causal reasoner's locate-first hard-seed commit inside ``tandem_step``
+    # (``commit_seed = _tandem_step >= reasoning_locate_warmup``).
+    reasoning_locate_warmup: int = 600     # locate-first: commit the learned seed after N steps
+
 
 @dataclass
 class DataConfig:

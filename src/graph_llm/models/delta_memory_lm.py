@@ -45,8 +45,10 @@ import torch.utils.checkpoint
 from torch import Tensor
 
 from graph_llm.models.baselines.transformer import RMSNorm
+from graph_llm.models.components.causal_reasoner import CausalReasoner
 from graph_llm.models.components.delta_memory import DeltaMemoryState, GatedDeltaMemory
 from graph_llm.models.components.multiscale_conv_embed import MultiScaleConvEmbedding
+from graph_llm.models.components.reasoning_field import ReasoningField
 from graph_llm.models.registry import get_embedding_init, register_model
 
 if TYPE_CHECKING:
@@ -133,6 +135,9 @@ class DeltaMemoryLM(nn.Module):
     Trainer depends only on that contract.
     """
 
+    # Registered only when tandem_enabled (declared here for static typing).
+    _tandem_step: Tensor
+
     def __init__(self, cfg: Config) -> None:
         super().__init__()
         m = cfg.model
@@ -159,6 +164,47 @@ class DeltaMemoryLM(nn.Module):
 
         # Depth-scalable stack of delta-memory blocks.
         self.blocks = nn.ModuleList([DeltaMemoryBlock(m) for _ in range(m.delta_layers)])
+
+        # Optional transient reasoning field (card 9907dc9e): the R2-validated
+        # iterated 2-D reasoner, run INDEPENDENTLY per position (seeded from h_t
+        # alone -> input-seeded + provably causal + transient), inserted AFTER the
+        # memory blocks and BEFORE norm_out so its readout refines the next-token
+        # prediction (added as a residual in ``forward``).  It is a SEPARATE
+        # scratchpad, distinct from the persistent delta-net memory + its carried
+        # DeltaMemoryState.  ``reasoning_enabled=False`` (default) builds NOTHING
+        # here (no module, no params, no RNG draws) -> the committed backbone is
+        # byte-for-byte unchanged, so it is a clean one-flag A/B.
+        self.reasoner: ReasoningField | None = (
+            ReasoningField(m) if getattr(m, "reasoning_enabled", False) else None
+        )
+
+        # Optional tandem reasoner pathway (card 2dd3400f): the lead-verified v3 WIN
+        # causal reasoner (card e4e8a4dc) run PER POSITION, fused with the delta-memory
+        # backbone by the UNSUPERVISED gate (card 31fe6b00).  The delta stack is the
+        # MEMORY pathway (unchanged); the reasoner reads the raw tokens over
+        # segment-bounded windows and produces a per-position reasoning hidden; a LIGHT
+        # gate ``g = sigmoid(Linear([h_mem ; h_reason ; h_ctx]))`` fuses them per
+        # position: ``h = g*h_reason + (1-g)*h_mem`` -> norm -> head.  DISTINCT from the
+        # legacy ``self.reasoner`` field above (separate config surface).
+        #
+        # ``tandem_enabled=False`` (default) builds NOTHING here (no reasoner, no gate,
+        # no buffer, no params, no RNG draws) -> the committed backbone is byte-for-byte
+        # unchanged, so it is a clean one-flag A/B.
+        self.causal_reasoner: CausalReasoner | None = None
+        self.tandem_gate: nn.Linear | None = None
+        if getattr(m, "tandem_enabled", False):
+            self.causal_reasoner = CausalReasoner(m)
+            gate_out = 1 if m.tandem_gate_scalar else m.d_model
+            self.tandem_gate = nn.Linear(3 * m.d_model, gate_out)
+            # Train-step counter (card 2dd3400f): drives the forced-mix warmup + the
+            # locate-first seed commit.  Registered ONLY when the tandem is on, so the
+            # OFF state_dict is unchanged.
+            self.register_buffer("_tandem_step", torch.zeros((), dtype=torch.long))
+            self._gate_mix_warmup = m.gate_mix_warmup_steps
+            self._gate_noise_std = m.gate_noise_std
+            self._reasoning_locate_warmup = m.reasoning_locate_warmup
+            self._tandem_hard_gate = m.tandem_hard_gate
+
         self.norm_out = RMSNorm(m.d_model)
 
         # Output head — optionally tied to the embedding table.
@@ -212,6 +258,29 @@ class DeltaMemoryLM(nn.Module):
             for block in self.blocks:
                 if block.mixer.alpha_proj is not None:
                     nn.init.constant_(block.mixer.alpha_proj.bias, m.delta_forget_bias_init)
+
+        # Reasoning-field head-bias priors (card 9907dc9e).  The generic loop above
+        # zeros ALL linear biases — including the reasoner's controller heads, whose
+        # R2-validated priors (trust a content match, neutral gate/shift, mild
+        # sharpen) are load-bearing for trainability.  Re-apply them HERE, after the
+        # loop, so they survive.  When reasoning is disabled self.reasoner is None and
+        # this is a no-op (the committed backbone is untouched).
+        if self.reasoner is not None:
+            self.reasoner._reset_head_biases()
+
+        # Tandem causal reasoner (card 2dd3400f).  The generic loop above re-inits ALL
+        # nn.Linear to std=0.02 and zeros their biases — clobbering the reasoner's
+        # scratchpad-validated default init AND its load-bearing head-bias priors (beta
+        # positive, neutral gate, mild sharpen, key-scale 5).  Re-apply the reasoner's
+        # own faithful init HERE, after the loop, so it survives.  No-op when the tandem
+        # is off (self.causal_reasoner is None).
+        if self.causal_reasoner is not None:
+            self.causal_reasoner.reset_parameters()
+            # Memory-favoring gate bias (safe default): g = sigmoid(bias) ~= 0.05 at
+            # init -> the tandem starts ~= the committed memory backbone (the reasoner
+            # earns its weight).  Re-applied after the generic loop zeroed it.
+            assert self.tandem_gate is not None
+            nn.init.constant_(self.tandem_gate.bias, m.tandem_gate_bias_init)
 
     def _forward_blocks(
         self,
@@ -279,6 +348,124 @@ class DeltaMemoryLM(nn.Module):
         return_states: Literal[True],
     ) -> tuple[Tensor, Tensor, list[DeltaMemoryState]]: ...
 
+    def _forward_impl(
+        self,
+        x: Tensor,
+        targets: Tensor | None,
+        states_in: list[DeltaMemoryState] | None,
+        return_states: bool,
+        *,
+        gate_mix: float | Tensor | None = None,
+        gate_noise: float = 0.0,
+        collect_aux: bool = False,
+        aux_query_pos: Tensor | None = None,
+        tf_seed: Tensor | None = None,
+        commit_seed: bool = True,
+        steps: int | None = None,
+        memory_only: bool = False,
+    ) -> tuple[Tensor, Tensor, list[DeltaMemoryState] | None, Tensor | None, dict | None]:
+        """Shared forward body for the public ``forward`` + the tandem trainer.
+
+        Returns ``(loss, logits, states_out, gate, aux)``.  ``gate`` /``aux`` are
+        ``None`` unless the tandem is enabled; the OFF path (``causal_reasoner is
+        None``) is byte-for-byte the committed backbone.
+        """
+        h_embed = self.embed_drop(self.embed(x))
+        # Optional cheap local combiner (card ed853f9c): enrich each token with
+        # multi-scale causal local context before the memory layers.  ``None`` when
+        # front_end="none" -> this line is a pure pass-through (the committed
+        # backbone, unchanged).
+        if self.front_end is not None:
+            h_embed = self.front_end(h_embed)
+
+        # MEMORY pathway = the existing delta-memory block stack (UNCHANGED).
+        # ``_forward_blocks`` returns a ``(x, states)`` tuple whenever a carried state
+        # is threaded in (``states_in is not None``) OR ``return_states`` — so unpack
+        # in that case and only EXPOSE the carried state when the caller asked for it.
+        # This keeps the two committed paths byte-for-byte (states_in=None +
+        # return_states=False -> fast path; return_states=True -> unpack) and also
+        # supports carrying a state WITHOUT returning it (the tandem answer segment).
+        states_out: list[DeltaMemoryState] | None = None
+        if return_states or states_in is not None:
+            h_mem, carried_out = cast(
+                "tuple[Tensor, list[DeltaMemoryState]]",
+                self._forward_blocks(h_embed, states_in=states_in, return_states=True),
+            )
+            if return_states:
+                states_out = carried_out
+        else:
+            h_mem = cast(Tensor, self._forward_blocks(h_embed, states_in=states_in))
+
+        # Optional transient reasoning field (card 9907dc9e): a per-position iterated
+        # 2-D reasoner seeded from h_t alone, added back as a residual.  Applied to the
+        # memory pathway output (unchanged when the tandem is off).
+        if self.reasoner is not None:
+            h_mem = h_mem + self.reasoner(h_mem)
+
+        gate: Tensor | None = None
+        aux: dict | None = None
+        if self.causal_reasoner is None or memory_only:
+            # OFF path (byte-for-byte the committed backbone), or the memory-only fast
+            # path for non-answer carry segments (skip the reasoner + gate — those
+            # segments only build the cross-segment memory state; the delta blocks that
+            # produce ``states_out`` are unaffected by the gate).
+            h = h_mem
+        else:
+            # REASONER pathway: per-position, segment-bounded causal walk over the raw
+            # tokens (card e4e8a4dc).  Sub-quadratic by construction (bounded window).
+            assert self.tandem_gate is not None
+            if collect_aux:
+                h_reason, aux = cast(
+                    "tuple[Tensor, dict]",
+                    self.causal_reasoner(
+                        x, steps=steps, commit_seed=commit_seed, return_aux=True,
+                        aux_query_pos=aux_query_pos, tf_seed=tf_seed,
+                    ),
+                )
+            else:
+                h_reason = cast(
+                    Tensor,
+                    self.causal_reasoner(
+                        x, steps=steps, commit_seed=commit_seed,
+                        aux_query_pos=aux_query_pos, tf_seed=tf_seed,
+                    ),
+                )
+            # LIGHT gate over [h_mem ; h_reason ; h_ctx]; h_ctx = the shared embedding
+            # / front-end hidden (the routing signal).
+            gate_logit = self.tandem_gate(torch.cat([h_mem, h_reason, h_embed], dim=-1))
+            if gate_noise > 0.0 and self.training:
+                gate_logit = gate_logit + gate_noise * torch.randn_like(gate_logit)
+            g_soft = torch.sigmoid(gate_logit)
+            if gate_mix is not None:  # forced fusion (mix warmup, or per-row curriculum).
+                if isinstance(gate_mix, Tensor):
+                    # Per-row/per-position directed routing (curriculum): route each
+                    # example to its specialist.  Broadcast (B,) -> (B, 1, 1) over T + d.
+                    gm = gate_mix
+                    while gm.dim() < g_soft.dim():
+                        gm = gm.unsqueeze(-1)
+                    g = gm.to(g_soft.dtype).expand_as(g_soft)
+                else:
+                    g = torch.full_like(g_soft, float(gate_mix))
+            elif self._tandem_hard_gate and self.training:
+                # Straight-through hard gate: forward commits to 0/1 (answer depends on
+                # the DOMINANT pathway), soft gradient in backward.
+                g = (g_soft > 0.5).to(g_soft.dtype) + (g_soft - g_soft.detach())
+            else:
+                g = g_soft
+            h = g * h_reason + (1.0 - g) * h_mem
+            # Report/loss on the SOFT gate preference (1=reasoner, 0=memory).
+            gate = g_soft.mean(dim=-1)  # (B, T)
+
+        h = self.norm_out(h)
+        logits = self.lm_head(h)
+
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, self.vocab_size), targets.reshape(-1))
+        else:
+            loss = torch.zeros(1, device=x.device)
+
+        return loss, logits, states_out, gate, aux
+
     def forward(
         self,
         x: Tensor,
@@ -314,35 +501,100 @@ class DeltaMemoryLM(nn.Module):
             backbone): the optional ``multiscale_conv`` front-end left-zero-pads
             each call, so a naive per-segment forward would not match a single
             full-sequence forward at segment boundaries.  The carried state covers
-            the delta-memory layers only.
+            the delta-memory layers only.  The optional reasoning field
+            (``reasoning_enabled=True``) is a *transient* per-position scratchpad
+            seeded from each position's hidden state alone — it carries no state
+            across positions or segments, so it composes with the carry without
+            affecting it (it is applied to ``h`` after the carried memory blocks).
+            The optional tandem reasoner (``tandem_enabled=True``) is likewise a
+            transient per-position pathway fused by the gate; the standard forward
+            uses the LEARNED gate (no forced-mix / noise — those are training-only,
+            applied via :meth:`tandem_step`), and it is byte-for-byte the committed
+            backbone when ``tandem_enabled=False``.
         """
-        h = self.embed_drop(self.embed(x))
-        # Optional cheap local combiner (card ed853f9c): enrich each token with
-        # multi-scale causal local context before the memory layers.  ``None`` when
-        # front_end="none" -> this line is a pure pass-through (the committed
-        # backbone, unchanged).
-        if self.front_end is not None:
-            h = self.front_end(h)
-
-        states_out: list[DeltaMemoryState] | None = None
-        if return_states:
-            h, states_out = cast(
-                "tuple[Tensor, list[DeltaMemoryState]]",
-                self._forward_blocks(h, states_in=states_in, return_states=True),
-            )
-        else:
-            h = cast(Tensor, self._forward_blocks(h, states_in=states_in))
-        h = self.norm_out(h)
-        logits = self.lm_head(h)
-
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, self.vocab_size), targets.reshape(-1))
-        else:
-            loss = torch.zeros(1, device=x.device)
-
+        loss, logits, states_out, _gate, _aux = self._forward_impl(
+            x, targets, states_in, return_states
+        )
         if states_out is not None:
             return loss, logits, states_out
         return loss, logits
+
+    def memory_forward(
+        self,
+        x: Tensor,
+        states_in: list[DeltaMemoryState] | None = None,
+        return_states: bool = True,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, list[DeltaMemoryState]]:
+        """Memory-only forward (skips the reasoner + gate) for carry segments.
+
+        Used by the tandem trainer to build the cross-segment delta-memory state on
+        the non-answer segments (filler / binding) without paying for the
+        per-position walk — the delta blocks that produce the carried state are
+        unaffected by the gate, so this yields the identical ``states_out``.  Same
+        return contract as :meth:`forward`.
+        """
+        loss, logits, states_out, _g, _a = self._forward_impl(
+            x, None, states_in, return_states, memory_only=True
+        )
+        if states_out is not None:
+            return loss, logits, states_out
+        return loss, logits
+
+    def tandem_step(
+        self,
+        x: Tensor,
+        targets: Tensor | None = None,
+        states_in: list[DeltaMemoryState] | None = None,
+        return_states: bool = False,
+        *,
+        aux_query_pos: Tensor | None = None,
+        tf_seed: Tensor | None = None,
+        steps: int | None = None,
+        collect_aux: bool = True,
+        force_gate: float | Tensor | None = None,
+    ) -> dict:
+        """Tandem training/eval forward exposing the gate + reasoner aux.
+
+        Used by the :class:`~graph_llm.train.tandem.TandemTrainer` to apply the
+        unsupervised gate losses + the reasoner locate-CE / walk-aux.  Does NOT
+        touch the standard ``(loss, logits)`` Trainer contract.  In train mode it
+        drives the forced-mix warmup (``g = 0.5`` while the train-step counter is
+        below ``gate_mix_warmup_steps``) + gate-logit noise + the locate-first seed
+        commit from the model's ``_tandem_step`` buffer.
+
+        Returns a dict with ``logits`` ``(B, T, vocab)``, ``gate`` ``(B, T)`` (or
+        ``None`` when the tandem is off), ``aux`` (``{"seed_logits", "walk_w"}``
+        gathered at ``aux_query_pos``), ``states_out``, and the current ``step`` /
+        ``gate_mix``.
+        """
+        if self.causal_reasoner is None:
+            raise RuntimeError("tandem_step requires tandem_enabled=True.")
+        step = int(self._tandem_step.item())
+        if force_gate is not None:
+            # Dissociation probe: pin g to 0.0 (memory only) or 1.0 (reasoner only) to
+            # measure each pathway in isolation (the interpretable-proof eval).
+            gate_mix: float | Tensor | None = force_gate
+        else:
+            gate_mix = 0.5 if (self.training and step < self._gate_mix_warmup) else None
+        gate_noise = self._gate_noise_std if self.training else 0.0
+        commit_seed = step >= self._reasoning_locate_warmup
+        loss, logits, states_out, gate, aux = self._forward_impl(
+            x, targets, states_in, return_states,
+            gate_mix=gate_mix, gate_noise=gate_noise, collect_aux=collect_aux,
+            aux_query_pos=aux_query_pos, tf_seed=tf_seed, commit_seed=commit_seed,
+            steps=steps,
+        )
+        if self.training:
+            self._tandem_step += 1
+        return {
+            "loss": loss,
+            "logits": logits,
+            "states_out": states_out,
+            "gate": gate,
+            "aux": aux,
+            "step": step,
+            "gate_mix": gate_mix,
+        }
 
     def num_parameters(self, trainable_only: bool = True) -> int:
         """Return total (or trainable-only) parameter count."""

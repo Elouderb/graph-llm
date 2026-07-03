@@ -256,6 +256,10 @@ class CausalReasoner(nn.Module):
         aux_query_pos: Tensor | None,
         tf_seed: Tensor | None,
         collect_aux: bool,
+        walk_hard: bool = False,
+        gamma_add: float = 0.0,
+        clock_period: int | None = None,
+        query_pos: Tensor | None = None,
     ) -> tuple[Tensor, dict | None]:
         """Run the per-position locate-then-walk over ONE batch of windows.
 
@@ -269,22 +273,55 @@ class CausalReasoner(nn.Module):
                 ``aux_query_pos`` rows during training, or ``None``.
             collect_aux: gather ``seed_logits`` + per-hop ``walk_w`` at
                 ``aux_query_pos``.
-
+            query_pos: ``(N,)`` SINGLE query position per row.  When given, the walk
+                is run only at that one position per row (``Lq = 1``) instead of at
+                every position (``Lq = L``) — the O(K*L) single-query fast path used
+                when the caller needs the reasoning hidden at ONE position (e.g. the
+                answer position for the R-synthetic aux training / eval).  The returned
+                hidden is ``(N, 1, d_model)`` and, with ``collect_aux``, the aux is that
+                single row directly.  ``None`` (default) is the full per-position path
+                (byte-for-byte the shipped LM behaviour).
+            walk_hard: EVAL-TIME per-hop hard addressing (card 0a98292b).  When
+                ``True``, straight-through top-1 the walk head AFTER each step's
+                sharpen so the next read/query is a CLEAN single-position read — this
+                stops the residual off-chain probability mass from accumulating over
+                deep walks (the ~0.98/hop soft-blend compounding tax).  ``False``
+                (default) is the byte-for-byte soft walk the tandem trains/evals with.
+            gamma_add: EVAL-TIME extra sharpening added to every per-step ``gamma``
+                (card 0a98292b, candidate 2).  ``0.0`` (default) leaves the trained
+                sharpen untouched.
+            clock_period: EVAL-TIME period for the walk step-clock (card 0a98292b).
+                The clock is ``phi = 2*pi*step / period``; ``None`` (default) uses
+                ``period = steps`` (the shipped behaviour — the clock stretches to fill
+                the walk).  Setting it to the TRAINED walk depth makes the clock REPEAT
+                its training cycle every ``clock_period`` hops, so a deep-extrapolation
+                walk keeps seeing an in-distribution clock instead of a stretched one
+                the controller never trained on.  A no-op when ``steps <= clock_period``
+                (then ``step/period`` matches the default over the trained range).
         Returns:
             ``(h_reason (N, L, d_model), aux | None)``.
         """
         n, length = x.shape
         device = x.device
+        rows = torch.arange(n, device=device)
+        qmode = query_pos is not None                    # single-query fast path
         h = self.encoder(x)                              # (N, L, d)
         keys_n = F.normalize(self.name_key(h), dim=-1)   # (N, L, dk)
         ptr_keys = self.ptr_key(h)                       # (N, L, dk)
         vals = self.val(h)                               # (N, L, d)
         seed_keys_n = F.normalize(self.seed_name_key(h), dim=-1)
 
-        # Causal mask: query t addresses keys <= t (predicting token t+1).
+        # Causal mask: query q addresses keys <= q_pos.  Full path: every position is a
+        # query (Lq=L).  Query path: one query per row (Lq=1) at ``query_pos``.
         pos = torch.arange(length, device=device)
-        addr_mask = (pos.unsqueeze(0) <= pos.unsqueeze(1)).unsqueeze(0)  # (1,Lq,Lk)
-        addr_mask = addr_mask.expand(n, length, length)
+        if qmode:
+            assert query_pos is not None
+            lq = 1
+            addr_mask = pos.view(1, 1, length) <= query_pos.view(n, 1, 1)  # (N,1,Lk)
+        else:
+            lq = length
+            addr_mask = (pos.unsqueeze(0) <= pos.unsqueeze(1)).unsqueeze(0)  # (1,Lq,Lk)
+            addr_mask = addr_mask.expand(n, length, length)
         neg_inf = torch.finfo(h.dtype).min
         scale = F.softplus(self.key_scale)
 
@@ -293,12 +330,15 @@ class CausalReasoner(nn.Module):
         # the DEDICATED locate keys.  ``seed_pre`` is the pre-softmax address logit
         # (cosine * scale, masked) kept for the aux locate-CE.
         pooled = self._causal_pool(h)                    # (N, L, d)
-        q0 = self.query_pool(pooled)                     # (N, L, dk)
+        if qmode:
+            assert query_pos is not None
+            pooled = pooled[rows, query_pos].unsqueeze(1)  # (N, 1, d)
+        q0 = self.query_pool(pooled)                     # (N, Lq, dk)
         q0_n = F.normalize(q0, dim=-1)
         seed_cos = torch.einsum("nqd,nkd->nqk", q0_n, seed_keys_n)
         seed_pre = (scale * seed_cos).masked_fill(~addr_mask, neg_inf)  # (N,Lq,Lk)
         w = F.softmax(seed_pre, dim=-1)
-        gamma_seed = torch.full((n, length, 1), self.gamma_floor + 1.0, device=device, dtype=h.dtype)
+        gamma_seed = torch.full((n, lq, 1), self.gamma_floor + 1.0, device=device, dtype=h.dtype)
         w = self._sharpen(w, gamma_seed)
         if self.hard_seed and commit_seed:
             w = _st_top1(w)
@@ -308,31 +348,33 @@ class CausalReasoner(nn.Module):
         # mixed batch the reasoning rows get the known-head one-hot start while the
         # memory rows (``tf_seed = -1``) keep the learned locate.
         if tf_seed is not None and aux_query_pos is not None:
-            rows = torch.arange(n, device=device)
             valid = tf_seed >= 0
             if bool(valid.any()):
                 one_hot = torch.zeros(n, length, device=device, dtype=h.dtype)
                 one_hot.scatter_(1, tf_seed.clamp_min(0).unsqueeze(1), 1.0)
                 w = w.clone()
                 vr = rows[valid]
-                w[vr, aux_query_pos[valid]] = one_hot[valid]
+                if qmode:
+                    w[vr, 0] = one_hot[valid]            # the single Lq row IS the query
+                else:
+                    w[vr, aux_query_pos[valid]] = one_hot[valid]
 
         aux_seed_logits = None
         walk_w_list: list[Tensor] = []
         if collect_aux and aux_query_pos is not None:
-            rows = torch.arange(n, device=device)
-            aux_seed_logits = seed_pre[rows, aux_query_pos]  # (N, Lk)
+            aux_seed_logits = seed_pre[:, 0] if qmode else seed_pre[rows, aux_query_pos]  # (N, Lk)
 
         # --- Stage 2: walk ---
-        ctrl = torch.zeros(n, length, self.d_ctrl, device=device, dtype=h.dtype)
+        ctrl = torch.zeros(n, lq, self.d_ctrl, device=device, dtype=h.dtype)
+        clock_norm = steps if clock_period is None else clock_period
         for step in range(steps):
-            phi = 2.0 * math.pi * step / max(1, steps)
+            phi = 2.0 * math.pi * step / max(1, clock_norm)
             clk = torch.tensor([math.sin(phi), math.cos(phi)], device=device, dtype=h.dtype)
-            clk = clk.view(1, 1, 2).expand(n, length, 2)
+            clk = clk.view(1, 1, 2).expand(n, lq, 2)
             r = torch.einsum("nqk,nkd->nqd", w, vals)          # (N, Lq, d)
             read_ptr = torch.einsum("nqk,nkd->nqd", w, ptr_keys)  # (N, Lq, dk)
-            gru_in = torch.cat([r, clk], dim=-1).reshape(n * length, -1)
-            ctrl = self.gru(gru_in, ctrl.reshape(n * length, -1)).view(n, length, self.d_ctrl)
+            gru_in = torch.cat([r, clk], dim=-1).reshape(n * lq, -1)
+            ctrl = self.gru(gru_in, ctrl.reshape(n * lq, -1)).view(n, lq, self.d_ctrl)
 
             query = self.to_query(ctrl)
             if self.direct_ptr:
@@ -340,19 +382,30 @@ class CausalReasoner(nn.Module):
             beta = F.softplus(self.to_beta(ctrl))
             g = torch.sigmoid(self.to_gate(ctrl))
             gamma = self.gamma_floor + F.softplus(self.to_gamma(ctrl))
+            if gamma_add:
+                gamma = gamma + gamma_add
 
             w_c = self._address(query, keys_n, addr_mask, scale, beta, neg_inf)
             w = g * w_c + (1.0 - g) * w
             w = w.masked_fill(~addr_mask, 0.0)
             w = w / w.sum(-1, keepdim=True).clamp_min(1e-12)
             w = self._sharpen(w, gamma)
+            # Collect the SOFT head for the aux (walk-aux NLL needs a real distribution;
+            # ``argmax`` is unchanged by the hard commit below, so the eval on-target
+            # trace is identical either way).
             if collect_aux and aux_query_pos is not None:
-                rows = torch.arange(n, device=device)
-                walk_w_list.append(w[rows, aux_query_pos])  # (N, Lk)
+                walk_w_list.append(w[:, 0] if qmode else w[rows, aux_query_pos])  # (N, Lk)
+            if walk_hard:
+                # HARD addressing: straight-through top-1 the head so the NEXT step's
+                # read/query is a CLEAN single-position read (no compounding off-chain
+                # blur).  Eval lever (card 0a98292b); also a valid TRAINING regime
+                # (straight-through is differentiable) that sharpens per-hop precision
+                # while the walk-aux above still supervises the underlying soft head.
+                w = _st_top1(w)
 
         r_final = torch.einsum("nqk,nkd->nqd", w, vals)         # (N, Lq, d)
         fusion_hidden = torch.cat([r_final, ctrl], dim=-1)      # (N, Lq, d + d_ctrl)
-        out = self.proj(fusion_hidden)                          # (N, L, d_model)
+        out = self.proj(fusion_hidden)                          # (N, Lq, d_model)
 
         aux: dict | None = None
         if collect_aux and aux_query_pos is not None:
@@ -370,6 +423,9 @@ class CausalReasoner(nn.Module):
         return_aux: bool = False,
         aux_query_pos: Tensor | None = None,
         tf_seed: Tensor | None = None,
+        walk_hard: bool = False,
+        gamma_add: float = 0.0,
+        clock_period: int | None = None,
     ) -> Tensor | tuple[Tensor, dict]:
         """Per-position reasoning hidden over segment-bounded windows.
 
@@ -382,6 +438,14 @@ class CausalReasoner(nn.Module):
             aux_query_pos: ``(B,)`` answer position per row (for the aux gather /
                 teacher forcing).
             tf_seed: ``(B,)`` teacher-forced walk-seed index at ``aux_query_pos``.
+            walk_hard: EVAL-TIME per-hop hard addressing (card 0a98292b) — straight-
+                through top-1 the walk head after each step so deep walks do not
+                accumulate off-chain blur.  ``False`` (default) = the soft walk the
+                tandem trains/evals with (no behavioural change to the shipped path).
+            gamma_add: EVAL-TIME extra per-step sharpening added to ``gamma``.  ``0.0``
+                (default) leaves the trained sharpen untouched.
+            clock_period: EVAL-TIME walk step-clock period (see ``_walk_window``).
+                ``None`` (default) = the shipped stretch-to-fill clock.
 
         Returns:
             ``h_reason (B, T, d_model)`` or, when ``return_aux``, ``(h_reason, aux)``.
@@ -398,7 +462,8 @@ class CausalReasoner(nn.Module):
                     f"reasoning_segment_len={length})."
                 )
             out, aux = self._walk_window(
-                x, k, commit_seed, aux_query_pos, tf_seed, collect_aux=return_aux
+                x, k, commit_seed, aux_query_pos, tf_seed, collect_aux=return_aux,
+                walk_hard=walk_hard, gamma_add=gamma_add, clock_period=clock_period,
             )
             if return_aux:
                 assert aux is not None
@@ -414,10 +479,58 @@ class CausalReasoner(nn.Module):
             x = F.pad(x, (0, pad))
         xw = x.view(b, n_win, length).reshape(b * n_win, length)
         out, _ = self._walk_window(
-            xw, k, commit_seed, aux_query_pos=None, tf_seed=None, collect_aux=False
+            xw, k, commit_seed, aux_query_pos=None, tf_seed=None, collect_aux=False,
+            walk_hard=walk_hard, gamma_add=gamma_add, clock_period=clock_period,
         )
         out = out.view(b, n_win, length, self.d_model).reshape(b, n_win * length, self.d_model)
         return out[:, :t]
+
+    def query_forward(
+        self,
+        x: Tensor,
+        query_pos: Tensor,
+        steps: int | None = None,
+        commit_seed: bool = True,
+        return_aux: bool = False,
+        tf_seed: Tensor | None = None,
+        walk_hard: bool = False,
+        gamma_add: float = 0.0,
+        clock_period: int | None = None,
+    ) -> Tensor | tuple[Tensor, dict]:
+        """Single-query fast path: the reasoning hidden AT ``query_pos`` only.
+
+        Runs the identical locate-then-walk as :meth:`forward` but only for the one
+        query position per row, so cost is ``O(K * L)`` (not ``O(K * L^2)``) — the
+        efficient route for R-synthetic aux training/eval, where only the answer
+        position is supervised/read.  It is numerically identical to
+        ``forward(x, ..., return_aux=True)`` gathered at ``query_pos`` (pinned by a test).
+
+        Args:
+            x: ``(B, T)`` token ids (single window: ``T <= segment_len``).
+            query_pos: ``(B,)`` the one position per row to run the walk at.
+            (Remaining args mirror :meth:`forward`.)
+
+        Returns:
+            ``h_reason (B, d_model)`` or, when ``return_aux``, ``(h_reason, aux)`` with
+            ``aux = {"seed_logits" (B, T), "walk_w" (B, K, T)}``.
+        """
+        b, t = x.shape
+        k = self.steps if steps is None else steps
+        if t > self.segment_len:
+            raise ValueError(
+                f"query_forward requires a single window (T={t} <= "
+                f"reasoning_segment_len={self.segment_len})."
+            )
+        out, aux = self._walk_window(
+            x, k, commit_seed, aux_query_pos=query_pos, tf_seed=tf_seed,
+            collect_aux=return_aux, walk_hard=walk_hard, gamma_add=gamma_add,
+            clock_period=clock_period, query_pos=query_pos,
+        )
+        out = out[:, 0]  # (B, d_model) — the single query row
+        if return_aux:
+            assert aux is not None
+            return out, aux
+        return out
 
 
 __all__ = ["CausalGRUEncoder", "CausalReasoner"]

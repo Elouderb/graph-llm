@@ -324,6 +324,25 @@ class ModelConfig:
     # d_model), the scratchpad form.  ``h = g (broadcast) * h_reason + (1-g) * h_mem``.
     tandem_gate_scalar: bool = False
 
+    # --- Tandem MLP WORKHORSE: 3rd pathway + 3-way softmax gate (card a7948491) ---
+    # An OPTIONAL plain per-token MLP/FFN added as a THIRD gated pathway, generalising the
+    # 2-way sigmoid blend {mem, reason} into a 3-way softmax over {mem, reason, mlp} with
+    # fusion ``h = sum_e g_e * h_e``.  Motivation (card a7948491 / the conv/matched-OFF
+    # findings 4d7dda62): plain per-token capacity is the strongest use of params on
+    # ORDINARY prediction; the 2-way gate over-leans on the specialists (memory/reasoner)
+    # because it has no default workhorse to route ordinary text to (text8 washed at
+    # +0.83%).  The MLP reads the SAME trunk input the memory pathway does (``h_embed``),
+    # is stateless + per-position -> LM-leak-safe (logits[t] depend only on tokens <= t).
+    #
+    # tandem_mlp_enabled=False (default) == the SHIPPED, verified 2-way sigmoid tandem,
+    # byte-for-byte UNCHANGED (no MLP module, no gate reshape, no extra RNG draws): the
+    # 3-way is a NEW MODE, opt-in, so the committed 2-way recipe still reproduces exactly.
+    # Requires tandem_enabled=True (the MLP pathway + 3-way gate only exist when the tandem
+    # is on); it is a no-op when tandem_enabled=False (nothing is constructed either way).
+    tandem_mlp_enabled: bool = False
+    # GatedMLP (GeGLU) inner-expansion for the workhorse pathway (d_ff = mult * d_model).
+    tandem_mlp_ff_mult: int = 4
+
     # --- Unsupervised gate-routing losses (card 31fe6b00, applied by TandemTrainer) ---
     # Label-free routing: the main answer loss decides DIRECTION per example; these force
     # DIFFERENTIATION.  The load-bearing rung is the forced-mix warmup (both pathways

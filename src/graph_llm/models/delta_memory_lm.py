@@ -190,12 +190,32 @@ class DeltaMemoryLM(nn.Module):
         # ``tandem_enabled=False`` (default) builds NOTHING here (no reasoner, no gate,
         # no buffer, no params, no RNG draws) -> the committed backbone is byte-for-byte
         # unchanged, so it is a clean one-flag A/B.
+        #
+        # WORKHORSE (card a7948491): with ``tandem_mlp_enabled=True`` a THIRD pathway — a
+        # plain per-token :class:`GatedMLP` on the same trunk input ``h_embed`` — is added
+        # and the gate is generalised 2-way sigmoid {mem, reason} -> 3-way softmax {mem(0),
+        # reason(1), mlp(2)}, fusing ``h = sum_e g_e * h_e``.  ``tandem_mlp_enabled=False``
+        # (default) keeps the SHIPPED 2-way sigmoid path byte-for-byte (no MLP, gate stays
+        # Linear(3*d_model)) so the committed recipe still reproduces exactly.
         self.causal_reasoner: CausalReasoner | None = None
         self.tandem_gate: nn.Linear | None = None
+        self.tandem_mlp: GatedMLP | None = None
         if getattr(m, "tandem_enabled", False):
             self.causal_reasoner = CausalReasoner(m)
-            gate_out = 1 if m.tandem_gate_scalar else m.d_model
-            self.tandem_gate = nn.Linear(3 * m.d_model, gate_out)
+            self._tandem_scalar = m.tandem_gate_scalar
+            if getattr(m, "tandem_mlp_enabled", False):
+                # 3-way: memory / reasoner / mlp-workhorse.  Gate reads all three pathway
+                # hiddens + the shared trunk context (4*d_model) and emits 3 expert logits
+                # (per-channel: 3*d_model viewed (.,d_model,3); scalar: 3).
+                self.tandem_mlp = GatedMLP(
+                    m.d_model, m.tandem_mlp_ff_mult * m.d_model, m.delta_dropout
+                )
+                gate_out = 3 if m.tandem_gate_scalar else 3 * m.d_model
+                self.tandem_gate = nn.Linear(4 * m.d_model, gate_out)
+            else:
+                # 2-way (shipped, verified): memory / reasoner sigmoid blend (UNCHANGED).
+                gate_out = 1 if m.tandem_gate_scalar else m.d_model
+                self.tandem_gate = nn.Linear(3 * m.d_model, gate_out)
             # Train-step counter (card 2dd3400f): drives the forced-mix warmup + the
             # locate-first seed commit.  Registered ONLY when the tandem is on, so the
             # OFF state_dict is unchanged.
@@ -276,11 +296,26 @@ class DeltaMemoryLM(nn.Module):
         # is off (self.causal_reasoner is None).
         if self.causal_reasoner is not None:
             self.causal_reasoner.reset_parameters()
-            # Memory-favoring gate bias (safe default): g = sigmoid(bias) ~= 0.05 at
-            # init -> the tandem starts ~= the committed memory backbone (the reasoner
-            # earns its weight).  Re-applied after the generic loop zeroed it.
             assert self.tandem_gate is not None
-            nn.init.constant_(self.tandem_gate.bias, m.tandem_gate_bias_init)
+            if self.tandem_mlp is not None:
+                # 3-way softmax gate (card a7948491).  Suppress the UNTRAINED reasoner
+                # logit at init (bias = tandem_gate_bias_init, e.g. -3 -> softmax mass
+                # ~0.03) and leave mem + mlp NEUTRAL (0) -> softmax([0, bias, 0]) starts
+                # the tandem ~= a mem/mlp blend with the reasoner earning its weight
+                # (the 3-way analogue of the 2-way memory-favoring init; keeps text8
+                # ON close to OFF).  Bias layout mirrors the forward reshape: per-channel
+                # bias (3*d_model,) -> (d_model, 3), scalar bias (3,); expert index 1 =
+                # reasoner.  Re-applied after the generic loop zeroed it.
+                bias = self.tandem_gate.bias
+                nn.init.zeros_(bias)
+                with torch.no_grad():
+                    bview = bias.view(3) if m.tandem_gate_scalar else bias.view(m.d_model, 3)
+                    bview[..., 1] = m.tandem_gate_bias_init
+            else:
+                # Memory-favoring gate bias (safe default): g = sigmoid(bias) ~= 0.05 at
+                # init -> the tandem starts ~= the committed memory backbone (the reasoner
+                # earns its weight).  Re-applied after the generic loop zeroed it.
+                nn.init.constant_(self.tandem_gate.bias, m.tandem_gate_bias_init)
 
     def _forward_blocks(
         self,
@@ -430,31 +465,75 @@ class DeltaMemoryLM(nn.Module):
                         aux_query_pos=aux_query_pos, tf_seed=tf_seed,
                     ),
                 )
-            # LIGHT gate over [h_mem ; h_reason ; h_ctx]; h_ctx = the shared embedding
-            # / front-end hidden (the routing signal).
-            gate_logit = self.tandem_gate(torch.cat([h_mem, h_reason, h_embed], dim=-1))
-            if gate_noise > 0.0 and self.training:
-                gate_logit = gate_logit + gate_noise * torch.randn_like(gate_logit)
-            g_soft = torch.sigmoid(gate_logit)
-            if gate_mix is not None:  # forced fusion (mix warmup, or per-row curriculum).
-                if isinstance(gate_mix, Tensor):
-                    # Per-row/per-position directed routing (curriculum): route each
-                    # example to its specialist.  Broadcast (B,) -> (B, 1, 1) over T + d.
-                    gm = gate_mix
-                    while gm.dim() < g_soft.dim():
-                        gm = gm.unsqueeze(-1)
-                    g = gm.to(g_soft.dtype).expand_as(g_soft)
+            if self.tandem_mlp is None:
+                # 2-way (shipped, verified, card 2dd3400f): sigmoid blend {mem, reason}.
+                # LIGHT gate over [h_mem ; h_reason ; h_ctx]; h_ctx = the shared embedding
+                # / front-end hidden (the routing signal).
+                gate_logit = self.tandem_gate(torch.cat([h_mem, h_reason, h_embed], dim=-1))
+                if gate_noise > 0.0 and self.training:
+                    gate_logit = gate_logit + gate_noise * torch.randn_like(gate_logit)
+                g_soft = torch.sigmoid(gate_logit)
+                if gate_mix is not None:  # forced fusion (mix warmup, or per-row curriculum).
+                    if isinstance(gate_mix, Tensor):
+                        # Per-row/per-position directed routing (curriculum): route each
+                        # example to its specialist.  Broadcast (B,) -> (B, 1, 1) over T + d.
+                        gm = gate_mix
+                        while gm.dim() < g_soft.dim():
+                            gm = gm.unsqueeze(-1)
+                        g = gm.to(g_soft.dtype).expand_as(g_soft)
+                    else:
+                        g = torch.full_like(g_soft, float(gate_mix))
+                elif self._tandem_hard_gate and self.training:
+                    # Straight-through hard gate: forward commits to 0/1 (answer depends on
+                    # the DOMINANT pathway), soft gradient in backward.
+                    g = (g_soft > 0.5).to(g_soft.dtype) + (g_soft - g_soft.detach())
                 else:
-                    g = torch.full_like(g_soft, float(gate_mix))
-            elif self._tandem_hard_gate and self.training:
-                # Straight-through hard gate: forward commits to 0/1 (answer depends on
-                # the DOMINANT pathway), soft gradient in backward.
-                g = (g_soft > 0.5).to(g_soft.dtype) + (g_soft - g_soft.detach())
+                    g = g_soft
+                h = g * h_reason + (1.0 - g) * h_mem
+                # Report/loss on the SOFT gate preference (1=reasoner, 0=memory).
+                gate = g_soft.mean(dim=-1)  # (B, T)
             else:
-                g = g_soft
-            h = g * h_reason + (1.0 - g) * h_mem
-            # Report/loss on the SOFT gate preference (1=reasoner, 0=memory).
-            gate = g_soft.mean(dim=-1)  # (B, T)
+                # 3-way WORKHORSE (card a7948491): softmax over {mem(0), reason(1), mlp(2)}
+                # with a plain per-token GatedMLP on the trunk input; fusion h = sum_e
+                # g_e * h_e.  h_mlp reads h_embed only (per-position) -> stays LM-leak-safe.
+                assert self.tandem_mlp is not None
+                h_mlp = self.tandem_mlp(h_embed)
+                gate_logit = self.tandem_gate(
+                    torch.cat([h_mem, h_reason, h_mlp, h_embed], dim=-1)
+                )
+                if gate_noise > 0.0 and self.training:
+                    gate_logit = gate_logit + gate_noise * torch.randn_like(gate_logit)
+                # Reshape to expose the expert axis (last dim): scalar gate -> (B,T,3);
+                # per-channel gate -> (B,T,d_model,3) (layout matches the bias init).
+                if self._tandem_scalar:
+                    logits3 = gate_logit
+                else:
+                    logits3 = gate_logit.view(*gate_logit.shape[:-1], self.d_model, 3)
+                g_soft = F.softmax(logits3, dim=-1)
+                if gate_mix is not None:
+                    if isinstance(gate_mix, Tensor):
+                        # Per-row expert INDEX in {0,1,2} -> one-hot route (curriculum /
+                        # dissociation probe): row i routes wholly to expert gate_mix[i].
+                        idx = gate_mix.long().view(-1)                # (B,)
+                        onehot = F.one_hot(idx, 3).to(g_soft.dtype)   # (B, 3)
+                        view = [onehot.shape[0]] + [1] * (g_soft.dim() - 2) + [3]
+                        g = onehot.view(view).expand_as(g_soft)
+                    else:
+                        # Forced UNIFORM mix (warmup): every expert 1/3 (all pathways train
+                        # equally regardless of the learned gate — the load-bearing rung).
+                        g = torch.full_like(g_soft, 1.0 / 3.0)
+                elif self._tandem_hard_gate and self.training:
+                    # Straight-through: forward one-hot(argmax expert), soft in backward.
+                    idx = g_soft.argmax(dim=-1, keepdim=True)
+                    hard = torch.zeros_like(g_soft).scatter_(-1, idx, 1.0)
+                    g = hard + (g_soft - g_soft.detach())
+                else:
+                    g = g_soft
+                paths = torch.stack([h_mem, h_reason, h_mlp], dim=-1)  # (B, T, d, 3)
+                gw = g if not self._tandem_scalar else g.unsqueeze(-2)  # -> broadcast over d
+                h = (paths * gw).sum(dim=-1)                            # (B, T, d)
+                # Report/loss on the SOFT per-expert weights (B, T, 3): [mem, reason, mlp].
+                gate = g_soft if self._tandem_scalar else g_soft.mean(dim=-2)
 
         h = self.norm_out(h)
         logits = self.lm_head(h)

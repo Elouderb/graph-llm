@@ -31,6 +31,7 @@ import argparse
 import json
 import random
 import time
+import warnings
 from dataclasses import asdict, dataclass, field
 
 import numpy as np
@@ -127,6 +128,92 @@ class TandemConfig:
     # back into the (documented, M-orphaning) flat forced-mix for the ablation.
     mlp_enabled: bool = False
     mlp_ff_mult: int = 4  # GatedMLP inner expansion for the workhorse pathway
+    # --- PROGRESSIVE R-depth curriculum (card cff8f5ee; recipe from card 0a98292b) ---
+    # The shipped fixed ``train_r_depths=(4,5,6)`` + ``k_train=8`` caps the reasoner at a
+    # TRAINED-WALK-BUDGET CLIFF at hop==k_train: within budget the per-hop walk is fine, but
+    # PAST it the weight-tied walk controller was never trained, so it drifts OOD and acc_R@16/32
+    # collapse to ~0.42/0.37 in the 3-way tandem (card a7948491 comment 195).  The verified cure
+    # (card 0a98292b): RAMP the training chain depth shallow-first then deepen
+    # (``r_depth_start`` -> ``r_depth_max``) while ``k_train`` covers the deepest chain, so the
+    # controller GROKS the deep walk (per-hop ~0.98 SUSTAINED, extrapolates 28->32).  A naive
+    # WIDE curriculum (jump straight to 2..32) instead COLLAPSES pre-transition — the ramp is
+    # LOAD-BEARING.  The grokking transition is stochastic per seed, so budget 5000-6000 steps and
+    # a GENTLER ramp (long ``r_depth_ramp_steps``) for margin.
+    #
+    # ``r_depth_ramp=False`` (default) -> ``depth = rng.choice(train_r_depths)`` EXACTLY as
+    # shipped (the disabled branch of ``_ramp_depth`` makes the identical ``rng.choice`` call, so
+    # the 2-way / non-ramp reproduction is byte-for-byte RNG-preserving).
+    r_depth_ramp: bool = False
+    r_depth_start: int = 4         # ramp floor (shallowest chain depth)
+    r_depth_max: int = 28          # ramp ceiling (deepest chain depth trained)
+    r_depth_ramp_steps: int = 3500  # linear ramp length (gentler = more margin over the
+    #                                 stochastic grokking transition — card 0a98292b note)
+    # Hold at ``r_depth_start`` for this many steps BEFORE ramping, so the M/R/P routing basin
+    # can COMMIT at shallow depth first (Option A: through the forced type-warmup AND the
+    # unsupervised commitment anneal) — else the deep-R answer-loss destabilises the still-fluid
+    # gate and P drifts onto the memory (the de-risk #1 routing crossing, card cff8f5ee).
+    # ``-1`` (default, SENTINEL) = AUTO: resolved by ``_resolve_ramp_delay`` to
+    # ``release + gate_commit_anneal`` (the point routing has committed) — so a raw
+    # ``TandemConfig(r_depth_ramp=True)`` is SAFE by default, not the broken delay-0 schedule.
+    # An explicit ``0`` ramps concurrently with the type-warmup (the Option-B ablation) and is
+    # WARNED; any explicit value shorter than the safe point is also warned.
+    r_depth_ramp_delay: int = -1
+
+
+def _ramp_depth(cfg: TandemConfig, step: int, rng: random.Random) -> int:
+    """Per-step training chain depth for the progressive R-depth curriculum (card cff8f5ee).
+
+    When ``cfg.r_depth_ramp`` is off, returns ``rng.choice(cfg.train_r_depths)`` — the shipped
+    uniform draw, with IDENTICAL RNG consumption so the non-ramp reproduction is byte-for-byte
+    unchanged.  When on, ramps the max chain depth ``r_depth_start`` -> ``r_depth_max`` linearly
+    over ``r_depth_ramp_steps`` (after an optional ``r_depth_ramp_delay`` hold), then samples a
+    depth uniformly from the WIDENING window ``[r_depth_start, cur_max]``.
+
+    The window WIDENS (it does not slide): every trained depth from the floor up to the current
+    max stays in the mix, so the weight-tied walk controller never FORGETS the shallow walks as
+    it deepens.  A sliding window collapses acc_R@4/6/16 (measured: the reasoner overfits the
+    deep end and inverts the depth profile).  This matches the standalone 0.976 recipe
+    (card 0a98292b: ``depth = randint(floor, cur_max)``).
+    """
+    if not cfg.r_depth_ramp:
+        return rng.choice(cfg.train_r_depths)
+    t = step - cfg.r_depth_ramp_delay
+    if t <= 0:
+        cur_max = cfg.r_depth_start
+    else:
+        frac = min(1.0, t / max(1, cfg.r_depth_ramp_steps))
+        span = cfg.r_depth_max - cfg.r_depth_start
+        cur_max = cfg.r_depth_start + int(round(frac * span))
+    return rng.randint(cfg.r_depth_start, cur_max)
+
+
+def _resolve_ramp_delay(cfg: TandemConfig) -> int:
+    """Resolve/validate the depth-ramp delay against the ROUTING-LOCKS-BEFORE-RAMP invariant.
+
+    The safe point is where the M/R/P routing basin has committed: the forced-routing release
+    (``type_warmup`` under the curriculum, else the model's ``gate_mix_warmup``) PLUS the
+    unsupervised commitment anneal.  Starting the depth ramp before that lets the deep-R
+    answer-loss destabilise the still-fluid gate and P drifts onto the memory (the de-risk #1
+    routing crossing, card cff8f5ee).
+
+    ``r_depth_ramp_delay < 0`` (the default SENTINEL) resolves to that safe point.  An explicit
+    delay shorter than it is honoured (e.g. the Option-B concurrent ablation) but WARNED, so the
+    footgun is never silent — including for a raw ``TandemConfig`` that never went through the CLI.
+    """
+    release = cfg.type_warmup if cfg.type_warmup > 0 else cfg.gate_mix_warmup
+    safe = release + cfg.gate_commit_anneal
+    if cfg.r_depth_ramp_delay < 0:
+        return safe
+    if cfg.r_depth_ramp_delay < safe:
+        warnings.warn(
+            f"r_depth_ramp_delay={cfg.r_depth_ramp_delay} starts the depth ramp before the "
+            f"routing basin commits (safe >= {safe} = release {release} + gate_commit_anneal "
+            f"{cfg.gate_commit_anneal}); the 3-way M/R/P routing may cross (P->memory) — the "
+            f"de-risk #1 failure (card cff8f5ee).  Use the auto default (r_depth_ramp_delay<0) "
+            f"unless intentionally running the concurrent Option-B ablation.",
+            stacklevel=2,
+        )
+    return cfg.r_depth_ramp_delay
 
 
 def build_tandem_model(cfg: TandemConfig, device: torch.device) -> torch.nn.Module:
@@ -303,6 +390,19 @@ def _answer_gather(t: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
 def _train_one(cfg: TandemConfig, seed: int, device: torch.device, verbose: bool) -> dict:
     torch.manual_seed(seed)
     np.random.seed(seed)
+    # Progressive-ramp invariants (enforced at the RUNTIME path so they hold for EVERY entry
+    # point, not just the CLI — card cff8f5ee review):
+    # (1) the walk budget must cover the deepest trained chain so its walk_traj reaches the root
+    #     (else the per-hop walk-aux never sees the answer clause) — card 0a98292b.
+    # (2) routing must lock before the ramp (_resolve_ramp_delay): a raw TandemConfig gets the
+    #     safe auto delay rather than the silent, known-broken delay-0 schedule.
+    if cfg.r_depth_ramp:
+        if cfg.k_train < cfg.r_depth_max:
+            raise ValueError(
+                f"r_depth_ramp requires k_train ({cfg.k_train}) >= r_depth_max "
+                f"({cfg.r_depth_max}) so the walk trajectory reaches the deepest chain's root."
+            )
+        cfg.r_depth_ramp_delay = _resolve_ramp_delay(cfg)
     model = build_tandem_model(cfg, device)
     params = model.num_parameters()
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
@@ -323,7 +423,7 @@ def _train_one(cfg: TandemConfig, seed: int, device: torch.device, verbose: bool
     t0 = time.time()
     for step in range(cfg.train_steps):
         kinds = [rng.choice(stream_kinds) for _ in range(cfg.batch_size)]
-        depth = rng.choice(cfg.train_r_depths)
+        depth = _ramp_depth(cfg, step, rng)
         nb = make_stream_batch(rng, kinds, depth, cfg, text8_tr, np_tr)
         d = _to_dev(nb, device)
         states = _build_state(model, d["seg"], d["answer_seg"])
@@ -348,6 +448,11 @@ def _train_one(cfg: TandemConfig, seed: int, device: torch.device, verbose: bool
         out = model.tandem_step(
             d["seg"][:, d["answer_seg"]], None, states, return_states=False,
             aux_query_pos=pred_pos, tf_seed=tf, steps=cfg.k_train, force_gate=force,
+            # FAST PATH (card cff8f5ee): run the reasoner only at the answer position (the
+            # trainer reads every loss/aux there) -> O(K*L) not O(K*L^2), so the deep k_train
+            # walk trains at the routing-stable batch instead of OOMing.  Loss/grad-identical
+            # to the full path (query_forward is numerically pinned to it).
+            reasoner_query_only=True,
         )
         gstep = out["step"]
         ans_logits = _answer_gather(out["logits"], pred_pos)
@@ -398,6 +503,7 @@ def _train_one(cfg: TandemConfig, seed: int, device: torch.device, verbose: bool
         sched.step()
         if verbose and (step % cfg.log_every == 0 or step == cfg.train_steps - 1):
             mixflag = "MIX" if out["gate_mix"] is not None else "   "
+            mixflag = f"{mixflag} d{depth:>2d}" if cfg.r_depth_ramp else mixflag
             with torch.no_grad():
                 if cfg.mlp_enabled:
                     # Per-type mass on the TARGET expert (want each near 1): M->mem(0),
@@ -670,33 +776,15 @@ class _Args:
     seeds: tuple[int, ...] = field(default_factory=lambda: (0, 1, 2))
 
 
-def main() -> None:
-    import sys
+def _build_run_config(argv: list[str] | None = None) -> tuple[TandemConfig, tuple[int, ...], str]:
+    """Parse the (non-merge) CLI args into ``(TandemConfig, seeds, out_path)``.
 
-    if len(sys.argv) > 1 and sys.argv[1] == "merge":
-        ap = argparse.ArgumentParser()
-        ap.add_argument("merge")
-        ap.add_argument("shards", nargs="+")
-        ap.add_argument("--out", default="")
-        args = ap.parse_args()
-        merged_seeds: list[dict] = []
-        cfg_dict: dict = {}
-        for p in args.shards:
-            sh = json.load(open(p))
-            cfg_dict = sh.get("config", cfg_dict)
-            merged_seeds.extend(sh.get("seeds", sh.get("seed_results", [])))
-        # report() only needs the depth grids; reconstruct those (typed) and default rest.
-        cfg = TandemConfig(
-            train_r_depths=tuple(int(x) for x in cfg_dict.get("train_r_depths", (4, 5, 6))),
-            test_r_depths=tuple(int(x) for x in cfg_dict.get("test_r_depths", (4, 6, 16, 32))),
-            mlp_enabled=bool(cfg_dict.get("mlp_enabled", False)),
-        )
-        out = report(merged_seeds, cfg)
-        if args.out:
-            json.dump(out, open(args.out, "w"), indent=2, default=str)
-            print(f"wrote {args.out}")
-        return
-
+    Split out of ``main`` so the derived-defaults logic — the --mlp / --r-ramp recipe
+    resolution — is UNIT-TESTABLE without launching training (card cff8f5ee review).
+    ``argv=None`` reads ``sys.argv``.  The ramp delay is left as the sentinel (or the explicit
+    ``--ramp-delay``); it is resolved to the safe lock-before-ramp value at runtime in
+    ``_train_one`` (single source of truth for every entry point).
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--seeds", default="0,1,2")
@@ -714,10 +802,28 @@ def main() -> None:
                     help="3-way: use the FLAT forced-mix instead of the curriculum (documented "
                          "M-orphaning ablation — the memory grabs plain, M fails; --mlp default "
                          "is the curriculum)")
-    args = ap.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device={device}" + (f" {torch.cuda.get_device_name(0)}" if device.type == "cuda" else ""), flush=True)
+    ap.add_argument("--r-ramp", dest="r_ramp", action="store_true",
+                    help="progressive R-depth curriculum (card cff8f5ee): ramp the train chain "
+                         "depth r_depth_start->r_depth_max so the reasoner GROKS the deep walk "
+                         "(lifts acc_R@32 ~0.37->~0.9+).  Defaults k_train=30 + steps=5500 + "
+                         "train_r_depths=(start,max).  Default OFF = the shipped fixed depths.")
+    ap.add_argument("--k-train", dest="k_train", type=int, default=None,
+                    help="reasoner walk budget K per position (must be >= max train depth)")
+    ap.add_argument("--ramp-delay", dest="ramp_delay", type=int, default=None,
+                    help="hold shallow for N steps before the depth ramp.  Default (omitted) = "
+                         "AUTO = type_warmup + gate_commit_anneal (deepen AFTER routing commits = "
+                         "Option A); 0 = ramp from step 0 = Option B ablation (warned).")
+    ap.add_argument("--ramp-steps", dest="ramp_steps", type=int, default=None,
+                    help="depth-ramp length in steps (gentler = more margin over the grok transition)")
+    ap.add_argument("--r-depth-max", dest="r_depth_max", type=int, default=None,
+                    help="ramp ceiling (deepest chain depth trained; default 28)")
+    ap.add_argument("--type-warmup", dest="type_warmup", type=int, default=None,
+                    help="forced per-type routing warmup steps (M->mem/R->reason/P->mlp).  Longer "
+                         "FIRMS the routing basin before the depth ramp (the memory is kept off "
+                         "plain text longer, so it cannot out-capture the MLP on P) — the "
+                         "robustness knob for the 3-way routing seed-fragility.  Default under "
+                         "--mlp = gate_mix_warmup (600).")
+    args = ap.parse_args(argv)
     seeds = tuple(int(s) for s in args.seeds.split(",") if s.strip())
 
     if args.smoke:
@@ -748,16 +854,100 @@ def main() -> None:
         # for --mlp unless --flat-mix opts into the documented failing ablation.
         if not args.flat_mix and cfg.type_warmup == 0:
             cfg.type_warmup = cfg.gate_mix_warmup
+    # Explicit type-warmup override (robustness knob) — must precede the --r-ramp block so the
+    # ramp-delay default (type_warmup + commit_anneal) picks up the overridden value.
+    if args.type_warmup is not None:
+        cfg.type_warmup = args.type_warmup
+    # PROGRESSIVE R-depth curriculum (card cff8f5ee).  Must run AFTER the --mlp block so the
+    # ramp-delay default can read the type_warmup it sets.
+    if args.r_depth_max is not None:
+        cfg.r_depth_max = args.r_depth_max
+    if args.r_ramp:
+        cfg.r_depth_ramp = True
+        # VERIFIED RECIPE (card cff8f5ee).  Acc is 3-seed robust: acc_M 1.000, acc_R
+        # 0.997/0.999/0.992/0.940+/-0.026@D32 (every seed clears in-dist>=0.95 + D32>=0.85; vs
+        # the pre-card shipped D32 ~0.37).  ROUTING is the seed-fragile axis: at type_warmup
+        # 600 it is 2/3 (one seed lets P drift onto the memory during the ramp), so the robust
+        # default is type_warmup 1200 — it FIRMS the P->mlp basin BEFORE the ramp (the memory
+        # is kept off plain text long enough that it cannot out-capture the per-token MLP on
+        # P), verified to flip the failing seed to a full PASS (route M/P -> 1.0, D32 0.969).
+        # --steps/--k-train/--batch/--type-warmup/--ramp-* still override.  The query_forward
+        # fast path (reasoner_query_only, wired into tandem_step) makes it cheap (~1.5GB/seed).
+        if args.type_warmup is None and cfg.mlp_enabled:
+            cfg.type_warmup = max(cfg.type_warmup, 1200)
+        if args.steps is None:
+            cfg.train_steps = 8500
+        if args.k_train is None and cfg.k_train < cfg.r_depth_max + 2:
+            cfg.k_train = 30
+        # Batch 40 = card a7948491's proven routing-STABLE batch (the 3-way M/P routing is
+        # batch-sensitive: at batch 24 the permutation-invariant gate lets P drift onto the
+        # memory and orphan M — measured; batch 40 holds).  The fast path removes the VRAM
+        # cost that previously forced a smaller batch.
+        if args.batch is None:
+            cfg.batch_size = 40
+        # Train depths now span start..max: report()/eval read train_r_depths[0]=start (the
+        # shallow M/P/dissociation depth) and max()=r_depth_max (the in-dist boundary).
+        cfg.train_r_depths = (cfg.r_depth_start, cfg.r_depth_max)
+        # NOTE: the ramp DELAY (routing-locks-before-ramp: deepen only after the M/R/P basin has
+        # committed) is left as the SENTINEL here and resolved at runtime in _train_one via
+        # _resolve_ramp_delay — so the invariant holds for EVERY entry point, not just this CLI.
+    if args.ramp_delay is not None:
+        cfg.r_depth_ramp_delay = args.ramp_delay
+    if args.ramp_steps is not None:
+        cfg.r_depth_ramp_steps = args.ramp_steps
+    if args.k_train is not None:
+        cfg.k_train = args.k_train
+    return cfg, seeds, args.out
+
+
+def main() -> None:
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "merge":
+        ap = argparse.ArgumentParser()
+        ap.add_argument("merge")
+        ap.add_argument("shards", nargs="+")
+        ap.add_argument("--out", default="")
+        args = ap.parse_args()
+        merged_seeds: list[dict] = []
+        cfg_dict: dict = {}
+        for p in args.shards:
+            sh = json.load(open(p))
+            cfg_dict = sh.get("config", cfg_dict)
+            merged_seeds.extend(sh.get("seeds", sh.get("seed_results", [])))
+        # report() only needs the depth grids; reconstruct those (typed) and default the rest.
+        # (Consequence: a MERGE output's "config" block carries DEFAULT k_train/type_warmup —
+        # cite the per-seed run JSONs, not the merge output, for the recipe.)
+        cfg = TandemConfig(
+            train_r_depths=tuple(int(x) for x in cfg_dict.get("train_r_depths", (4, 5, 6))),
+            test_r_depths=tuple(int(x) for x in cfg_dict.get("test_r_depths", (4, 6, 16, 32))),
+            mlp_enabled=bool(cfg_dict.get("mlp_enabled", False)),
+        )
+        out = report(merged_seeds, cfg)
+        if args.out:
+            json.dump(out, open(args.out, "w"), indent=2, default=str)
+            print(f"wrote {args.out}")
+        return
+
+    cfg, seeds, out = _build_run_config()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device={device}"
+          + (f" {torch.cuda.get_device_name(0)}" if device.type == "cuda" else ""), flush=True)
     print(f"    delta_layers={cfg.delta_layers} tie_embeddings={cfg.tie_embeddings} "
           f"mlp_enabled={cfg.mlp_enabled} type_warmup={cfg.type_warmup}", flush=True)
+    if cfg.r_depth_ramp:
+        delay_str = str(cfg.r_depth_ramp_delay) if cfg.r_depth_ramp_delay >= 0 else "auto"
+        print(f"    r_depth_ramp: widening [{cfg.r_depth_start}, cur_max] with cur_max "
+              f"{cfg.r_depth_start}->{cfg.r_depth_max} over {cfg.r_depth_ramp_steps} steps "
+              f"(delay {delay_str}), k_train={cfg.k_train}, steps={cfg.train_steps}", flush=True)
 
     seed_results: list[dict] = []
     for seed in seeds:
         seed_results.append(_train_one(cfg, seed, device, verbose=True))
-        if args.out:  # write incrementally so a killed run resumes from disk
-            json.dump({"config": asdict(cfg), "seeds": seed_results}, open(args.out, "w"),
+        if out:  # write incrementally so a killed run resumes from disk
+            json.dump({"config": asdict(cfg), "seeds": seed_results}, open(out, "w"),
                       indent=2, default=str)
-            print(f"  wrote {args.out} ({len(seed_results)} seeds)", flush=True)
+            print(f"  wrote {out} ({len(seed_results)} seeds)", flush=True)
 
     report(seed_results, cfg)
     print("done", flush=True)

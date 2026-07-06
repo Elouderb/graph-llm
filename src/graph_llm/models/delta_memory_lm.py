@@ -398,6 +398,7 @@ class DeltaMemoryLM(nn.Module):
         commit_seed: bool = True,
         steps: int | None = None,
         memory_only: bool = False,
+        reasoner_query_only: bool = False,
     ) -> tuple[Tensor, Tensor, list[DeltaMemoryState] | None, Tensor | None, dict | None]:
         """Shared forward body for the public ``forward`` + the tandem trainer.
 
@@ -449,7 +450,43 @@ class DeltaMemoryLM(nn.Module):
             # REASONER pathway: per-position, segment-bounded causal walk over the raw
             # tokens (card e4e8a4dc).  Sub-quadratic by construction (bounded window).
             assert self.tandem_gate is not None
-            if collect_aux:
+            if reasoner_query_only and aux_query_pos is None:
+                # Contract: the fast path needs the single query position; do not silently fall
+                # back to the full O(K*L^2) walk (that would hide a caller bug — card cff8f5ee).
+                raise ValueError(
+                    "reasoner_query_only=True requires a per-row aux_query_pos (the single "
+                    "query position to run the reasoner walk at)."
+                )
+            if reasoner_query_only:
+                assert aux_query_pos is not None  # guaranteed by the guard above
+                # FAST PATH (card cff8f5ee): run the reasoner ONLY at the query position via
+                # the O(K*L) ``query_forward`` (numerically PINNED to the full per-position
+                # walk gathered at ``query_pos`` — see the query_forward faithfulness tests),
+                # then scatter it into a zero ``(B, T, d)``.  The tandem trainer reads every
+                # loss + aux ONLY at the query position (answer-CE + locate-CE + walk-aux +
+                # gate), so this is loss/grad-IDENTICAL to the full path while cutting the
+                # RETAINED walk activations O(K*L^2) -> O(K*L) — deep-K training then fits the
+                # routing-stable batch.  ``h_reason`` is 0 at the other positions (never read);
+                # the returned logits/gate are valid ONLY at ``aux_query_pos`` in this mode.
+                if collect_aux:
+                    h_q, aux = cast(
+                        "tuple[Tensor, dict]",
+                        self.causal_reasoner.query_forward(
+                            x, query_pos=aux_query_pos, steps=steps, commit_seed=commit_seed,
+                            return_aux=True, tf_seed=tf_seed,
+                        ),
+                    )
+                else:
+                    h_q = cast(
+                        Tensor,
+                        self.causal_reasoner.query_forward(
+                            x, query_pos=aux_query_pos, steps=steps, commit_seed=commit_seed,
+                            tf_seed=tf_seed,
+                        ),
+                    )
+                h_reason = h_mem.new_zeros(h_mem.shape)
+                h_reason[torch.arange(x.shape[0], device=x.device), aux_query_pos] = h_q
+            elif collect_aux:
                 h_reason, aux = cast(
                     "tuple[Tensor, dict]",
                     self.causal_reasoner(
@@ -631,6 +668,7 @@ class DeltaMemoryLM(nn.Module):
         steps: int | None = None,
         collect_aux: bool = True,
         force_gate: float | Tensor | None = None,
+        reasoner_query_only: bool = False,
     ) -> dict:
         """Tandem training/eval forward exposing the gate + reasoner aux.
 
@@ -645,6 +683,15 @@ class DeltaMemoryLM(nn.Module):
         ``None`` when the tandem is off), ``aux`` (``{"seed_logits", "walk_w"}``
         gathered at ``aux_query_pos``), ``states_out``, and the current ``step`` /
         ``gate_mix``.
+
+        ``reasoner_query_only`` (card cff8f5ee): when True (requires a per-row
+        ``aux_query_pos``), run the reasoner ONLY at that query position via the
+        O(K*L) ``query_forward`` fast path instead of the full O(K*L^2) per-position
+        walk.  Loss/grad-identical to the full path for the tandem trainer (which
+        reads every signal at the query position) but cheap enough to train the deep
+        walk at the routing-stable batch; the returned ``logits``/``gate`` are then
+        valid ONLY at ``aux_query_pos``.  Default False = the full per-position walk
+        (byte-for-byte the shipped path).
         """
         if self.causal_reasoner is None:
             raise RuntimeError("tandem_step requires tandem_enabled=True.")
@@ -661,7 +708,7 @@ class DeltaMemoryLM(nn.Module):
             x, targets, states_in, return_states,
             gate_mix=gate_mix, gate_noise=gate_noise, collect_aux=collect_aux,
             aux_query_pos=aux_query_pos, tf_seed=tf_seed, commit_seed=commit_seed,
-            steps=steps,
+            steps=steps, reasoner_query_only=reasoner_query_only,
         )
         if self.training:
             self._tandem_step += 1

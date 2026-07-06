@@ -36,6 +36,13 @@ import graph_llm.models  # noqa: F401 — registers "delta_memory_lm" (+ baselin
 from graph_llm.config import Config, DataConfig, ModelConfig, TrainConfig
 from graph_llm.models import build_model
 from graph_llm.models.components.causal_reasoner import CausalReasoner
+from graph_llm.train.tandem import (
+    TandemConfig,
+    _build_run_config,
+    _ramp_depth,
+    _resolve_ramp_delay,
+    _train_one,
+)
 
 
 def _mem_cfg(**overrides: Any) -> ModelConfig:
@@ -746,3 +753,252 @@ def test_reasoner_addressing_is_segment_bounded() -> None:
         f"reasoner at position 40 depended on token 5 in an EARLIER window "
         f"(Δ={diff_at_40:.2e}) — not segment-bounded."
     )
+
+
+# ---------------------------------------------------------------------------
+# query_forward fast path wired into tandem_step (card cff8f5ee)
+# ---------------------------------------------------------------------------
+# The tandem trainer reads every loss + aux at the single answer position, so running the
+# reasoner ONLY there (query_forward, O(K*L)) is loss/grad-identical to the full O(K*L^2)
+# per-position walk but cheap enough to train the deep k_train walk at the routing-stable
+# batch.  Default OFF => the shipped full-path forward is byte-for-byte unchanged.
+
+
+def test_tandem_step_reasoner_query_only_matches_full_path() -> None:
+    """``tandem_step(reasoner_query_only=True)`` is numerically IDENTICAL to the full
+    per-position walk AT the query position — logits, gate, AND aux (seed_logits, walk_w) —
+    through the full 3-way gate fusion.  This is the correctness guarantee that lets the
+    trainer use the O(K*L) fast path for deep-K training loss/grad-identically."""
+    torch.manual_seed(0)
+    model = build_model(_full_cfg(_on3_cfg(reasoning_segment_len=32, causal_reasoner_steps=6)))
+    model.eval()  # deterministic: no gate noise / forced-mix / hard-gate / dropout
+    b, t = 3, 32
+    x = torch.randint(1, 256, (b, t))
+    qpos = torch.tensor([5, 17, 28])
+    tf = torch.tensor([2, 9, 20])
+    common: dict[str, Any] = {"aux_query_pos": qpos, "tf_seed": tf, "steps": 6, "collect_aux": True}
+    full = model.tandem_step(x, **common, reasoner_query_only=False)
+    fast = model.tandem_step(x, **common, reasoner_query_only=True)
+    rows = torch.arange(b)
+    assert torch.allclose(full["logits"][rows, qpos], fast["logits"][rows, qpos], atol=1e-5)
+    assert torch.allclose(full["gate"][rows, qpos], fast["gate"][rows, qpos], atol=1e-5)
+    assert torch.allclose(full["aux"]["seed_logits"], fast["aux"]["seed_logits"], atol=1e-5)
+    assert torch.allclose(full["aux"]["walk_w"], fast["aux"]["walk_w"], atol=1e-5)
+
+
+def test_tandem_step_reasoner_query_only_is_leak_free() -> None:
+    """The fast-path answer at the query position depends only on tokens <= query_pos:
+    perturbing a token AFTER the query position leaves the query-position logits unchanged
+    (query_forward uses the same causal address window as the full path)."""
+    torch.manual_seed(1)
+    model = build_model(_full_cfg(_on3_cfg(reasoning_segment_len=32, causal_reasoner_steps=5)))
+    model.eval()
+    b, t = 2, 32
+    x = torch.randint(1, 256, (b, t))
+    qpos = torch.tensor([10, 15])
+    with torch.no_grad():
+        base = model.tandem_step(x, aux_query_pos=qpos, steps=5, collect_aux=False,
+                                 reasoner_query_only=True)
+        xp = x.clone()
+        xp[:, 20] = (x[:, 20] + 7) % 256  # perturb a token AFTER both query positions
+        pert = model.tandem_step(xp, aux_query_pos=qpos, steps=5, collect_aux=False,
+                                 reasoner_query_only=True)
+    rows = torch.arange(b)
+    diff = (base["logits"][rows, qpos] - pert["logits"][rows, qpos]).abs().max().item()
+    assert diff < 1e-6, f"fast-path query-position logits leaked from a future token (Δ={diff:.2e})"
+
+
+def test_tandem_step_reasoner_query_only_requires_query_pos() -> None:
+    """reasoner_query_only=True with aux_query_pos=None RAISES (does not silently fall back to
+    the full O(K*L^2) walk) — the documented fast-path contract (card cff8f5ee review)."""
+    torch.manual_seed(0)
+    model = build_model(_full_cfg(_on3_cfg(reasoning_segment_len=16, causal_reasoner_steps=4)))
+    model.eval()
+    x = torch.randint(1, 256, (2, 16))
+    with pytest.raises(ValueError, match="aux_query_pos"):
+        model.tandem_step(x, aux_query_pos=None, reasoner_query_only=True)
+
+
+# ---------------------------------------------------------------------------
+# Progressive R-depth curriculum (card cff8f5ee) — the per-step depth-ramp hook
+# ---------------------------------------------------------------------------
+# The ramp deepens the reasoner's TRAINING chain depth (r_depth_start -> r_depth_max)
+# so the weight-tied walk controller groks the deep walk (lifts acc_R@32 off the
+# trained-walk-budget cliff — card 0a98292b).  It is additive + default-OFF; the OFF
+# branch must consume the RNG IDENTICALLY to the shipped rng.choice(train_r_depths).
+
+
+def test_r_depth_ramp_defaults_off() -> None:
+    """The progressive ramp is OFF by default -> the shipped fixed train_r_depths."""
+    cfg = TandemConfig()
+    assert cfg.r_depth_ramp is False
+    assert cfg.train_r_depths == (4, 5, 6)
+
+
+def test_r_depth_ramp_off_is_rng_preserving() -> None:
+    """Ramp OFF: ``_ramp_depth`` draws IDENTICALLY to the shipped
+    ``rng.choice(train_r_depths)`` — same depth sequence AND same downstream RNG state,
+    so the 2-way / non-ramp reproduction is byte-for-byte unchanged."""
+    import random
+
+    cfg = TandemConfig()  # r_depth_ramp=False
+    r1, r2 = random.Random(123), random.Random(123)
+    ramp_draws = [_ramp_depth(cfg, s, r1) for s in range(200)]
+    choice_draws = [r2.choice(cfg.train_r_depths) for _ in range(200)]
+    assert ramp_draws == choice_draws
+    assert r1.getstate() == r2.getstate()  # no extra RNG consumed
+
+
+def test_r_depth_ramp_schedule_and_bounds() -> None:
+    """Ramp ON: hold at the floor during the delay; a WIDENING window ``[start, cur_max]``
+    (never below the floor, never above ``r_depth_max``); the max reaches ``r_depth_max``
+    after ``delay + ramp_steps``; shallow depths stay in the mix throughout (anti-forget)."""
+    import random
+
+    cfg = TandemConfig(
+        r_depth_ramp=True, r_depth_start=4, r_depth_max=28,
+        r_depth_ramp_steps=3500, r_depth_ramp_delay=1500,
+    )
+    rng = random.Random(0)
+    # Delay hold: exactly the floor.
+    assert all(_ramp_depth(cfg, s, rng) == 4 for s in range(1500) for _ in range(30))
+    # Global bounds over the whole run.
+    alld = [_ramp_depth(cfg, s, rng) for s in range(7000) for _ in range(3)]
+    assert min(alld) == cfg.r_depth_start and max(alld) == cfg.r_depth_max
+    # After delay + ramp_steps the max reaches the ceiling, but the WIDENING window still
+    # samples the floor (shallow walks stay in the mix — no forgetting).
+    late = [_ramp_depth(cfg, s, rng) for s in range(1500 + 3500, 7000) for _ in range(50)]
+    assert max(late) == cfg.r_depth_max and min(late) == cfg.r_depth_start
+    # The per-step max is monotone non-decreasing as the ramp climbs.
+    maxes = [max(_ramp_depth(cfg, s, rng) for _ in range(300)) for s in range(1500, 5000, 350)]
+    assert all(b >= a for a, b in zip(maxes, maxes[1:]))
+
+
+def test_r_depth_ramp_option_b_starts_at_step_zero() -> None:
+    """Option B (delay 0) ramps from step 0 (still the floor at step 0); by the end the
+    widening window spans the full ``[start, max]`` range."""
+    import random
+
+    cfg = TandemConfig(r_depth_ramp=True, r_depth_ramp_delay=0, r_depth_ramp_steps=100)
+    assert _ramp_depth(cfg, 0, random.Random(1)) == cfg.r_depth_start
+    rng = random.Random(1)
+    late = [_ramp_depth(cfg, s, rng) for s in range(100, 400) for _ in range(30)]
+    assert max(late) == cfg.r_depth_max and min(late) == cfg.r_depth_start
+
+
+@pytest.mark.parametrize("delay", [0, 3])
+def test_r_depth_ramp_trains_end_to_end_2way(delay: int) -> None:
+    """The ramp integrates into the real training loop end-to-end (2-way M+R — no text8
+    dependency): a tiny ramped run trains + evals without error and returns per-depth
+    accuracies.  Exercises ``_ramp_depth`` inside ``_train_one`` + ``make_stream_batch``
+    at ramped depth (both Option A ``delay>0`` and Option B ``delay=0``)."""
+    cfg = TandemConfig(
+        r_depth_ramp=True, r_depth_start=2, r_depth_max=6, r_depth_ramp_steps=6,
+        r_depth_ramp_delay=delay, train_r_depths=(2, 6),
+        k_train=8, train_steps=12, batch_size=8, seg_len=128, d_model=32,
+        delta_n_heads=2, delta_head_dim=16, eval_batches=1, eval_batch=8,
+        test_r_depths=(2, 6), locate_warmup=4, gate_mix_warmup=4, type_warmup=4,
+        gate_commit_anneal=4, lr_warmup=2, log_every=100,
+    )
+    import warnings
+
+    with warnings.catch_warnings():
+        # These tiny delays (0/3) are below the safe lock point and intentionally warn (that
+        # contract has its own test); here we only exercise the ramp mechanics end-to-end.
+        warnings.simplefilter("ignore")
+        out = _train_one(cfg, seed=0, device=torch.device("cpu"), verbose=False)
+    assert "acc_R" in out and set(out["acc_R"]) == {"2", "6"}
+    assert 0.0 <= out["acc_M"] <= 1.0
+    assert all(0.0 <= v <= 1.0 for v in out["acc_R"].values())
+
+
+def test_r_depth_ramp_requires_k_train_covers_max_depth() -> None:
+    """The ramp requires ``k_train >= r_depth_max`` (the walk must reach the deepest
+    chain's root, else the per-hop walk-aux never sees the answer clause) — a too-small
+    walk budget raises a clear error rather than silently training a broken walk."""
+    cfg = TandemConfig(r_depth_ramp=True, r_depth_max=28, k_train=8)
+    with pytest.raises(ValueError, match="k_train"):
+        _train_one(cfg, seed=0, device=torch.device("cpu"), verbose=False)
+
+
+# --- routing-locks-before-ramp invariant (card cff8f5ee review MAJOR) -------------------
+# The invariant must hold at the RUNTIME path, not just the CLI: a raw TandemConfig must NOT
+# silently use the known-broken concurrent (delay-0) schedule.
+
+
+def test_r_depth_ramp_delay_default_is_sentinel_and_resolves_safe() -> None:
+    """A raw TandemConfig(r_depth_ramp=True) defaults to the SENTINEL (-1), which resolves to
+    the safe lock-before-ramp point (release + gate_commit_anneal) — NOT the broken delay 0."""
+    cfg = TandemConfig(r_depth_ramp=True, mlp_enabled=True, type_warmup=1200, gate_commit_anneal=900)
+    assert cfg.r_depth_ramp_delay == -1  # sentinel default
+    assert _resolve_ramp_delay(cfg) == 1200 + 900  # 2100
+    # type_warmup=0 (flat-mix / 2-way) falls back to the model's gate_mix_warmup as the release.
+    cfg2 = TandemConfig(r_depth_ramp=True, type_warmup=0, gate_mix_warmup=600, gate_commit_anneal=900)
+    assert _resolve_ramp_delay(cfg2) == 600 + 900
+
+
+def test_resolve_ramp_delay_explicit_safe_does_not_warn() -> None:
+    """An explicit delay at/above the safe point is honoured with no warning."""
+    import warnings
+
+    cfg = TandemConfig(r_depth_ramp=True, type_warmup=600, gate_commit_anneal=900,
+                       r_depth_ramp_delay=2000)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any warning becomes a test failure
+        assert _resolve_ramp_delay(cfg) == 2000
+
+
+def test_resolve_ramp_delay_too_short_warns_but_honours() -> None:
+    """An explicit delay shorter than the safe lock point WARNS (footgun never silent) yet is
+    honoured — e.g. the documented Option-B concurrent ablation (delay 0)."""
+    cfg = TandemConfig(r_depth_ramp=True, type_warmup=600, gate_commit_anneal=900,
+                       r_depth_ramp_delay=0)
+    with pytest.warns(UserWarning, match="routing basin commits"):
+        assert _resolve_ramp_delay(cfg) == 0
+
+
+def test_train_one_resolves_sentinel_delay_before_ramp() -> None:
+    """_train_one resolves the sentinel to the safe delay for EVERY entry point (a raw config
+    that never touched the CLI): a tiny ramped run with delay=-1 records the resolved delay."""
+    cfg = TandemConfig(
+        r_depth_ramp=True, r_depth_start=2, r_depth_max=6, r_depth_ramp_steps=4,
+        r_depth_ramp_delay=-1, train_r_depths=(2, 6), k_train=8, train_steps=12, batch_size=8,
+        seg_len=128, d_model=32, delta_n_heads=2, delta_head_dim=16, eval_batches=1, eval_batch=8,
+        test_r_depths=(2, 6), locate_warmup=4, gate_mix_warmup=4, type_warmup=4,
+        gate_commit_anneal=4, lr_warmup=2, log_every=100,
+    )
+    _train_one(cfg, seed=0, device=torch.device("cpu"), verbose=False)
+    assert cfg.r_depth_ramp_delay == 4 + 4  # release(type_warmup=4) + gate_commit_anneal(4)
+
+
+# --- CLI derived-defaults are unit-testable via _build_run_config (review MAJOR part b) ---
+
+
+def test_cli_mlp_rramp_derives_robust_recipe() -> None:
+    """--mlp --r-ramp derives the shipped robust recipe (the CLI derived-defaults logic)."""
+    cfg, seeds, out = _build_run_config(["--mlp", "--r-ramp", "--seeds", "0,1,2", "--out", "x.json"])
+    assert cfg.mlp_enabled is True and cfg.r_depth_ramp is True
+    assert cfg.type_warmup == 1200
+    assert cfg.k_train == 30
+    assert cfg.batch_size == 40
+    assert cfg.train_steps == 8500
+    assert cfg.train_r_depths == (4, 28)
+    assert cfg.r_depth_ramp_delay == -1  # sentinel -> resolved to 2100 at runtime
+    assert _resolve_ramp_delay(cfg) == 2100
+    assert seeds == (0, 1, 2) and out == "x.json"
+
+
+def test_cli_overrides_type_warmup_and_ramp_delay() -> None:
+    """Explicit --type-warmup / --ramp-delay override the derived defaults."""
+    cfg, _, _ = _build_run_config(
+        ["--mlp", "--r-ramp", "--type-warmup", "800", "--ramp-delay", "1500"]
+    )
+    assert cfg.type_warmup == 800
+    assert cfg.r_depth_ramp_delay == 1500  # explicit, not the sentinel
+
+
+def test_cli_no_ramp_leaves_shipped_defaults() -> None:
+    """Without --r-ramp / --mlp the shipped 2-way defaults are unchanged (additive flags)."""
+    cfg, _, _ = _build_run_config([])
+    assert cfg.r_depth_ramp is False and cfg.mlp_enabled is False
+    assert cfg.train_r_depths == (4, 5, 6) and cfg.k_train == 8

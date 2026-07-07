@@ -6,9 +6,10 @@ The smoke path (source="synthetic") is fully offline and deterministic.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 import torch

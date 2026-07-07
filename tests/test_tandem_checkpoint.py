@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -24,11 +25,11 @@ from graph_llm.train.checkpoint import load_training_checkpoint
 from graph_llm.train.tandem import TandemConfig, _train_one
 
 
-def _tiny_cfg(**overrides) -> TandemConfig:
+def _tiny_cfg(**overrides: Any) -> TandemConfig:
     """A tiny CPU-fast TandemConfig exercising the 2-way M+R curriculum (type_warmup +
     gate_mix_warmup/commit_anneal + gate noise, so the resume test actually exercises
     torch's global RNG + the python `rng` stream + the model's own step buffer)."""
-    base = dict(
+    base: dict[str, Any] = dict(
         train_r_depths=(4,),
         test_r_depths=(4,),
         k_train=4,

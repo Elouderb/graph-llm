@@ -9,10 +9,14 @@ the card (see card 69776c3e comments), not exercised here.
 from __future__ import annotations
 
 import io
+import sys
 import zipfile
+from pathlib import Path
 
 import numpy as np
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from graph_llm.config import DataConfig
 from graph_llm.data.loader import (

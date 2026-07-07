@@ -32,9 +32,11 @@ from __future__ import annotations
 
 import json
 import random
+from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -90,14 +92,25 @@ def _reasoning_and_routing(
 
     acc_m, gate_m = _eval_M(model, tcfg, rng, device)
     reasoning: dict[str, float] = {"M": acc_m}
-    routing: dict[str, Any] = {
-        "M": gate_m.tolist() if hasattr(gate_m, "tolist") else gate_m
-    }
+    routing: dict[str, Any] = {"M": _gate_to_jsonable(gate_m)}
     for depth in depths:
         acc_d, gate_d = _eval_R_depth(model, tcfg, depth, rng, device)
         reasoning[f"D{depth}"] = acc_d
-        routing[f"D{depth}"] = gate_d.tolist() if hasattr(gate_d, "tolist") else gate_d
+        routing[f"D{depth}"] = _gate_to_jsonable(gate_d)
     return reasoning, routing
+
+
+def _gate_to_jsonable(gate: Any) -> Any:
+    """Normalise a gate report to a JSON-able value.
+
+    ``_eval_M``/``_eval_R_depth`` return a scalar reasoner-preference (2-way gate)
+    or a ``(3,)`` per-expert distribution array (3-way gate, ``mlp_enabled``) --
+    ``np.ndarray`` needs ``.tolist()``; a plain ``float`` (or numpy scalar) is
+    already JSON-able via ``float()``.
+    """
+    if isinstance(gate, np.ndarray):
+        return gate.tolist()
+    return float(gate)
 
 
 def build_eval_report(

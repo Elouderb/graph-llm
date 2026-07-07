@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
 import numpy as np
 import torch
@@ -253,6 +253,84 @@ def load_text8_bytes(cfg: DataConfig) -> np.ndarray | None:
     return _bytes_to_tokens(raw)
 
 
+def load_enwik9_bytes(cfg: DataConfig) -> np.ndarray | None:
+    """Load the cached enwik9 byte stream as an ``int64`` token array.
+
+    Mirrors :func:`load_text8_bytes` (card 69776c3e): same cache-first contract, same
+    return type, same ``None``-on-offline fallback -- so a trainer (e.g.
+    :class:`~graph_llm.train.segmented.SegmentedTrainer`) can switch between the two
+    corpora by flag/arg alone.  enwik9 (Matt Mahoney's 10^9-byte Wikipedia XML dump,
+    http://mattmahoney.net/dc/enwik9.zip) is the natural next rung above text8
+    (~10^8 bytes) for the 5M -> 15M -> 50M parameter mini-ladder.
+
+    Deliberately RAW bytes -- no XML stripping.  This is a byte-level LM corpus
+    (vocab_size=256, tokenizer-independent BPB), matching the existing enwik8/text8
+    convention in this module; a future cleaned-text variant is a separate concern.
+
+    Reads the lazy on-disk cache (``<cfg.data_dir>/enwik9.bin``, gitignored);
+    downloads once via :func:`_fetch_enwik9_bytes` if absent.  Returns ``None`` when
+    the cache is absent and the corpus cannot be fetched (offline), so callers can
+    fall back to a smaller corpus / synthetic data instead of a hard failure.
+    """
+    raw = _load_or_fetch_bytes(cfg, "enwik9", _fetch_enwik9_bytes)
+    if raw is None:
+        return None
+    return _bytes_to_tokens(raw)
+
+
+_CORPUS_BYTE_LOADERS: dict[str, Callable[[DataConfig], np.ndarray | None]] = {
+    "text8": load_text8_bytes,
+    "enwik9": load_enwik9_bytes,
+}
+
+
+def load_corpus_split(
+    source: str,
+    cfg: DataConfig | None = None,
+    train_frac: float = 0.98,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load a cached byte corpus and split it into disjoint contiguous (train, eval) slices.
+
+    Generalises :func:`~graph_llm.train.tandem.load_text8_split` to any of this
+    module's flat byte-stream loaders (``"text8"`` or ``"enwik9"``) behind one
+    ``source`` flag, so a trainer can move to enwik9 without touching its split
+    logic (card 69776c3e).  The split is a contiguous cut (NOT random), so eval rows
+    are never memorised training windows.
+
+    Args:
+        source: ``"text8"`` or ``"enwik9"``.
+        cfg: Optional :class:`DataConfig` (only ``data_dir`` is consulted); defaults
+            to ``DataConfig(source=source)`` when omitted.
+        train_frac: Fraction of the stream kept for training (default 0.98 -- enwik9
+            is 10x text8, so the same 5-50M-byte eval slice is a much smaller
+            fraction of the whole; pass 0.8 to match ``load_text8_split``'s ratio).
+
+    Returns:
+        ``(train_tokens, eval_tokens)`` as ``int64`` arrays.
+
+    Raises:
+        ValueError: If ``source`` is not a known corpus name.
+        RuntimeError: If the corpus is not cached and cannot be downloaded
+            (offline) -- mirrors ``load_text8_split``'s hard failure; callers that
+            want a soft fallback should catch this.
+    """
+    load_fn = _CORPUS_BYTE_LOADERS.get(source)
+    if load_fn is None:
+        raise ValueError(
+            f"load_corpus_split: unknown source {source!r}; "
+            f"choose one of {sorted(_CORPUS_BYTE_LOADERS)}"
+        )
+    cfg = cfg or DataConfig(source=source)
+    arr = load_fn(cfg)
+    if arr is None:  # pragma: no cover - requires the cached corpus
+        raise RuntimeError(
+            f"{source} cache required (data_dir={cfg.data_dir!r}); no cache present "
+            "and the fetch failed (offline?)."
+        )
+    cut = int(len(arr) * train_frac)
+    return arr[:cut], arr[cut:]
+
+
 # ---------------------------------------------------------------------------
 # Public builder
 # ---------------------------------------------------------------------------
@@ -281,11 +359,12 @@ def build_dataloaders(
     source = cfg.source.lower()
 
     # Real byte-level corpora with a *canonical contiguous* split (enwik8/text8:
-    # 90M/5M/5M; wikitext103: provided train/valid/test).  These return a fixed
-    # (train, val) pair built from the standard split rather than a random split,
-    # so results are comparable across runs and across models.  See card
-    # 424e3a8e and docs/baselines.md.
-    if source in ("enwik8", "text8", "wikitext103"):
+    # 90M/5M/5M; enwik9: 900M/50M/50M -- card 69776c3e, the next rung above
+    # text8/enwik8 for the parameter mini-ladder; wikitext103: provided
+    # train/valid/test).  These return a fixed (train, val) pair built from the
+    # standard split rather than a random split, so results are comparable across
+    # runs and across models.  See card 424e3a8e and docs/baselines.md.
+    if source in ("enwik8", "text8", "wikitext103", "enwik9"):
         loaders = _try_build_canonical_loaders(cfg, num_workers)
         if loaders is not None:
             return loaders
@@ -399,6 +478,19 @@ _ENWIK8_TRAIN_BYTES = 90_000_000
 _ENWIK8_VAL_BYTES = 5_000_000
 _ENWIK8_TEST_BYTES = 5_000_000
 
+# Canonical enwik9 split (card 69776c3e): same 5M/5M val/test tail sizes as
+# enwik8/text8 (comparable held-out set sizes across corpora), train gets the
+# remaining 990M of the 10^9-byte total.
+_ENWIK9_TRAIN_BYTES = 990_000_000
+_ENWIK9_VAL_BYTES = 5_000_000
+_ENWIK9_TEST_BYTES = 5_000_000
+
+# Per-source canonical split sizes consulted by :func:`_try_build_canonical_loaders`.
+# Falls back to the enwik8 sizes for any source not listed here.
+_SOURCE_SPLIT_BYTES: dict[str, tuple[int, int, int]] = {
+    "enwik9": (_ENWIK9_TRAIN_BYTES, _ENWIK9_VAL_BYTES, _ENWIK9_TEST_BYTES),
+}
+
 
 def _bytes_to_tokens(raw: bytes) -> np.ndarray:
     """View raw bytes as an ``int64`` token array (byte-level, vocab=256)."""
@@ -503,10 +595,38 @@ def _fetch_wikitext103_bytes() -> bytes:
     return text.encode("utf-8", errors="replace")
 
 
+_ENWIK9_URL = "http://mattmahoney.net/dc/enwik9.zip"
+
+
+def _fetch_enwik9_bytes() -> bytes:
+    """Download + extract enwik9 (card 69776c3e): raw Wikipedia XML bytes, no cleaning.
+
+    Unlike enwik8/text8/wikitext103 (served pre-decoded via the HF ``datasets`` hub),
+    enwik9 has no HF dataset id: Matt Mahoney publishes it directly as a ~330 MB zip
+    (http://mattmahoney.net/dc/enwik9.zip) containing one member, canonically named
+    "enwik9".  Fetched with stdlib ``urllib`` + ``zipfile`` (no new dependency); the
+    lazy on-disk cache in :func:`_load_or_fetch_bytes` means this network call (and
+    the ~1 GB extraction) only happens once per machine -- see that function's
+    ``cfg.data_dir`` cache path.  Raises on any failure so the caller's existing
+    offline fallback applies (this fetcher is never invoked once cached).
+    """
+    import io
+    import urllib.request
+    import zipfile
+
+    with urllib.request.urlopen(_ENWIK9_URL, timeout=300) as resp:  # noqa: S310
+        zip_bytes = resp.read()
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = zf.namelist()
+        member = "enwik9" if "enwik9" in names else names[0]
+        return zf.read(member)
+
+
 _CANONICAL_FETCHERS = {
     "enwik8": _fetch_enwik8_bytes,
     "text8": _fetch_text8_bytes,
     "wikitext103": _fetch_wikitext103_bytes,
+    "enwik9": _fetch_enwik9_bytes,
 }
 
 
@@ -514,14 +634,18 @@ def make_canonical_split_datasets(
     raw: bytes,
     seq_len: int,
     encoder: TextEncoder | None = None,
+    train_bytes: int = _ENWIK8_TRAIN_BYTES,
+    val_bytes: int = _ENWIK8_VAL_BYTES,
+    test_bytes: int = _ENWIK8_TEST_BYTES,
 ) -> dict[str, _TextChunkDataset]:
     """Build {train,val,test} chunk datasets from raw corpus bytes.
 
     By default uses byte-level encoding (vocab=256).  Pass an ``encoder``
     (e.g. a :class:`~graph_llm.tokenizer.BPETokenizer`) to tokenize at the
-    BPE level instead.  The canonical 90M/5M/5M byte-offset split is applied
-    first, then each split is encoded independently so there is no cross-split
-    context leakage.
+    BPE level instead.  The canonical byte-offset split (90M/5M/5M by default;
+    pass ``train_bytes``/``val_bytes``/``test_bytes`` for a different corpus, e.g.
+    enwik9's 990M/5M/5M -- card 69776c3e) is applied first, then each split is
+    encoded independently so there is no cross-split context leakage.
 
     Exposed for unit tests so the split/chunk logic can be exercised on a small
     in-memory fixture with no network or disk I/O.
@@ -529,20 +653,20 @@ def make_canonical_split_datasets(
     if encoder is None or isinstance(encoder, ByteLevelEncoder):
         # Fast path: byte-level, no decode round-trip needed.
         tokens = _bytes_to_tokens(raw)
-        splits = canonical_byte_splits(tokens)
+        splits = canonical_byte_splits(tokens, train_bytes, val_bytes, test_bytes)
         return {name: _TextChunkDataset(arr, seq_len) for name, arr in splits.items()}
 
     # BPE (or other text encoder): split bytes by offset first, then encode each
     # split as text so no cross-split context leaks through the tokenizer.
     total = len(raw)
-    total_req = _ENWIK8_TRAIN_BYTES + _ENWIK8_VAL_BYTES + _ENWIK8_TEST_BYTES
+    total_req = train_bytes + val_bytes + test_bytes
     if total < total_req:
         scale = total / total_req
-        train_end = int(_ENWIK8_TRAIN_BYTES * scale)
-        val_end = train_end + int(_ENWIK8_VAL_BYTES * scale)
+        train_end = int(train_bytes * scale)
+        val_end = train_end + int(val_bytes * scale)
     else:
-        train_end = _ENWIK8_TRAIN_BYTES
-        val_end = _ENWIK8_TRAIN_BYTES + _ENWIK8_VAL_BYTES
+        train_end = train_bytes
+        val_end = train_bytes + val_bytes
 
     byte_splits = {
         "train": raw[:train_end],
@@ -607,7 +731,17 @@ def _try_build_canonical_loaders(
     if raw is None:
         return None
     encoder = get_encoder(cfg)
-    datasets_by_split = make_canonical_split_datasets(raw, cfg.seq_len, encoder=encoder)
+    train_bytes, val_bytes, test_bytes = _SOURCE_SPLIT_BYTES.get(
+        source, (_ENWIK8_TRAIN_BYTES, _ENWIK8_VAL_BYTES, _ENWIK8_TEST_BYTES)
+    )
+    datasets_by_split = make_canonical_split_datasets(
+        raw,
+        cfg.seq_len,
+        encoder=encoder,
+        train_bytes=train_bytes,
+        val_bytes=val_bytes,
+        test_bytes=test_bytes,
+    )
     train_ds = datasets_by_split["train"]
     val_ds = datasets_by_split["val"]
     train_loader = DataLoader(

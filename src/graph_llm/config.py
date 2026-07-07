@@ -407,9 +407,10 @@ class ModelConfig:
 class DataConfig:
     """Dataset and tokenization settings."""
 
-    # source: "synthetic" | "enwik8" | "text8" | "wikitext103" | "tinystories"
-    # enwik8/text8 use the canonical 90M/5M/5M byte split; wikitext103 is loaded
-    # byte-level (BPB) for now (token-level ppl seam documented in loader.py).
+    # source: "synthetic" | "enwik8" | "text8" | "wikitext103" | "tinystories" | "enwik9"
+    # enwik8/text8 use the canonical 90M/5M/5M byte split; enwik9 (card 69776c3e, the
+    # next rung above text8 for the parameter mini-ladder) uses 990M/5M/5M; wikitext103
+    # is loaded byte-level (BPB) for now (token-level ppl seam documented in loader.py).
     source: str = "synthetic"
     encoder: str = "byte"              # "byte" | "bpe" (card e1644700)
     bpe_tokenizer_path: str | None = None  # path to saved BPETokenizer JSON

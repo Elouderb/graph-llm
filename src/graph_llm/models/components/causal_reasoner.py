@@ -48,6 +48,8 @@ M+R reproduction feeds one segment per forward, so this always holds there.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -533,4 +535,522 @@ class CausalReasoner(nn.Module):
         return out
 
 
-__all__ = ["CausalGRUEncoder", "CausalReasoner"]
+# =====================================================================================
+# MULTI-HEAD WALK (card 22acac98) — N parallel weight-independent locate-then-walk heads
+# over a SHARED causal encoder, combined on their FINAL reads.  Entirely additive and
+# default-off: the shipped ``CausalReasoner`` above is untouched, and ``n_heads=1`` with
+# the default ``combine="mean"`` reproduces a single ``CausalReasoner`` walk exactly
+# (pinned by a faithfulness test).  The probe (card 22acac98) asks whether redundancy
+# buys per-hop precision (independent per-hop errors ε -> joint ~ε^H under agreement) or
+# whether the heads collapse to identical walks.
+# =====================================================================================
+
+
+def _mh_causal_pool(h: Tensor, window: int) -> Tensor:
+    """Causal mean-pool of width ``window`` ending at each position (free-function twin of
+    :meth:`CausalReasoner._causal_pool`, so each head can pool its OWN window without
+    touching the shipped class).  ``(N, L, d)`` -> ``(N, L, d)``."""
+    _, length, _ = h.shape
+    acc = torch.zeros_like(h)
+    cnt = torch.zeros(1, length, 1, device=h.device, dtype=h.dtype)
+    ones = torch.ones(1, length, 1, device=h.device, dtype=h.dtype)
+    for off in range(window):
+        if off == 0:
+            acc = acc + h
+            cnt = cnt + ones
+        else:
+            acc[:, off:] = acc[:, off:] + h[:, : length - off]
+            cnt[:, off:] = cnt[:, off:] + ones[:, : length - off]
+    return acc / cnt
+
+
+def _mh_sharpen(w: Tensor, gamma: Tensor) -> Tensor:
+    """``w^gamma`` renormalised over the last dim (twin of ``CausalReasoner._sharpen``)."""
+    wp = w.clamp_min(1e-12) ** gamma
+    return wp / wp.sum(-1, keepdim=True).clamp_min(1e-12)
+
+
+def _mh_address(
+    query: Tensor, keys_n: Tensor, addr_mask: Tensor, scale: Tensor,
+    beta: Tensor | None, neg_inf: float,
+) -> Tensor:
+    """Cosine content-address -> masked softmax head (twin of ``CausalReasoner._address``)."""
+    q_n = F.normalize(query, dim=-1)
+    cos = torch.einsum("nqd,nkd->nqk", q_n, keys_n)
+    cos = cos.masked_fill(~addr_mask, neg_inf)
+    logit = scale * cos if beta is None else scale * beta * cos
+    return F.softmax(logit, dim=-1)
+
+
+@dataclass(frozen=True)
+class WalkHeadSpec:
+    """Per-head architecture for :class:`MultiHeadCausalReasoner`.
+
+    Homogeneous heads share one spec (identical architecture, INDEPENDENT parameters =
+    diversity via init/dropout).  Heterogeneous heads take DIFFERENT specs — different
+    ``steps`` (walk depth K), ``query_window`` (locate pool = short vs long addressing),
+    ``d_ctrl`` / ``d_key`` (width) — so they cannot collapse to the same walk by
+    construction (structural decorrelation, the card's "diversity for free").
+
+    Fields:
+        steps: walk depth K (native/trained budget for this head).
+        query_window: causal locate-pool width for this head.
+        d_key: addressing key dimension for this head.
+        d_ctrl: walk-controller hidden dimension for this head.
+        gamma_floor: mandatory per-step sharpen floor (>= 1.0).
+        direct_ptr: read the RHS descriptor straight into the move query.
+        hard_seed: straight-through commit the locate seed.
+        read_dropout: dropout on the per-hop value read (train-only DIVERSITY pressure —
+            independent masks per head decorrelate homogeneous trajectories; 0.0 = off).
+        addr_range: if set, band-limit the walk addressing to keys within ``addr_range``
+            positions back of the query (a "short-range" head); ``None`` = full causal
+            window (the default / long-range head).
+    """
+
+    steps: int
+    query_window: int
+    d_key: int
+    d_ctrl: int
+    gamma_floor: float = 2.0
+    direct_ptr: bool = True
+    hard_seed: bool = True
+    read_dropout: float = 0.0
+    addr_range: int | None = None
+
+    @classmethod
+    def from_cfg(cls, cfg: ModelConfig) -> WalkHeadSpec:
+        """The homogeneous default: a head matching the shipped ``CausalReasoner`` cfg."""
+        return cls(
+            steps=cfg.causal_reasoner_steps,
+            query_window=cfg.causal_reasoner_query_window,
+            d_key=cfg.causal_reasoner_key_dim,
+            d_ctrl=cfg.d_model,
+            gamma_floor=float(cfg.causal_reasoner_gamma_floor),
+            direct_ptr=cfg.causal_reasoner_direct_ptr,
+            hard_seed=cfg.causal_reasoner_hard_seed,
+        )
+
+
+class _WalkHead(nn.Module):
+    """One locate-then-walk head over a SHARED encoder output ``h`` (see
+    :class:`MultiHeadCausalReasoner`).  Holds its own copy of every walk parameter and
+    a per-head fusion ``head_proj`` mapping ``cat([r_final, ctrl]) -> d_model`` (so the
+    combine step is width-uniform even when heads differ in ``d_ctrl``).
+
+    The walk math is byte-faithful to ``CausalReasoner._walk_window`` (a single head): a
+    dedicated-seed locate, then K weight-tied soft hops with mandatory per-step sharpen,
+    ``direct_ptr``, optional eval hard-addressing.  ``forward`` returns the fused per-head
+    hidden, the per-row commit confidence (final head peak), and — when ``collect_aux`` —
+    the seed logits, per-hop soft distribution, and final position at the query row.
+    """
+
+    def __init__(self, d_model: int, spec: WalkHeadSpec) -> None:
+        super().__init__()
+        if spec.gamma_floor < 1.0:
+            raise ValueError("WalkHeadSpec.gamma_floor must be >= 1.0 (mandatory sharpen).")
+        if spec.d_key < 2:
+            raise ValueError("WalkHeadSpec.d_key must be >= 2.")
+        if spec.query_window < 1:
+            raise ValueError("WalkHeadSpec.query_window must be >= 1.")
+        if spec.steps < 1:
+            raise ValueError("WalkHeadSpec.steps must be >= 1.")
+        self.spec = spec
+        self.d_model = d_model
+        d_key = spec.d_key
+        d_ctrl = spec.d_ctrl
+
+        self.name_key = nn.Linear(d_model, d_key)
+        self.ptr_key = nn.Linear(d_model, d_key)
+        self.val = nn.Linear(d_model, d_model)
+        self.seed_name_key = nn.Linear(d_model, d_key)
+        self.query_pool = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_key),
+        )
+        self.move_gain = nn.Parameter(torch.tensor(1.0))
+
+        self.gru = nn.GRUCell(d_model + 2, d_ctrl)
+        self.to_query = nn.Linear(d_ctrl, d_key)
+        self.to_beta = nn.Linear(d_ctrl, 1)
+        self.to_gate = nn.Linear(d_ctrl, 1)
+        self.to_gamma = nn.Linear(d_ctrl, 1)
+        self.key_scale = nn.Parameter(torch.tensor(5.0))
+        self.read_drop = nn.Dropout(spec.read_dropout)
+        self.head_proj = nn.Linear(d_model + d_ctrl, d_model)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Faithful init + the load-bearing head-bias priors (mirrors ``CausalReasoner``)."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                m.reset_parameters()
+        with torch.no_grad():
+            self.to_beta.bias.fill_(1.0)
+            self.to_gate.bias.fill_(0.0)
+            self.to_gamma.bias.fill_(0.5)
+            self.key_scale.fill_(5.0)
+            self.move_gain.fill_(1.0)
+
+    def forward(
+        self,
+        h: Tensor,
+        addr_mask: Tensor,
+        pos: Tensor,
+        query_pos: Tensor | None,
+        aux_query_pos: Tensor | None,
+        tf_seed: Tensor | None,
+        commit_seed: bool,
+        steps: int,
+        walk_hard: bool,
+        gamma_add: float,
+        clock_period: int | None,
+        collect_aux: bool,
+    ) -> tuple[Tensor, Tensor, dict | None]:
+        n, length, _ = h.shape
+        device = h.device
+        rows = torch.arange(n, device=device)
+        qmode = query_pos is not None
+        lq = 1 if qmode else length
+        spec = self.spec
+
+        keys_n = F.normalize(self.name_key(h), dim=-1)
+        ptr_keys = self.ptr_key(h)
+        vals = self.val(h)
+        seed_keys_n = F.normalize(self.seed_name_key(h), dim=-1)
+        neg_inf = torch.finfo(h.dtype).min
+        scale = F.softplus(self.key_scale)
+
+        # Optional band-limit (a short-range head): key k is addressable by query q only
+        # when q - addr_range <= k (<= q is already the causal mask).
+        mask = addr_mask
+        if spec.addr_range is not None:
+            if qmode:
+                assert query_pos is not None
+                qp = query_pos.view(n, 1, 1)
+            else:
+                qp = pos.view(1, length, 1)
+            band = pos.view(1, 1, length) >= (qp - spec.addr_range)
+            mask = addr_mask & band
+
+        # --- Stage 1: locate (seed) ---
+        pooled = _mh_causal_pool(h, spec.query_window)
+        if qmode:
+            assert query_pos is not None
+            pooled = pooled[rows, query_pos].unsqueeze(1)
+        q0 = self.query_pool(pooled)
+        q0_n = F.normalize(q0, dim=-1)
+        seed_cos = torch.einsum("nqd,nkd->nqk", q0_n, seed_keys_n)
+        seed_pre = (scale * seed_cos).masked_fill(~mask, neg_inf)
+        w = F.softmax(seed_pre, dim=-1)
+        gamma_seed = torch.full((n, lq, 1), spec.gamma_floor + 1.0, device=device, dtype=h.dtype)
+        w = _mh_sharpen(w, gamma_seed)
+        if spec.hard_seed and commit_seed:
+            w = _st_top1(w)
+
+        if tf_seed is not None and aux_query_pos is not None:
+            valid = tf_seed >= 0
+            if bool(valid.any()):
+                one_hot = torch.zeros(n, length, device=device, dtype=h.dtype)
+                one_hot.scatter_(1, tf_seed.clamp_min(0).unsqueeze(1), 1.0)
+                w = w.clone()
+                vr = rows[valid]
+                if qmode:
+                    w[vr, 0] = one_hot[valid]
+                else:
+                    w[vr, aux_query_pos[valid]] = one_hot[valid]
+
+        aux_seed_logits = None
+        walk_w_list: list[Tensor] = []
+        if collect_aux and aux_query_pos is not None:
+            aux_seed_logits = seed_pre[:, 0] if qmode else seed_pre[rows, aux_query_pos]
+
+        # --- Stage 2: walk ---
+        ctrl = torch.zeros(n, lq, spec.d_ctrl, device=device, dtype=h.dtype)
+        clock_norm = steps if clock_period is None else clock_period
+        for step in range(steps):
+            phi = 2.0 * math.pi * step / max(1, clock_norm)
+            clk = torch.tensor([math.sin(phi), math.cos(phi)], device=device, dtype=h.dtype)
+            clk = clk.view(1, 1, 2).expand(n, lq, 2)
+            r = torch.einsum("nqk,nkd->nqd", w, vals)
+            r = self.read_drop(r)  # train-only diversity pressure (off at eval / p=0)
+            read_ptr = torch.einsum("nqk,nkd->nqd", w, ptr_keys)
+            gru_in = torch.cat([r, clk], dim=-1).reshape(n * lq, -1)
+            ctrl = self.gru(gru_in, ctrl.reshape(n * lq, -1)).view(n, lq, spec.d_ctrl)
+
+            query = self.to_query(ctrl)
+            if spec.direct_ptr:
+                query = query + self.move_gain * read_ptr
+            beta = F.softplus(self.to_beta(ctrl))
+            g = torch.sigmoid(self.to_gate(ctrl))
+            gamma = spec.gamma_floor + F.softplus(self.to_gamma(ctrl))
+            if gamma_add:
+                gamma = gamma + gamma_add
+
+            w_c = _mh_address(query, keys_n, mask, scale, beta, neg_inf)
+            w = g * w_c + (1.0 - g) * w
+            w = w.masked_fill(~mask, 0.0)
+            w = w / w.sum(-1, keepdim=True).clamp_min(1e-12)
+            w = _mh_sharpen(w, gamma)
+            if collect_aux and aux_query_pos is not None:
+                walk_w_list.append(w[:, 0] if qmode else w[rows, aux_query_pos])
+            if walk_hard:
+                w = _st_top1(w)
+
+        r_final = torch.einsum("nqk,nkd->nqd", w, vals)
+        conf = w.max(dim=-1).values                       # (N, Lq) commit confidence
+        head_out = self.head_proj(torch.cat([r_final, ctrl], dim=-1))  # (N, Lq, d_model)
+
+        aux: dict | None = None
+        if collect_aux and aux_query_pos is not None:
+            w_at = w[:, 0] if qmode else w[rows, aux_query_pos]        # (N, Lk)
+            aux = {
+                "seed_logits": aux_seed_logits,
+                "walk_w": torch.stack(walk_w_list, dim=1) if walk_w_list else None,
+                "final_pos": w_at.argmax(dim=-1),                     # (N,)
+                "conf": w_at.max(dim=-1).values,                     # (N,)
+            }
+        return head_out, conf, aux
+
+
+class MultiHeadCausalReasoner(nn.Module):
+    """Multi-head causal locate-then-walk reasoner (card 22acac98).
+
+    ``n_heads`` parallel :class:`_WalkHead` walks over ONE shared
+    :class:`CausalGRUEncoder`, fused per-head to ``d_model`` and then COMBINED on those
+    final reads.  Default-off and interface-stable: ``n_heads=1`` + ``combine="mean"``
+    reproduces a single :class:`CausalReasoner` walk exactly.
+
+    Args:
+        cfg: a :class:`~graph_llm.config.ModelConfig` (supplies ``d_model``,
+            ``vocab_size``, ``reasoning_segment_len`` and the ``causal_reasoner_*``
+            defaults used for homogeneous heads / the shared encoder).
+        n_heads: number of parallel walk heads (default 1).
+        head_specs: optional per-head :class:`WalkHeadSpec` list of length ``n_heads``
+            (HETEROGENEOUS heads).  ``None`` (default) = HOMOGENEOUS: every head uses
+            ``WalkHeadSpec.from_cfg(cfg)`` (identical architecture, independent params).
+        combine: how to reduce the ``n_heads`` per-head hiddens ->
+            ``"mean"`` (equal average), ``"confidence"`` (agreement-gated: softmax over
+            heads of the final commit confidence), or ``"concat"`` (learned projection of
+            the concatenation).
+        combine_temp_init: initial temperature for the ``"confidence"`` softmax.
+    """
+
+    def __init__(
+        self,
+        cfg: ModelConfig,
+        *,
+        n_heads: int = 1,
+        head_specs: Sequence[WalkHeadSpec] | None = None,
+        combine: str = "mean",
+        combine_temp_init: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if n_heads < 1:
+            raise ValueError("n_heads must be >= 1.")
+        if combine not in ("mean", "confidence", "concat"):
+            raise ValueError(f"combine must be mean|confidence|concat, got {combine!r}.")
+        if cfg.reasoning_segment_len < 1:
+            raise ValueError("reasoning_segment_len must be >= 1.")
+        if head_specs is not None and len(head_specs) != n_heads:
+            raise ValueError(
+                f"head_specs length {len(head_specs)} != n_heads {n_heads}."
+            )
+
+        self.d_model = cfg.d_model
+        self.segment_len = cfg.reasoning_segment_len
+        self.n_heads = n_heads
+        self.combine = combine
+        if head_specs is None:
+            base = WalkHeadSpec.from_cfg(cfg)
+            specs: list[WalkHeadSpec] = [replace(base) for _ in range(n_heads)]
+        else:
+            specs = list(head_specs)
+        self.specs = tuple(specs)
+        # Default single-head walk depth (mirrors CausalReasoner.steps for the API).
+        self.steps = specs[0].steps
+
+        self.encoder = CausalGRUEncoder(
+            cfg.vocab_size,
+            cfg.d_model,
+            conv_kernel=cfg.causal_reasoner_conv_kernel,
+            gru_layers=cfg.causal_reasoner_gru_layers,
+        )
+        self.heads = nn.ModuleList(_WalkHead(cfg.d_model, s) for s in specs)
+        self.combine_temp = nn.Parameter(torch.tensor(float(combine_temp_init)))
+        self.final_proj = (
+            nn.Linear(n_heads * cfg.d_model, cfg.d_model) if combine == "concat" else None
+        )
+
+    # ------------------------------------------------------------------- helpers
+    def _resolve_steps(self, steps: int | Sequence[int] | None) -> list[int]:
+        """Per-head effective walk depth.  ``None`` -> each head's native ``spec.steps``;
+        an int -> uniform override (deep-extrapolation eval); a sequence -> per head."""
+        if steps is None:
+            return [s.steps for s in self.specs]
+        if isinstance(steps, int):
+            return [steps] * self.n_heads
+        steps = list(steps)
+        if len(steps) != self.n_heads:
+            raise ValueError(f"per-head steps length {len(steps)} != n_heads {self.n_heads}.")
+        return steps
+
+    def _combine(self, outs: Tensor, confs: Tensor) -> tuple[Tensor, Tensor | None]:
+        """Reduce ``outs (N,Lq,H,d)`` over the head axis -> ``(N,Lq,d)`` + combine weights."""
+        if self.combine == "mean":
+            return outs.mean(dim=2), None
+        if self.combine == "confidence":
+            alpha = F.softmax(self.combine_temp * confs, dim=2)      # (N,Lq,H)
+            combined = (alpha.unsqueeze(-1) * outs).sum(dim=2)
+            return combined, alpha
+        # concat
+        n, lq, hh, d = outs.shape
+        assert self.final_proj is not None
+        return self.final_proj(outs.reshape(n, lq, hh * d)), None
+
+    def _run(
+        self,
+        x: Tensor,
+        steps_per_head: list[int],
+        commit_seed: bool,
+        aux_query_pos: Tensor | None,
+        tf_seed: Tensor | None,
+        collect_aux: bool,
+        walk_hard: bool,
+        gamma_add: float,
+        clock_period: int | None,
+        query_pos: Tensor | None,
+    ) -> tuple[Tensor, dict | None]:
+        """Encode once (shared), run every head, combine on the final reads."""
+        n, length = x.shape
+        device = x.device
+        qmode = query_pos is not None
+        h = self.encoder(x)
+        pos = torch.arange(length, device=device)
+        if qmode:
+            assert query_pos is not None
+            addr_mask = pos.view(1, 1, length) <= query_pos.view(n, 1, 1)
+        else:
+            addr_mask = (pos.unsqueeze(0) <= pos.unsqueeze(1)).unsqueeze(0)
+            addr_mask = addr_mask.expand(n, length, length)
+
+        head_outs: list[Tensor] = []
+        confs: list[Tensor] = []
+        per_head_aux: list[dict | None] = []
+        for i, head in enumerate(self.heads):
+            ho, conf, aux_h = head(
+                h, addr_mask, pos, query_pos, aux_query_pos, tf_seed, commit_seed,
+                steps_per_head[i], walk_hard, gamma_add, clock_period, collect_aux,
+            )
+            head_outs.append(ho)
+            confs.append(conf)
+            per_head_aux.append(aux_h)
+
+        outs = torch.stack(head_outs, dim=2)      # (N, Lq, H, d)
+        cf = torch.stack(confs, dim=2)            # (N, Lq, H)
+        combined, cw = self._combine(outs, cf)    # (N, Lq, d)
+
+        aux: dict | None = None
+        if collect_aux and aux_query_pos is not None:
+            aux = {
+                "per_head": per_head_aux,
+                "combine_weights": None if cw is None else (cw[:, 0] if qmode else cw),
+                # Convenience mirrors of head-0 aux (single-head-compatible callers).
+                "seed_logits": per_head_aux[0]["seed_logits"] if per_head_aux[0] else None,
+                "walk_w": per_head_aux[0]["walk_w"] if per_head_aux[0] else None,
+            }
+        return combined, aux
+
+    # -------------------------------------------------------------------- public
+    def forward(
+        self,
+        x: Tensor,
+        steps: int | Sequence[int] | None = None,
+        commit_seed: bool = True,
+        return_aux: bool = False,
+        aux_query_pos: Tensor | None = None,
+        tf_seed: Tensor | None = None,
+        walk_hard: bool = False,
+        gamma_add: float = 0.0,
+        clock_period: int | None = None,
+    ) -> Tensor | tuple[Tensor, dict]:
+        """Per-position combined reasoning hidden over segment-bounded windows.
+
+        Mirrors :meth:`CausalReasoner.forward`; ``steps`` may be an int (uniform), a
+        per-head sequence, or ``None`` (each head's native ``spec.steps``).  ``return_aux``
+        gathers per-head ``{seed_logits, walk_w, final_pos, conf}`` at ``aux_query_pos``
+        (requires a single window).
+        """
+        _, t = x.shape
+        length = self.segment_len
+        steps_per_head = self._resolve_steps(steps)
+
+        if return_aux or aux_query_pos is not None or tf_seed is not None:
+            if t > length:
+                raise ValueError(
+                    f"aux/teacher-forcing require a single window (T={t} <= "
+                    f"reasoning_segment_len={length})."
+                )
+            out, aux = self._run(
+                x, steps_per_head, commit_seed, aux_query_pos, tf_seed,
+                collect_aux=return_aux, walk_hard=walk_hard, gamma_add=gamma_add,
+                clock_period=clock_period, query_pos=None,
+            )
+            if return_aux:
+                assert aux is not None
+                return out, aux
+            return out
+
+        b = x.shape[0]
+        n_win = (t + length - 1) // length
+        pad = n_win * length - t
+        if pad:
+            x = F.pad(x, (0, pad))
+        xw = x.view(b, n_win, length).reshape(b * n_win, length)
+        out, _ = self._run(
+            xw, steps_per_head, commit_seed, aux_query_pos=None, tf_seed=None,
+            collect_aux=False, walk_hard=walk_hard, gamma_add=gamma_add,
+            clock_period=clock_period, query_pos=None,
+        )
+        out = out.view(b, n_win, length, self.d_model).reshape(b, n_win * length, self.d_model)
+        return out[:, :t]
+
+    def query_forward(
+        self,
+        x: Tensor,
+        query_pos: Tensor,
+        steps: int | Sequence[int] | None = None,
+        commit_seed: bool = True,
+        return_aux: bool = False,
+        tf_seed: Tensor | None = None,
+        walk_hard: bool = False,
+        gamma_add: float = 0.0,
+        clock_period: int | None = None,
+    ) -> Tensor | tuple[Tensor, dict]:
+        """Single-query fast path: the combined reasoning hidden AT ``query_pos`` only —
+        ``O(sum_h K_h * L)`` (mirrors :meth:`CausalReasoner.query_forward`)."""
+        _, t = x.shape
+        if t > self.segment_len:
+            raise ValueError(
+                f"query_forward requires a single window (T={t} <= "
+                f"reasoning_segment_len={self.segment_len})."
+            )
+        steps_per_head = self._resolve_steps(steps)
+        out, aux = self._run(
+            x, steps_per_head, commit_seed, aux_query_pos=query_pos, tf_seed=tf_seed,
+            collect_aux=return_aux, walk_hard=walk_hard, gamma_add=gamma_add,
+            clock_period=clock_period, query_pos=query_pos,
+        )
+        out = out[:, 0]
+        if return_aux:
+            assert aux is not None
+            return out, aux
+        return out
+
+
+__all__ = [
+    "CausalGRUEncoder",
+    "CausalReasoner",
+    "MultiHeadCausalReasoner",
+    "WalkHeadSpec",
+]

@@ -21,7 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from graph_llm.config import DataConfig
 from graph_llm.data.loader import (
     _CANONICAL_FETCHERS,
+    _EXPECTED_CORPUS_SIZES,
+    _cache_path,
     _fetch_enwik9_bytes,
+    _load_or_fetch_bytes,
     build_dataloaders,
     canonical_byte_splits,
     load_corpus_split,
@@ -80,6 +83,10 @@ def test_load_enwik9_bytes_uses_disk_cache_not_network(tmp_path, monkeypatch) ->
         raise AssertionError("network fetch should not be called when cache exists")
 
     monkeypatch.setattr("graph_llm.data.loader._fetch_enwik9_bytes", _boom)
+    # This test exercises the cache-hit/no-network contract on a small synthetic
+    # fixture, not the real-corpus size check (covered separately below) -- disable
+    # the exact-length guard so a deliberately tiny fixture is still accepted here.
+    monkeypatch.setattr("graph_llm.data.loader._EXPECTED_CORPUS_SIZES", {})
 
     cfg = DataConfig(source="enwik9", data_dir=str(tmp_path))
     tokens = load_enwik9_bytes(cfg)
@@ -108,6 +115,7 @@ def test_build_dataloaders_enwik9_source_from_cache(tmp_path, monkeypatch) -> No
         raise AssertionError("network fetch should not be called when cache exists")
 
     monkeypatch.setattr("graph_llm.data.loader._fetch_enwik9_bytes", _boom)
+    monkeypatch.setattr("graph_llm.data.loader._EXPECTED_CORPUS_SIZES", {})
 
     cfg = DataConfig(source="enwik9", data_dir=str(tmp_path), seq_len=16, batch_size=4)
     train_loader, val_loader = build_dataloaders(cfg, vocab_size=256, seed=0)
@@ -120,6 +128,7 @@ def test_build_dataloaders_enwik9_source_from_cache(tmp_path, monkeypatch) -> No
 def test_load_corpus_split_enwik9(tmp_path, monkeypatch) -> None:
     raw = _fake_enwik9_bytes(3000, seed=3)
     (tmp_path / "enwik9.bin").write_bytes(raw)
+    monkeypatch.setattr("graph_llm.data.loader._EXPECTED_CORPUS_SIZES", {})
     cfg = DataConfig(source="enwik9", data_dir=str(tmp_path))
     train, ev = load_corpus_split("enwik9", cfg=cfg, train_frac=0.9)
     assert len(train) + len(ev) == len(raw)
@@ -142,6 +151,98 @@ def test_load_corpus_split_raises_without_cache_or_network(tmp_path, monkeypatch
     cfg = DataConfig(source="enwik9", data_dir=str(tmp_path))
     with pytest.raises(RuntimeError):
         load_corpus_split("enwik9", cfg=cfg)
+
+
+def test_enwik9_registered_in_expected_corpus_sizes() -> None:
+    """The review's Major finding #1 (card 69776c3e comment 264): enwik9's
+    well-known exact decompressed size must be registered so both a fresh fetch
+    and an existing cache are validated against it."""
+    assert _EXPECTED_CORPUS_SIZES["enwik9"] == 1_000_000_000
+
+
+def test_load_or_fetch_bytes_raises_on_existing_cache_size_mismatch(tmp_path) -> None:
+    """A cache file that does NOT match the expected exact size (e.g. a truncated
+    write left by a killed process) must be a loud failure, not silently trusted."""
+    cfg = DataConfig(source="enwik9", data_dir=str(tmp_path))
+    (tmp_path / "enwik9.bin").write_bytes(b"\x00" * 999)  # deliberately wrong size
+
+    def _boom() -> bytes:  # pragma: no cover - cache exists, must not be called
+        raise AssertionError("fetch should not be called when a cache file exists")
+
+    with pytest.raises(ValueError, match="expected exactly 1,000,000,000"):
+        _load_or_fetch_bytes(cfg, "enwik9", _boom, expected_size=1_000_000_000)
+
+
+def test_load_or_fetch_bytes_raises_on_fresh_fetch_size_mismatch_and_does_not_cache(
+    tmp_path,
+) -> None:
+    """A fresh fetch that returns the wrong number of bytes (corrupted/incomplete
+    download) must raise AND must NOT be written to the cache path."""
+    cfg = DataConfig(source="enwik9", data_dir=str(tmp_path))
+
+    def _short_fetch() -> bytes:
+        return b"\x00" * 999  # wrong size -- simulates a truncated download
+
+    with pytest.raises(ValueError, match="expected exactly 1,000,000,000"):
+        _load_or_fetch_bytes(cfg, "enwik9", _short_fetch, expected_size=1_000_000_000)
+
+    assert not (tmp_path / "enwik9.bin").exists()
+
+
+def test_load_enwik9_bytes_raises_on_real_cache_size_mismatch(tmp_path) -> None:
+    """End-to-end through the public ``load_enwik9_bytes`` entry point (not just
+    the private helper): a wrong-sized real cache file must raise, not silently
+    return truncated/corrupt tokens."""
+    (tmp_path / "enwik9.bin").write_bytes(b"\x00" * 1234)
+    cfg = DataConfig(source="enwik9", data_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="expected exactly 1,000,000,000"):
+        load_enwik9_bytes(cfg)
+
+
+def test_load_or_fetch_bytes_writes_cache_atomically_via_temp_and_replace(tmp_path) -> None:
+    """The cache write must go through a temp file in the SAME directory + an
+    atomic ``os.replace`` -- no stray temp files left behind on success, and no
+    partially-written file ever visible at the final cache path."""
+    cfg = DataConfig(source="text8", data_dir=str(tmp_path))
+    raw = _fake_enwik9_bytes(4096, seed=7)
+
+    def _fetch() -> bytes:
+        return raw
+
+    result = _load_or_fetch_bytes(cfg, "text8", _fetch)
+    assert result == raw
+
+    cache_path = _cache_path(cfg, "text8")
+    assert cache_path.exists()
+    assert cache_path.read_bytes() == raw
+    # No leftover temp files in the cache directory after a successful write.
+    leftover_tmp = [p for p in tmp_path.iterdir() if p.name.startswith(".text8.")]
+    assert leftover_tmp == []
+
+
+def test_load_or_fetch_bytes_atomic_write_survives_replace_failure(tmp_path, monkeypatch) -> None:
+    """If the final ``os.replace`` step fails, the temp file is cleaned up (no
+    debris left in the cache dir) and the fetched bytes are still returned to the
+    caller for this run (soft-fail on caching, matching the pre-existing
+    OSError-tolerant contract for a failed cache write)."""
+    import graph_llm.data.loader as loader_mod
+
+    cfg = DataConfig(source="text8", data_dir=str(tmp_path))
+    raw = _fake_enwik9_bytes(2048, seed=8)
+
+    def _fetch() -> bytes:
+        return raw
+
+    def _boom_replace(src, dst):  # noqa: ANN001, ARG001
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(loader_mod.os, "replace", _boom_replace)
+
+    result = _load_or_fetch_bytes(cfg, "text8", _fetch)
+    assert result == raw  # still usable this run even though caching failed
+    assert not _cache_path(cfg, "text8").exists()
+    leftover_tmp = [p for p in tmp_path.iterdir() if p.name.startswith(".text8.")]
+    assert leftover_tmp == []  # temp file cleaned up, not left as debris
 
 
 def test_fetch_enwik9_bytes_extracts_single_member_zip(monkeypatch) -> None:

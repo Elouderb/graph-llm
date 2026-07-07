@@ -5,7 +5,10 @@ The smoke path (source="synthetic") is fully offline and deterministic.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -273,7 +276,9 @@ def load_enwik9_bytes(cfg: DataConfig) -> np.ndarray | None:
     the cache is absent and the corpus cannot be fetched (offline), so callers can
     fall back to a smaller corpus / synthetic data instead of a hard failure.
     """
-    raw = _load_or_fetch_bytes(cfg, "enwik9", _fetch_enwik9_bytes)
+    raw = _load_or_fetch_bytes(
+        cfg, "enwik9", _fetch_enwik9_bytes, expected_size=_EXPECTED_CORPUS_SIZES.get("enwik9")
+    )
     if raw is None:
         return None
     return _bytes_to_tokens(raw)
@@ -539,25 +544,75 @@ def _cache_path(cfg: DataConfig, name: str) -> Path:
     return Path(cfg.data_dir) / f"{name}.bin"
 
 
-def _load_or_fetch_bytes(cfg: DataConfig, name: str, fetch) -> bytes | None:
+# Known-exact corpus byte sizes (card 69776c3e review, comment 264): checked
+# against BOTH a freshly-fetched corpus and an EXISTING on-disk cache, so a
+# truncated download or a kill-mid-write is a loud failure instead of a
+# silently-trusted corrupt cache on the next run. Only enwik9 has a single,
+# well-known exact size (Matt Mahoney's canonical 10^9-byte dump); enwik8/text8/
+# wikitext103 vary slightly by HF snapshot/decoding, so they are intentionally
+# left out of this dict (unchanged behavior -- no check for those sources).
+_EXPECTED_CORPUS_SIZES: dict[str, int] = {"enwik9": 1_000_000_000}
+
+
+def _load_or_fetch_bytes(
+    cfg: DataConfig, name: str, fetch, expected_size: int | None = None
+) -> bytes | None:
     """Return the raw corpus bytes, using a lazy on-disk cache.
 
     On the first call ``fetch()`` downloads the corpus (via ``datasets``); the
     raw bytes are cached under ``cfg.data_dir`` (which is ``.gitignore``d) so
     subsequent runs are offline.  Returns ``None`` if the fetch fails (no
     network), letting callers fall back to synthetic data.
+
+    The cache write is atomic: the bytes are written to a temp file in the
+    SAME directory as the final cache path, then moved into place with
+    ``os.replace`` (an atomic rename on a given filesystem). Without this, a
+    process killed mid-``write_bytes`` (e.g. an interrupted multi-GB enwik9
+    download) leaves a truncated file at the final path that the next run's
+    ``path.exists()`` check would trust with zero validation.
+
+    Args:
+        expected_size: exact byte length the corpus MUST have (e.g. enwik9's
+            well-known 1_000_000_000 bytes). When given, this is checked
+            against BOTH a freshly-fetched corpus (before caching it -- a
+            mismatch is NOT cached) and an existing on-disk cache (before
+            trusting it); either mismatch raises ``ValueError`` rather than
+            silently proceeding with truncated/corrupt data. ``None`` (the
+            default) skips the check, preserving prior behavior exactly.
     """
     path = _cache_path(cfg, name)
     if path.exists():
-        return path.read_bytes()
+        raw = path.read_bytes()
+        if expected_size is not None and len(raw) != expected_size:
+            raise ValueError(
+                f"{name} cache at {path} is {len(raw):,} bytes, expected exactly "
+                f"{expected_size:,} -- this looks like a truncated/corrupted cache "
+                "(e.g. an interrupted download or a process killed mid-write). "
+                "Delete the file and re-run to refetch."
+            )
+        return raw
     try:
         raw = fetch()
     except Exception as e:  # noqa: BLE001 — any fetch failure -> offline fallback
         _log.warning("%s fetch failed (offline?): %s", name, e)
         return None
+    if expected_size is not None and len(raw) != expected_size:
+        raise ValueError(
+            f"{name} fetch returned {len(raw):,} bytes, expected exactly "
+            f"{expected_size:,} -- treating this as a corrupted/incomplete "
+            "download; NOT caching it. Re-run to retry."
+        )
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(raw)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+            os.replace(tmp_name, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.remove(tmp_name)
+            raise
     except OSError as e:
         _log.warning("Could not cache %s to %s: %s", name, path, e)
     return raw
@@ -728,7 +783,9 @@ def _try_build_canonical_loaders(
     fetch = _CANONICAL_FETCHERS.get(source)
     if fetch is None:
         return None
-    raw = _load_or_fetch_bytes(cfg, source, fetch)
+    raw = _load_or_fetch_bytes(
+        cfg, source, fetch, expected_size=_EXPECTED_CORPUS_SIZES.get(source)
+    )
     if raw is None:
         return None
     encoder = get_encoder(cfg)

@@ -132,15 +132,32 @@ Select via `DataConfig.source`.
 |----------|--------|-------|----------|-------------|
 | `enwik8` | enwik8 (100 MB Wikipedia XML) | **90M / 5M / 5M** bytes (canonical, contiguous) | byte-level (vocab 256) | bits-per-byte |
 | `text8`  | text8 (cleaned enwik8) | **90M / 5M / 5M** bytes (canonical, contiguous) | byte-level (vocab 256) | bits-per-byte |
+| `enwik9` | enwik9 (1 GB Wikipedia XML, `http://mattmahoney.net/dc/enwik9.zip`) | **990M / 5M / 5M** bytes (canonical, contiguous; same 5M/5M held-out tail convention as enwik8/text8) | byte-level (vocab 256), raw bytes — no XML stripping | bits-per-byte |
 | `wikitext103` | WikiText-103 (raw) | provided train split, byte-level | byte-level (vocab 256) for now | bits-per-byte (see seam) |
 | `tinystories` | roneneldan/TinyStories | random | byte-level | tiny-scale coherence |
 | `synthetic` | deterministic random tokens | random | n/a | offline smoke / CI |
 
-The enwik8/text8/wikitext103 loaders return a **fixed** `(train, val)` pair built
-from the **canonical contiguous split** (NOT a random slice), so reported numbers
-are comparable across runs and across models. The split helpers
+The enwik8/text8/enwik9/wikitext103 loaders return a **fixed** `(train, val)` pair
+built from the **canonical contiguous split** (NOT a random slice), so reported
+numbers are comparable across runs and across models. The split helpers
 (`canonical_byte_splits`, `make_canonical_split_datasets`) are unit-tested on
 in-memory byte fixtures — never a live download.
+
+**enwik9 (card 69776c3e)** is the next rung above text8/enwik8 (~10^8 bytes) for
+the 5M → 15M → 50M parameter mini-ladder (card f82d95dc). Unlike the other
+corpora (served pre-decoded via the HF `datasets` hub), enwik9 has no HF dataset
+id: it is fetched once via stdlib `urllib` + `zipfile` from Matt Mahoney's
+canonical ~330 MB zip and cached as the raw, uncompressed ~1 GB (exactly
+1,000,000,000 bytes) dump. Cache location follows the same
+`DataConfig.data_dir`-relative convention as every other corpus in this table
+(`<data_dir>/enwik9.bin`, `.gitignore`d); on this project's dev machine that
+cache is shared across worktrees at `~/.cache/graph_llm/data/enwik9.bin`
+(`DataConfig(source="enwik9", data_dir="~/.cache/graph_llm/data")` — set once,
+reused by every tree without re-downloading). The cache write is atomic
+(temp-file-in-same-dir + `os.replace`) and both a fresh fetch and an existing
+cache file are checked against the exact expected size, so a kill-mid-download
+or a truncated cache raises loudly instead of silently training on corrupt
+bytes.
 
 ### Eval metric at Phase 0 = bits-per-byte (byte-level)
 

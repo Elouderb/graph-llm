@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -62,14 +63,38 @@ def _state_dicts_equal(a: dict, b: dict) -> bool:
     return all(torch.equal(a[k].cpu(), b[k].cpu()) for k in a)
 
 
-def test_resume_equivalence_losses_and_params_match_exactly(tmp_path) -> None:
+@pytest.mark.parametrize("ramp", [False, True], ids=["ramp_off", "ramp_on"])
+def test_resume_equivalence_losses_and_params_match_exactly(tmp_path, ramp: bool) -> None:
+    """Card 69776c3e review (comment 264, Major finding #2): the depth-ramp window
+    position (``r_depth_ramp=True``) is named explicitly in acceptance criterion 3
+    but was previously only hand-verified by the reviewer, not covered by an
+    automated regression test. Parametrized over ramp on/off so both the plain
+    ``rng.choice(train_r_depths)`` schedule AND the ramp's widening-window
+    ``rng.randint(r_depth_start, cur_max)`` schedule (a pure function of `step`,
+    per ``_ramp_depth``) are proven to resume exactly, on CPU, tiny/fast."""
     device = torch.device("cpu")
     seed = 123
     n_steps = 8
     k = 3
+    # Tiny ramp window: k_train (>= r_depth_max, enforced by _train_one) covers the
+    # walk budget; r_depth_ramp_delay auto-resolves to type_warmup(3) +
+    # gate_commit_anneal(3) = 6, so the ramp is actually exercised (steps 6, 7) within
+    # this test's tiny 8-step budget -- not just constructed-but-inert.
+    ramp_overrides: dict[str, Any] = (
+        dict(
+            r_depth_ramp=True,
+            r_depth_start=4,
+            r_depth_max=6,
+            r_depth_ramp_steps=2,
+            k_train=6,
+            seg_len=80,  # depth-6 x 1-chain reasoning text must fit (> the 48-byte default)
+        )
+        if ramp
+        else {}
+    )
 
     # (a) straight N-step run.
-    straight_cfg = _tiny_cfg(train_steps=n_steps)
+    straight_cfg = _tiny_cfg(train_steps=n_steps, **ramp_overrides)
     straight = _train_one(straight_cfg, seed, device, verbose=False, capture_model=True)
 
     # (b1) first k steps, checkpointing at the end.
@@ -78,6 +103,7 @@ def test_resume_equivalence_losses_and_params_match_exactly(tmp_path) -> None:
         train_steps=k,
         checkpoint_dir=str(ckpt_dir),
         checkpoint_every=k,  # exactly one checkpoint, at the very last of the k steps
+        **ramp_overrides,
     )
     b1 = _train_one(b1_cfg, seed, device, verbose=False, capture_model=True)
     assert len(b1["loss_history"]) == k
@@ -92,7 +118,7 @@ def test_resume_equivalence_losses_and_params_match_exactly(tmp_path) -> None:
     assert ckpt["rng_state"] is not None
 
     # (b2) resume from the checkpoint and train the remaining N-k steps.
-    b2_cfg = _tiny_cfg(train_steps=n_steps, resume_from=str(ckpt_path))
+    b2_cfg = _tiny_cfg(train_steps=n_steps, resume_from=str(ckpt_path), **ramp_overrides)
     b2 = _train_one(b2_cfg, seed, device, verbose=False, capture_model=True)
 
     assert len(b2["loss_history"]) == n_steps - k

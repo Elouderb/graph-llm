@@ -47,21 +47,22 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.amp.grad_scaler import GradScaler
+from torch.utils.data import DataLoader
 
-from graph_llm.data.loader import OrderedSegmentStream
+from graph_llm.data.loader import OrderedSegmentStream, _TextChunkDataset
 from graph_llm.data.synthetic_tasks import CrossSegmentTaskSampler, masked_token_loss
+from graph_llm.eval.report import build_eval_report, write_eval_report
 from graph_llm.models.components.delta_memory import DeltaMemoryState
 from graph_llm.train.optim import build_optimizer, build_scheduler
 from graph_llm.utils.logging import get_logger, log_metrics, setup_logging
 from graph_llm.utils.seed import seed_everything
 
 if TYPE_CHECKING:
-    import numpy as np
-
     from graph_llm.config import Config
 
 _log = get_logger("segmented_trainer")
@@ -181,6 +182,11 @@ class SegmentedTrainer:
         tokens: 1-D ``int64`` token array — the ordered stream to train on
             (e.g. text8 from :func:`~graph_llm.data.loader.load_text8_bytes`).
         device: Override device (defaults to CUDA when available, else CPU).
+        val_tokens: Optional 1-D ``int64`` held-out token array (e.g. a disjoint
+            slice from :func:`~graph_llm.data.loader.load_corpus_split`) used ONLY
+            by the periodic unified eval report (``cfg.train.eval_every``, card
+            69776c3e); ``None`` (default) skips the val-bpb component of that
+            report and does not otherwise change training.
     """
 
     def __init__(
@@ -189,6 +195,7 @@ class SegmentedTrainer:
         model: nn.Module,
         tokens: np.ndarray,
         device: torch.device | None = None,
+        val_tokens: np.ndarray | None = None,
     ) -> None:
         self.cfg = cfg
         self.model = model
@@ -238,6 +245,17 @@ class SegmentedTrainer:
         self._sched_rng = torch.Generator().manual_seed(cfg.train.seed + 1)
         self._noise_rng = torch.Generator(device=self.device).manual_seed(cfg.train.seed + 2)
 
+        # Unified eval-report hook (card 69776c3e): off by default (eval_every=0).
+        self._eval_every = cfg.train.eval_every
+        self._eval_run_dir = cfg.train.eval_run_dir
+        self._val_tokens = val_tokens
+        self._val_loader: DataLoader | None = None
+        if val_tokens is not None and self._eval_every > 0:
+            val_ds = _TextChunkDataset(np.asarray(val_tokens), self._segment_len)
+            self._val_loader = DataLoader(
+                val_ds, batch_size=cfg.data.batch_size, shuffle=False, drop_last=False
+            )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -283,7 +301,27 @@ class SegmentedTrainer:
                 lr = self.scheduler.get_last_lr()[0]
                 log_metrics(self.state.step, loss=round(loss_val, 4), lr=round(lr, 6))
 
+            if self._eval_every > 0 and self.state.step % self._eval_every == 0:
+                self._run_periodic_eval()
+
         return self.state.loss_history
+
+    # ------------------------------------------------------------------
+    # Unified eval-report hook (card 69776c3e)
+    # ------------------------------------------------------------------
+
+    def _run_periodic_eval(self) -> None:
+        """Build + write the unified eval report at the current step.
+
+        Runs under ``build_eval_report``'s own no-perturbation guarantee (eval
+        under ``no_grad`` + model-mode / RNG-state restore), so this never changes
+        the trajectory of the training loop that calls it.
+        """
+        report = build_eval_report(
+            self.model, self.cfg, self._val_loader, self.device, step=self.state.step
+        )
+        path = write_eval_report(report, self._eval_run_dir, step=self.state.step)
+        _log.info("Wrote eval report: %s", path)
 
     # ------------------------------------------------------------------
     # LM ordered-stream window (truncated BPTT)

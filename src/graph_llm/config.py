@@ -438,6 +438,15 @@ class TrainConfig:
     resume_from: str | None = None
     log_every: int = 100
 
+    # --- Unified eval-report hook (card 69776c3e) ---
+    # Consumed by SegmentedTrainer to periodically write the unified eval report
+    # (val bpb + cross-segment retrieval + in-model reasoning-depth accuracy +
+    # routing health -- see eval/report.py) to disk during a long run.
+    # ``eval_every=0`` (default) == off, byte-for-byte the existing behaviour (no
+    # extra eval passes, no report I/O).
+    eval_every: int = 0
+    eval_run_dir: str = "eval_reports/"
+
 
 # ---------------------------------------------------------------------------
 # Top-level config

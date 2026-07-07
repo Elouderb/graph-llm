@@ -492,7 +492,12 @@ def _train_one(
     # nothing else needs restoring for the schedule to continue correctly.
     start_step = 0
     if cfg.resume_from:
-        ckpt = load_training_checkpoint(cfg.resume_from, map_location=device)
+        # NOTE: load onto CPU (the default), NOT map_location=device -- the payload's
+        # rng_state["torch_cpu"] must stay a CPU ByteTensor (torch.set_rng_state
+        # requires it); model.load_state_dict / optimizer.load_state_dict both cast
+        # the loaded (CPU) tensors to the model's/optimizer's own device automatically,
+        # so this is safe regardless of what device `model`/`opt` already live on.
+        ckpt = load_training_checkpoint(cfg.resume_from)
         model.load_state_dict(ckpt["model_state"])
         opt.load_state_dict(ckpt["optimizer_state"])
         if ckpt.get("scheduler_state") is not None:

@@ -187,3 +187,48 @@ class MultiScaleConvEmbedding(nn.Module):
         flat = multi.reshape(B, T, S * d)                # (B, T, S*d)
         weights = F.softmax(self.select(flat), dim=-1)   # (B, T, S)
         return (weights.unsqueeze(-1) * multi).sum(dim=2)  # (B, T, d)
+
+    @torch.no_grad()
+    def identity_init(self) -> None:
+        """Init so the front-end is an EXACT pass-through of the raw embedding at step 0
+        (card b1926d5d, coordinator; the zero-init-superset pattern from the stacked probe's
+        ``seed_ctx_proj``).
+
+        ``front_end(x) == x`` at init, so enabling the conv starts from the SAME point as the
+        no-front-end backbone — the optimizer then OPENS the multi-scale mixing only where it
+        helps, instead of paying the up-front re-learning cost of a random condense projection
+        (which scrambles the embedding and regressed text8 bpb at a fixed budget).
+
+        Construction: scale 0 is set to an exact identity (a causal delta at the CURRENT tap
+        + an identity channel mix), and the condense is set to read ONLY scale 0.  The other
+        scales keep their random init but contribute NOTHING at step 0 (``concat_proj`` zeros
+        their blocks; ``soft_select`` routes ~all mass to scale 0), so training grows them via
+        the condense gradient.  Called AFTER the model's generic weight init so it overrides.
+        """
+        d = self.d_model
+        s0 = self.scales[0]
+        assert isinstance(s0, _CausalScaleConv)
+        # scale 0 -> exact identity: a causal delta at the CURRENT position (the last tap,
+        # since the conv is left-padded by width-1) + an identity pointwise channel mix.
+        nn.init.zeros_(s0.conv.weight)
+        if s0.depthwise:
+            s0.conv.weight[:, 0, -1] = 1.0                       # (d, 1, width) delta
+            assert s0.pointwise is not None
+            s0.pointwise.weight.copy_(torch.eye(d).view(d, d, 1))
+            assert s0.pointwise.bias is not None
+            nn.init.zeros_(s0.pointwise.bias)
+        else:
+            s0.conv.weight[:, :, -1] = torch.eye(d)              # (d, d, width) identity tap
+            if s0.conv.bias is not None:
+                nn.init.zeros_(s0.conv.bias)
+        # condense -> select ONLY scale 0 (the first d columns of the flattened (S, d) slice).
+        if self.condense == "concat_proj":
+            assert self.proj is not None
+            nn.init.zeros_(self.proj.weight)
+            self.proj.weight[:, :d] = torch.eye(d)
+            nn.init.zeros_(self.proj.bias)
+        else:  # soft_select: input-independent, near one-hot on scale 0.
+            assert self.select is not None
+            nn.init.zeros_(self.select.weight)
+            nn.init.zeros_(self.select.bias)
+            self.select.bias[0] = 20.0

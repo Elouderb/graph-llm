@@ -128,6 +128,23 @@ class TandemConfig:
     # back into the (documented, M-orphaning) flat forced-mix for the ablation.
     mlp_enabled: bool = False
     mlp_ff_mult: int = 4  # GatedMLP inner expansion for the workhorse pathway
+    # --- Workhorse strengthening A/B (card b1926d5d) ---
+    # front_end: "none" (shipped) | "multiscale_conv" — enable the committed cheap causal
+    # multi-scale local combiner so h_embed carries window-mixed local context for ALL
+    # pathways (memory + MLP-workhorse) + the gate context.  The reasoner reads raw tokens,
+    # so its name-ID locate signal is untouched.  mlp_depth: stack this many GeGLU blocks in
+    # the workhorse (1 = shipped single bare GatedMLP; >=2 adds residual+norm rungs).  Both
+    # default to the shipped backbone -> the front_end=none / mlp_depth=1 cells are controls.
+    front_end: str = "none"
+    mlp_depth: int = 1
+    # Range-separation variant (card b1926d5d, coordinator): route the conv to the MLP
+    # workhorse ONLY, keeping the validated memory + reasoner + gate on raw h_embed.  Only
+    # meaningful with front_end != "none" + mlp_enabled.
+    front_end_workhorse_only: bool = False
+    # Identity-init the conv front-end (card b1926d5d, coordinator): the front-end is an
+    # exact pass-through at step 0, so the optimizer opens the multi-scale mixing where it
+    # helps rather than paying the random-condense re-learning cost.  front_end != "none".
+    conv_identity_init: bool = False
     # --- PROGRESSIVE R-depth curriculum (card cff8f5ee; recipe from card 0a98292b) ---
     # The shipped fixed ``train_r_depths=(4,5,6)`` + ``k_train=8`` caps the reasoner at a
     # TRAINED-WALK-BUDGET CLIFF at hop==k_train: within budget the per-hop walk is fine, but
@@ -264,6 +281,10 @@ def build_tandem_model(cfg: TandemConfig, device: torch.device) -> torch.nn.Modu
         tandem_gate_scalar=cfg.gate_scalar,
         tandem_mlp_enabled=cfg.mlp_enabled,
         tandem_mlp_ff_mult=cfg.mlp_ff_mult,
+        tandem_mlp_depth=cfg.mlp_depth,
+        front_end=cfg.front_end,
+        front_end_workhorse_only=cfg.front_end_workhorse_only,
+        conv_identity_init=cfg.conv_identity_init,
     )
     full = Config(
         model=m,
@@ -823,6 +844,25 @@ def _build_run_config(argv: list[str] | None = None) -> tuple[TandemConfig, tupl
                          "plain text longer, so it cannot out-capture the MLP on P) — the "
                          "robustness knob for the 3-way routing seed-fragility.  Default under "
                          "--mlp = gate_mix_warmup (600).")
+    ap.add_argument("--front-end", dest="front_end", default=None,
+                    choices=["none", "multiscale_conv"],
+                    help="input-stage local combiner (card b1926d5d): 'multiscale_conv' enables "
+                         "the committed cheap causal multi-scale conv so h_embed carries local "
+                         "context for the memory + MLP-workhorse + gate (reasoner reads raw "
+                         "tokens).  Default (omitted) = the shipped 'none'.")
+    ap.add_argument("--mlp-depth", dest="mlp_depth", type=int, default=None,
+                    help="workhorse GeGLU depth (card b1926d5d): 1 = shipped single bare "
+                         "GatedMLP; >=2 stacks residual+norm rungs for more per-token capacity. "
+                         "Only meaningful with --mlp.  Default (omitted) = 1.")
+    ap.add_argument("--front-end-workhorse-only", dest="front_end_workhorse_only",
+                    action="store_true",
+                    help="range-separation variant (card b1926d5d): route the conv front-end to "
+                         "the MLP workhorse ONLY (memory + reasoner + gate keep raw h_embed).  "
+                         "Requires --front-end multiscale_conv + --mlp.")
+    ap.add_argument("--conv-identity-init", dest="conv_identity_init", action="store_true",
+                    help="identity-init the conv front-end (card b1926d5d): exact pass-through "
+                         "at step 0, so the optimizer opens the multi-scale mixing where it "
+                         "helps.  Requires --front-end multiscale_conv.")
     args = ap.parse_args(argv)
     seeds = tuple(int(s) for s in args.seeds.split(",") if s.strip())
 
@@ -897,6 +937,15 @@ def _build_run_config(argv: list[str] | None = None) -> tuple[TandemConfig, tupl
         cfg.r_depth_ramp_steps = args.ramp_steps
     if args.k_train is not None:
         cfg.k_train = args.k_train
+    # Workhorse strengthening A/B (card b1926d5d): additive, default to the shipped backbone.
+    if args.front_end is not None:
+        cfg.front_end = args.front_end
+    if args.mlp_depth is not None:
+        cfg.mlp_depth = args.mlp_depth
+    if args.front_end_workhorse_only:
+        cfg.front_end_workhorse_only = True
+    if args.conv_identity_init:
+        cfg.conv_identity_init = True
     return cfg, seeds, args.out
 
 
@@ -934,7 +983,9 @@ def main() -> None:
     print(f"device={device}"
           + (f" {torch.cuda.get_device_name(0)}" if device.type == "cuda" else ""), flush=True)
     print(f"    delta_layers={cfg.delta_layers} tie_embeddings={cfg.tie_embeddings} "
-          f"mlp_enabled={cfg.mlp_enabled} type_warmup={cfg.type_warmup}", flush=True)
+          f"mlp_enabled={cfg.mlp_enabled} type_warmup={cfg.type_warmup} "
+          f"front_end={cfg.front_end} mlp_depth={cfg.mlp_depth} "
+          f"wh_only={cfg.front_end_workhorse_only}", flush=True)
     if cfg.r_depth_ramp:
         delay_str = str(cfg.r_depth_ramp_delay) if cfg.r_depth_ramp_delay >= 0 else "auto"
         print(f"    r_depth_ramp: widening [{cfg.r_depth_start}, cur_max] with cur_max "

@@ -167,6 +167,33 @@ class ModelConfig:
     # Depthwise-separable convs (depthwise over the window + pointwise channel mix)
     # for cheapness when True; a single full 1-D conv per scale when False.
     conv_depthwise: bool = True
+    # Front-end SCOPE (card b1926d5d, coordinator range-separation variant).  False
+    # (default) == the conv output REPLACES h_embed and feeds ALL pathways (memory +
+    # MLP-workhorse + gate context) — the committed behaviour.  True == the conv feeds
+    # ONLY the MLP-workhorse input; the memory pathway, the reasoner context, and the
+    # gate keep the RAW embedding.  Rationale: the delta-memory k->v binding was tuned on
+    # raw bytes and the reasoner already reads raw tokens, so window-mixing the shared
+    # trunk can perturb the validated pathways; routing the local context to ONLY the
+    # workhorse (the pathway meant to own local sequential prediction) delivers the
+    # range-separation idea without touching the validated pathways.  Only meaningful
+    # when the conv front-end is built AND the MLP workhorse exists (tandem_mlp_enabled);
+    # a no-op otherwise (nothing to route the conv to).
+    front_end_workhorse_only: bool = False
+    # Identity-init the conv front-end (card b1926d5d, coordinator).  False (default) ==
+    # the committed random init.  True == the front-end starts as a pass-through of the raw
+    # embedding at step 0 (MultiScaleConvEmbedding.identity_init: scale 0 -> identity, the
+    # condense -> select scale 0 only) — EXACT (bit-for-bit) for condense="concat_proj";
+    # near-exact (a near-one-hot softmax over scales) for condense="soft_select" — so
+    # enabling the conv starts from the SAME point as the no-front-end backbone and the
+    # optimizer OPENS the multi-scale mixing only where it helps — instead of a random
+    # condense scrambling the embedding and paying an up-front re-learning cost (which
+    # regressed text8 bpb at a fixed budget).  SAFETY (card b1926d5d, cell c3): with the
+    # conv feeding all pathways + tandem_mlp_depth >= 2, a RANDOM-init conv silently
+    # DESTROYED cross-segment memory retrieval (acc_M -> chance) while text8 bpb still
+    # looked fine — identity-init is MANDATORY in the adopted config, not a bpb nicety.
+    # Only consulted when the conv front-end is built (front_end="multiscale_conv");
+    # a no-op otherwise.
+    conv_identity_init: bool = False
 
     # --- Cross-segment persistent-memory TRAINING hyperparameters (card 61f900ca,
     # piece 3) ---
@@ -342,6 +369,18 @@ class ModelConfig:
     tandem_mlp_enabled: bool = False
     # GatedMLP (GeGLU) inner-expansion for the workhorse pathway (d_ff = mult * d_model).
     tandem_mlp_ff_mult: int = 4
+    # Workhorse DEPTH (card b1926d5d): how many GeGLU blocks the MLP workhorse stacks.
+    # The shipped workhorse is ONE bare :class:`GatedMLP` on the raw trunk input ``h_embed``
+    # (near-unigram context); a stronger, deeper workhorse gives the plain-text pathway more
+    # per-token capacity (the workhorse's text win came DESPITE near-unigram input).  ``1``
+    # (default) == the shipped single bare GatedMLP, BYTE-FOR-BYTE (no extra module / params /
+    # RNG draws) so the depth-1 cell is a clean control.  ``depth>=2`` keeps that bare input
+    # GatedMLP and stacks ``depth-1`` PRE-NORM RESIDUAL GeGLU blocks (``x + mlp(norm(x))``,
+    # mirroring the delta block's MLP sub-layer) on top -> "stack 2 GeGLU blocks with
+    # residual+norm" at depth 2.  Only consulted when ``tandem_mlp_enabled=True`` (a no-op
+    # otherwise, like the ff_mult knob).  Every position is processed independently -> the
+    # LM-leak-safe (logits[t] depend only on tokens <= t) property is preserved at any depth.
+    tandem_mlp_depth: int = 1
 
     # --- Unsupervised gate-routing losses (card 31fe6b00, applied by TandemTrainer) ---
     # Label-free routing: the main answer loss decides DIRECTION per example; these force

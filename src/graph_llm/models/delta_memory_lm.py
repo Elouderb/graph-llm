@@ -75,6 +75,25 @@ class GatedMLP(nn.Module):
         return self.dropout(self.down_proj(h))
 
 
+class _WorkhorseBlock(nn.Module):
+    """Pre-norm residual GeGLU block for the stacked MLP workhorse (card b1926d5d).
+
+    ``x + mlp(norm(x))`` — one extra depth rung stacked on top of the workhorse's
+    bare input :class:`GatedMLP`, mirroring the delta block's MLP sub-layer
+    (:class:`DeltaMemoryBlock`).  Per-position (no token mixing) so the workhorse
+    stays LM-leak-safe at any depth.  Constructed only for ``tandem_mlp_depth >= 2``;
+    at depth 1 the workhorse is the shipped single bare ``GatedMLP`` (no block here).
+    """
+
+    def __init__(self, m: ModelConfig) -> None:
+        super().__init__()
+        self.norm = RMSNorm(m.d_model)
+        self.mlp = GatedMLP(m.d_model, m.tandem_mlp_ff_mult * m.d_model, m.delta_dropout)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x + self.mlp(self.norm(x))
+
+
 class DeltaMemoryBlock(nn.Module):
     """Pre-norm residual block: GatedDeltaMemory (token mixing) + gated MLP.
 
@@ -161,6 +180,10 @@ class DeltaMemoryLM(nn.Module):
         self.front_end: MultiScaleConvEmbedding | None = (
             MultiScaleConvEmbedding(m) if front_end == "multiscale_conv" else None
         )
+        # Front-end scope (card b1926d5d): route the conv output to the MLP-workhorse ONLY
+        # (leaving memory + reasoner-ctx + gate on the raw embedding) when True; feed it to
+        # all pathways (the committed default) when False.
+        self._front_end_workhorse_only = bool(getattr(m, "front_end_workhorse_only", False))
 
         # Depth-scalable stack of delta-memory blocks.
         self.blocks = nn.ModuleList([DeltaMemoryBlock(m) for _ in range(m.delta_layers)])
@@ -200,6 +223,10 @@ class DeltaMemoryLM(nn.Module):
         self.causal_reasoner: CausalReasoner | None = None
         self.tandem_gate: nn.Linear | None = None
         self.tandem_mlp: GatedMLP | None = None
+        # Extra stacked GeGLU rungs on top of the workhorse's bare input GatedMLP (card
+        # b1926d5d).  EMPTY (no modules/params/state_dict keys/RNG draws) unless
+        # tandem_mlp_depth >= 2 -> the depth-1 / 2-way / OFF states are byte-for-byte.
+        self.tandem_mlp_blocks: nn.ModuleList = nn.ModuleList()
         if getattr(m, "tandem_enabled", False):
             self.causal_reasoner = CausalReasoner(m)
             self._tandem_scalar = m.tandem_gate_scalar
@@ -209,6 +236,15 @@ class DeltaMemoryLM(nn.Module):
                 # (per-channel: 3*d_model viewed (.,d_model,3); scalar: 3).
                 self.tandem_mlp = GatedMLP(
                     m.d_model, m.tandem_mlp_ff_mult * m.d_model, m.delta_dropout
+                )
+                # WORKHORSE DEPTH (card b1926d5d): stack ``tandem_mlp_depth-1`` pre-norm
+                # residual GeGLU blocks on top of the bare input GatedMLP.  depth=1 -> the
+                # list stays empty (the shipped single bare workhorse, byte-for-byte).
+                depth = getattr(m, "tandem_mlp_depth", 1)
+                if depth < 1:
+                    raise ValueError(f"tandem_mlp_depth must be >= 1, got {depth}.")
+                self.tandem_mlp_blocks = nn.ModuleList(
+                    [_WorkhorseBlock(m) for _ in range(depth - 1)]
                 )
                 gate_out = 3 if m.tandem_gate_scalar else 3 * m.d_model
                 self.tandem_gate = nn.Linear(4 * m.d_model, gate_out)
@@ -268,6 +304,25 @@ class DeltaMemoryLM(nn.Module):
         for block in self.blocks:
             nn.init.normal_(block.mixer.out_proj.weight, mean=0.0, std=residual_std)
             nn.init.normal_(block.mlp.down_proj.weight, mean=0.0, std=residual_std)
+
+        # Stacked workhorse blocks (card b1926d5d): residual-scale their down_proj by the
+        # workhorse residual depth, same discipline as the memory blocks above (keeps the
+        # residual-stream variance bounded when the workhorse deepens).  The bare input
+        # ``tandem_mlp`` is deliberately LEFT at the generic std=0.02 (it is not on a
+        # residual stream) so the depth-1 workhorse stays byte-for-byte the shipped path.
+        n_wh = len(self.tandem_mlp_blocks)
+        if n_wh > 0:
+            wh_std = std / (2 * n_wh) ** 0.5
+            for wblock in self.tandem_mlp_blocks:
+                nn.init.normal_(wblock.mlp.down_proj.weight, mean=0.0, std=wh_std)
+
+        # Optional identity-init of the conv front-end (card b1926d5d, coordinator): make it
+        # an EXACT pass-through of the raw embedding at step 0 so enabling the conv starts
+        # from the no-front-end backbone and the optimizer opens the multi-scale mixing only
+        # where it helps.  Applied AFTER the generic loop (which set the conv weights to
+        # std=0.02) so it overrides.  No-op when the conv front-end is not built.
+        if self.front_end is not None and getattr(m, "conv_identity_init", False):
+            self.front_end.identity_init()
 
         # Forget-gate remember-by-default init (card 1e9245f4).  The generic loop above
         # zeros ALL linear biases — including alpha_proj.bias.  We re-apply the configured
@@ -411,8 +466,19 @@ class DeltaMemoryLM(nn.Module):
         # multi-scale causal local context before the memory layers.  ``None`` when
         # front_end="none" -> this line is a pure pass-through (the committed
         # backbone, unchanged).
+        #
+        # SCOPE (card b1926d5d): by default the conv REPLACES h_embed and feeds ALL
+        # pathways (memory + workhorse + gate) — the committed behaviour.  In
+        # workhorse-only scope the conv feeds ONLY the MLP-workhorse input
+        # (``h_wh_embed``); h_embed stays RAW so the delta-memory k->v binding, the
+        # reasoner context, and the gate are on the raw bytes they were tuned on.
+        h_wh_embed = h_embed
         if self.front_end is not None:
-            h_embed = self.front_end(h_embed)
+            if self._front_end_workhorse_only:
+                h_wh_embed = self.front_end(h_embed)
+            else:
+                h_embed = self.front_end(h_embed)
+                h_wh_embed = h_embed
 
         # MEMORY pathway = the existing delta-memory block stack (UNCHANGED).
         # ``_forward_blocks`` returns a ``(x, states)`` tuple whenever a carried state
@@ -534,7 +600,15 @@ class DeltaMemoryLM(nn.Module):
                 # with a plain per-token GatedMLP on the trunk input; fusion h = sum_e
                 # g_e * h_e.  h_mlp reads h_embed only (per-position) -> stays LM-leak-safe.
                 assert self.tandem_mlp is not None
-                h_mlp = self.tandem_mlp(h_embed)
+                # ``h_wh_embed`` == the (optionally conv-mixed) workhorse input: it equals
+                # h_embed EXCEPT under workhorse-only front-end scope, where only the
+                # workhorse sees the conv (card b1926d5d).
+                h_mlp = self.tandem_mlp(h_wh_embed)
+                # Optional deeper workhorse (card b1926d5d): stack pre-norm residual GeGLU
+                # rungs.  Empty at depth 1 -> this loop is a pure pass-through (the shipped
+                # single-block workhorse).  Per-position throughout -> LM-leak-safe preserved.
+                for wblock in self.tandem_mlp_blocks:
+                    h_mlp = wblock(h_mlp)
                 gate_logit = self.tandem_gate(
                     torch.cat([h_mem, h_reason, h_mlp, h_embed], dim=-1)
                 )

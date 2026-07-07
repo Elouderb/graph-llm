@@ -1002,3 +1002,288 @@ def test_cli_no_ramp_leaves_shipped_defaults() -> None:
     cfg, _, _ = _build_run_config([])
     assert cfg.r_depth_ramp is False and cfg.mlp_enabled is False
     assert cfg.train_r_depths == (4, 5, 6) and cfg.k_train == 8
+
+
+# ---------------------------------------------------------------------------
+# WORKHORSE STRENGTHENING A/B (card b1926d5d): stacked-MLP depth + conv front-end
+# ---------------------------------------------------------------------------
+
+
+def test_workhorse_depth_default_is_one() -> None:
+    assert ModelConfig().tandem_mlp_depth == 1
+
+
+def test_workhorse_depth_one_is_byte_for_byte_3way() -> None:
+    """tandem_mlp_depth=1 (explicit) == the shipped single-block 3-way workhorse.
+
+    The depth-1 cell is a control: no extra module / state_dict key / param, and the
+    forward logits are bit-identical under a fixed seed.
+    """
+    torch.manual_seed(0)
+    default3 = build_model(_full_cfg(_on3_cfg()))
+    torch.manual_seed(0)
+    depth1 = build_model(_full_cfg(_on3_cfg(tandem_mlp_depth=1)))
+    # No residual rungs constructed at depth 1 -> empty ModuleList, no state_dict keys.
+    assert len(default3.tandem_mlp_blocks) == 0
+    assert not any(k.startswith("tandem_mlp_blocks") for k in default3.state_dict())
+    assert set(default3.state_dict()) == set(depth1.state_dict())
+    assert default3.num_parameters() == depth1.num_parameters()
+    default3.eval()
+    depth1.eval()
+    x = torch.randint(1, 256, (2, 24))
+    with torch.no_grad():
+        _, la = default3(x)
+        _, lb = depth1(x)
+    assert torch.equal(la, lb), "tandem_mlp_depth=1 is not byte-for-byte the shipped workhorse"
+
+
+def test_workhorse_depth_stacks_blocks_and_adds_params() -> None:
+    """depth>=2 stacks depth-1 pre-norm residual GeGLU rungs + grows params monotonically."""
+    d1 = build_model(_full_cfg(_on3_cfg(tandem_mlp_depth=1)))
+    d2 = build_model(_full_cfg(_on3_cfg(tandem_mlp_depth=2)))
+    d3 = build_model(_full_cfg(_on3_cfg(tandem_mlp_depth=3)))
+    assert len(d1.tandem_mlp_blocks) == 0
+    assert len(d2.tandem_mlp_blocks) == 1
+    assert len(d3.tandem_mlp_blocks) == 2
+    assert any(k.startswith("tandem_mlp_blocks.0") for k in d2.state_dict())
+    assert d1.num_parameters() < d2.num_parameters() < d3.num_parameters()
+
+
+def test_workhorse_depth_below_one_raises() -> None:
+    with pytest.raises(ValueError, match="tandem_mlp_depth"):
+        build_model(_full_cfg(_on3_cfg(tandem_mlp_depth=0)))
+
+
+def test_workhorse_depth_two_three_way_gate_shapes() -> None:
+    """The deeper workhorse composes with the 3-way softmax gate (sums to 1 over experts)."""
+    torch.manual_seed(0)
+    on3 = build_model(_full_cfg(_on3_cfg(tandem_mlp_depth=2, gate_mix_warmup_steps=0)))
+    on3.train()
+    b, t = 3, 24
+    x = torch.randint(1, 256, (b, t))
+    out = on3.tandem_step(x, aux_query_pos=torch.tensor([t - 1, 12, 5]))
+    gate = out["gate"]
+    assert gate.shape == (b, t, 3)
+    sums = gate.sum(dim=-1)
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+
+
+def test_workhorse_depth_two_lm_leak_probe_exactly_zero() -> None:
+    """A deeper (stacked) workhorse stays per-position -> the LM-leak guarantee is carried."""
+    torch.manual_seed(0)
+    on3 = build_model(_full_cfg(_on3_cfg(tandem_mlp_depth=2, reasoning_segment_len=64)))
+    x = torch.randint(1, 256, (2, 48))
+    max_diff = _lm_leak_maxdiff(on3, x, t_pert=19)
+    assert max_diff == 0.0, f"deep-workhorse LM leak: max|Δlogit| at <=t = {max_diff:.3e} != 0.0"
+
+
+def test_conv_front_end_with_deep_workhorse_lm_leak_probe_exactly_zero() -> None:
+    """The TARGET config (multiscale_conv front-end + depth-2 workhorse, 3-way) stays EXACTLY
+    causal: the causal conv only mixes trailing context, so perturbing tokens > t leaves the
+    logits at <= t unchanged (0.0).  The conv also feeds the memory + gate; the reasoner reads
+    raw tokens."""
+    torch.manual_seed(0)
+    on3 = build_model(_full_cfg(_on3_cfg(
+        front_end="multiscale_conv", tandem_mlp_depth=2, reasoning_segment_len=64,
+    )))
+    assert on3.front_end is not None, "front_end='multiscale_conv' must construct the conv stage"
+    x = torch.randint(1, 256, (2, 48))
+    for t_pert in (11, 27):
+        max_diff = _lm_leak_maxdiff(on3, x, t_pert=t_pert)
+        assert max_diff == 0.0, (
+            f"conv+deep-workhorse LM leak at t={t_pert}: max|Δlogit| at <=t = {max_diff:.3e} != 0.0"
+        )
+
+
+def test_build_tandem_model_wires_front_end_and_depth() -> None:
+    """The trainer build path forwards front_end + mlp_depth into the model (composes on CPU)."""
+    from graph_llm.train.tandem import build_tandem_model
+
+    cfg = TandemConfig(
+        d_model=32, delta_layers=1, delta_n_heads=4, delta_head_dim=16, seg_len=64, k_train=8,
+        mlp_enabled=True, mlp_ff_mult=2, mlp_depth=2, front_end="multiscale_conv",
+    )
+    model = build_tandem_model(cfg, torch.device("cpu"))
+    assert model.front_end is not None
+    assert model.tandem_mlp is not None
+    assert len(model.tandem_mlp_blocks) == 1
+    # Forward composes (per-position workhorse + conv'd trunk + 3-way gate).
+    x = torch.randint(1, 256, (2, 64))
+    out = model.tandem_step(x, aux_query_pos=torch.tensor([63, 40]))
+    assert out["gate"].shape == (2, 64, 3)
+
+
+def test_cli_front_end_and_mlp_depth() -> None:
+    """--front-end / --mlp-depth flow into the run config; omitted -> the shipped backbone."""
+    cfg, _, _ = _build_run_config(["--mlp", "--front-end", "multiscale_conv", "--mlp-depth", "2"])
+    assert cfg.mlp_enabled is True
+    assert cfg.front_end == "multiscale_conv"
+    assert cfg.mlp_depth == 2
+    default_cfg, _, _ = _build_run_config([])
+    assert default_cfg.front_end == "none" and default_cfg.mlp_depth == 1
+
+
+# ---------------------------------------------------------------------------
+# WORKHORSE-ONLY conv scope (card b1926d5d, coordinator range-separation variant)
+# ---------------------------------------------------------------------------
+
+
+def test_front_end_workhorse_only_default_false() -> None:
+    assert ModelConfig().front_end_workhorse_only is False
+
+
+def test_front_end_workhorse_only_isolates_conv_to_the_workhorse() -> None:
+    """Workhorse-only scope: the conv feeds ONLY the MLP workhorse — perturbing the conv
+    weights leaves the MEMORY pathway (memory_forward) EXACTLY unchanged (it reads raw
+    h_embed) while changing the full 3-way forward (the workhorse consumes the conv)."""
+    torch.manual_seed(0)
+    wh = build_model(_full_cfg(_on3_cfg(
+        front_end="multiscale_conv", front_end_workhorse_only=True,
+    )))
+    assert wh.front_end is not None
+    wh.eval()
+    x = torch.randint(1, 256, (2, 24))
+    with torch.no_grad():
+        _, mem0 = wh.memory_forward(x, return_states=False)
+        _, full0 = wh(x)
+        for p in wh.front_end.parameters():  # perturb the conv weights
+            p.add_(1.0)
+        _, mem1 = wh.memory_forward(x, return_states=False)
+        _, full1 = wh(x)
+    assert torch.equal(mem0, mem1), "workhorse-only: the memory pathway must NOT see the conv"
+    assert not torch.equal(full0, full1), "workhorse-only: the workhorse must consume the conv"
+
+
+def test_front_end_conv_all_feeds_the_memory_pathway() -> None:
+    """Contrast: in the default (conv-all) scope the conv DOES feed the memory pathway —
+    perturbing the conv weights changes memory_forward.  This pins the scope routing."""
+    torch.manual_seed(0)
+    allc = build_model(_full_cfg(_on3_cfg(front_end="multiscale_conv")))  # workhorse_only=False
+    assert allc.front_end is not None
+    allc.eval()
+    x = torch.randint(1, 256, (2, 24))
+    with torch.no_grad():
+        _, mem0 = allc.memory_forward(x, return_states=False)
+        for p in allc.front_end.parameters():
+            p.add_(1.0)
+        _, mem1 = allc.memory_forward(x, return_states=False)
+    assert not torch.equal(mem0, mem1), "conv-all: the memory pathway must see the conv"
+
+
+def test_front_end_workhorse_only_lm_leak_probe_exactly_zero() -> None:
+    """Routing the conv to the workhorse only stays EXACTLY causal (per-position workhorse)."""
+    torch.manual_seed(0)
+    wh = build_model(_full_cfg(_on3_cfg(
+        front_end="multiscale_conv", front_end_workhorse_only=True,
+        tandem_mlp_depth=2, reasoning_segment_len=64,
+    )))
+    x = torch.randint(1, 256, (2, 48))
+    max_diff = _lm_leak_maxdiff(wh, x, t_pert=17)
+    assert max_diff == 0.0, f"workhorse-only conv LM leak: max|Δ| at <=t = {max_diff:.3e} != 0.0"
+
+
+def test_front_end_workhorse_only_is_noop_without_conv() -> None:
+    """The flag alone (front_end='none') builds/behaves byte-for-byte like the shipped 3-way."""
+    torch.manual_seed(3)
+    a = build_model(_full_cfg(_on3_cfg()))
+    torch.manual_seed(3)
+    b = build_model(_full_cfg(_on3_cfg(front_end_workhorse_only=True)))
+    assert set(a.state_dict()) == set(b.state_dict())
+    assert a.num_parameters() == b.num_parameters()
+    a.eval()
+    b.eval()
+    x = torch.randint(1, 256, (2, 24))
+    with torch.no_grad():
+        _, la = a(x)
+        _, lb = b(x)
+    assert torch.equal(la, lb), "front_end_workhorse_only is not a no-op when front_end='none'"
+
+
+def test_cli_front_end_workhorse_only() -> None:
+    cfg, _, _ = _build_run_config(
+        ["--mlp", "--front-end", "multiscale_conv", "--front-end-workhorse-only"]
+    )
+    assert cfg.front_end == "multiscale_conv" and cfg.front_end_workhorse_only is True
+    default_cfg, _, _ = _build_run_config([])
+    assert default_cfg.front_end_workhorse_only is False
+
+
+# ---------------------------------------------------------------------------
+# Identity-init conv front-end (card b1926d5d, coordinator: exact pass-through @ step 0)
+# ---------------------------------------------------------------------------
+
+
+def test_conv_identity_init_default_false() -> None:
+    assert ModelConfig().conv_identity_init is False
+
+
+def test_conv_identity_init_is_exact_pass_through_at_init() -> None:
+    """With conv_identity_init the front-end returns the raw embedding EXACTLY at step 0 —
+    the zero-init-superset pattern (enabling the conv == the no-front-end backbone at init)."""
+    torch.manual_seed(0)
+    m = build_model(_full_cfg(_on3_cfg(
+        front_end="multiscale_conv", conv_identity_init=True,
+    )))
+    assert m.front_end is not None
+    m.eval()
+    x = torch.randint(1, 256, (2, 24))
+    with torch.no_grad():
+        raw = m.embed_drop(m.embed(x))          # the raw embedding (dropout off in eval)
+        fe_out = m.front_end(raw)
+    assert torch.allclose(fe_out, raw, atol=1e-6), (
+        "identity-init front-end is not an exact pass-through of the raw embedding at init"
+    )
+
+
+def test_conv_identity_init_soft_select_is_near_exact_pass_through() -> None:
+    """The soft_select condense identity-init is NEAR-exact (a near-one-hot softmax puts
+    ~all mass on the identity scale, leaking ~e^-20 of the random scales) — looser bound
+    than the bit-exact concat_proj branch, by construction."""
+    torch.manual_seed(1)
+    m = build_model(_full_cfg(_on3_cfg(
+        front_end="multiscale_conv", conv_identity_init=True, conv_condense="soft_select",
+    )))
+    assert m.front_end is not None
+    m.eval()
+    x = torch.randint(1, 256, (2, 24))
+    with torch.no_grad():
+        raw = m.embed_drop(m.embed(x))
+        fe_out = m.front_end(raw)
+    assert torch.allclose(fe_out, raw, atol=1e-5), (
+        "identity-init soft_select front-end drifted beyond the near-one-hot leak bound"
+    )
+
+
+def test_conv_identity_init_noop_without_front_end() -> None:
+    """The flag with front_end='none' is byte-for-byte the shipped 3-way (nothing to init)."""
+    torch.manual_seed(3)
+    a = build_model(_full_cfg(_on3_cfg()))
+    torch.manual_seed(3)
+    b = build_model(_full_cfg(_on3_cfg(conv_identity_init=True)))
+    assert set(a.state_dict()) == set(b.state_dict())
+    a.eval()
+    b.eval()
+    x = torch.randint(1, 256, (2, 20))
+    with torch.no_grad():
+        _, la = a(x)
+        _, lb = b(x)
+    assert torch.equal(la, lb)
+
+
+def test_conv_identity_init_lm_leak_probe_exactly_zero() -> None:
+    torch.manual_seed(0)
+    m = build_model(_full_cfg(_on3_cfg(
+        front_end="multiscale_conv", conv_identity_init=True, reasoning_segment_len=64,
+    )))
+    x = torch.randint(1, 256, (2, 48))
+    max_diff = _lm_leak_maxdiff(m, x, t_pert=15)
+    assert max_diff == 0.0, f"identity-init conv LM leak: max|Δ| at <=t = {max_diff:.3e} != 0.0"
+
+
+def test_cli_conv_identity_init() -> None:
+    cfg, _, _ = _build_run_config(
+        ["--mlp", "--front-end", "multiscale_conv", "--conv-identity-init"]
+    )
+    assert cfg.front_end == "multiscale_conv" and cfg.conv_identity_init is True
+    default_cfg, _, _ = _build_run_config([])
+    assert default_cfg.conv_identity_init is False

@@ -72,6 +72,16 @@ def _reasoning_and_routing(
     if not getattr(cfg.model, "tandem_enabled", False):
         return None, None
 
+    # Stacked-tandem models (card d05da2db) route the LM through the stacked blocks, NOT the
+    # single-fusion ``tandem_step`` that ``_eval_M`` / ``_eval_R_depth`` drive (those would raise
+    # for a stacked model, whose ``causal_reasoner is None``).  Report the STACKED per-block gate
+    # fractions as routing health so periodic reports reflect the stacked gates.  The in-model
+    # reasoning-depth accuracy for a stacked model would need the compositional-task harness via
+    # ``stacked_step``; that is deferred to the rung-1 card (minimal here, not gold-plated).
+    stacked_blocks = getattr(model, "stacked_blocks", None)
+    if stacked_blocks is not None and len(stacked_blocks) > 0:
+        return None, _stacked_routing_health(model, cfg, seed=seed, device=device)
+
     # Deferred import: avoids a module-level dependency from eval/ (imported early,
     # e.g. by scripts/eval.py) onto the heavier train/tandem.py (which pulls in
     # graph_llm.models + the data pipelines) for callers that never need this path.
@@ -98,6 +108,35 @@ def _reasoning_and_routing(
         reasoning[f"D{depth}"] = acc_d
         routing[f"D{depth}"] = _gate_to_jsonable(gate_d)
     return reasoning, routing
+
+
+def _stacked_routing_health(
+    model: nn.Module,
+    cfg: Config,
+    *,
+    seed: int,
+    device: torch.device,
+    batch: int = 16,
+) -> dict[str, Any]:
+    """Per-block gate fractions ``[mem, reason, mlp]`` for a stacked-tandem model (card d05da2db).
+
+    A coarse routing-health probe: run the stacked LM forward on a fresh random-byte batch (one
+    reasoner window) and average each block's per-position 3-way gate.  Uses a DEDICATED generator
+    so it never perturbs the caller's RNG (``build_eval_report`` additionally snapshots/restores
+    the global RNG).  A typed / real-corpus batch would be more informative — deferred to the
+    rung-1 card.  Returns ``{"block0": [mem, reason, mlp], ...}``.
+    """
+    from graph_llm.models.delta_memory_lm import (
+        DeltaMemoryLM,  # noqa: PLC0415 — deferred (see above)
+    )
+
+    assert isinstance(model, DeltaMemoryLM)
+    length = int(getattr(cfg.model, "reasoning_segment_len", 64))
+    vocab = int(cfg.model.vocab_size)
+    gen = torch.Generator().manual_seed(seed)
+    x = torch.randint(1, vocab, (batch, length), generator=gen).to(device)
+    fractions = model.stacked_lm_gate_fractions(x)  # list of (3,) per block
+    return {f"block{i}": f.detach().cpu().tolist() for i, f in enumerate(fractions)}
 
 
 def _gate_to_jsonable(gate: Any) -> Any:

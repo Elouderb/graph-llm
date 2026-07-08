@@ -190,8 +190,24 @@ class DeltaMemoryLM(nn.Module):
         # all pathways (the committed default) when False.
         self._front_end_workhorse_only = bool(getattr(m, "front_end_workhorse_only", False))
 
-        # Depth-scalable stack of delta-memory blocks.
-        self.blocks = nn.ModuleList([DeltaMemoryBlock(m) for _ in range(m.delta_layers)])
+        # Stacked-tandem mode (tandem_enabled + tandem_blocks>=2, cards 3ac77deb + d05da2db):
+        # a VERTICAL stack of whole tandem blocks, each owning its OWN delta memory.  In that
+        # mode the OUTER delta backbone (``self.blocks``) is UNUSED on every path — both
+        # ``stacked_step`` (tandem trainer) and the stacked LM forward (``_stacked_lm_forward``,
+        # the SegmentedTrainer / real-corpus path) drive ``self.stacked_blocks`` instead — so it
+        # is NOT built here (an honest param budget for the stacked rung; ``delta_layers`` is
+        # inert in stacked mode).  For the NON-stacked configs (default / tandem off /
+        # tandem_blocks=1) the backbone is built EXACTLY as before -> byte-for-byte construction
+        # + RNG.  (This shifts the stacked-config construction RNG relative to a build that also
+        # allocated the dead backbone, which is acceptable: there is no committed stacked
+        # checkpoint and stacked routing is trained from scratch.)
+        self._stacked_mode = bool(getattr(m, "tandem_enabled", False)) and (
+            int(getattr(m, "tandem_blocks", 1)) >= 2
+        )
+        # Depth-scalable stack of delta-memory blocks (the MEMORY backbone).
+        self.blocks = nn.ModuleList(
+            [] if self._stacked_mode else [DeltaMemoryBlock(m) for _ in range(m.delta_layers)]
+        )
 
         # Optional transient reasoning field (card 9907dc9e): the R2-validated
         # iterated 2-D reasoner, run INDEPENDENTLY per position (seeded from h_t
@@ -558,6 +574,19 @@ class DeltaMemoryLM(nn.Module):
         ``None`` unless the tandem is enabled; the OFF path (``causal_reasoner is
         None``) is byte-for-byte the committed backbone.
         """
+        # Stacked-tandem LM path (card d05da2db): when the vertical stack is built the plain
+        # LM forward runs the stacked blocks per position (memory || reasoner || workhorse ->
+        # 3-way gate) so the SegmentedTrainer / real-corpus path actually TRAINS them (rather
+        # than the OFF backbone below, which is what made every stacked block dead weight).
+        # The single-fusion / OFF backbone below is untouched (byte-for-byte).  ``gate``/``aux``
+        # stay ``None`` here (the stacked gates are per-block; the eval harness reads them via
+        # ``stacked_lm_gate_fractions``).
+        if len(self.stacked_blocks) > 0:
+            loss, logits, states_out = self._stacked_lm_forward(
+                x, targets, states_in, return_states
+            )
+            return loss, logits, states_out, None, None
+
         h_embed = self.embed_drop(self.embed(x))
         # Optional cheap local combiner (card ed853f9c): enrich each token with
         # multi-scale causal local context before the memory layers.  ``None`` when
@@ -768,12 +797,14 @@ class DeltaMemoryLM(nn.Module):
                 cross-entropy loss is computed over the full sequence; if
                 ``None`` a zero loss tensor is returned (eval / generation).
             states_in: Optional list of per-block carried
-                :class:`DeltaMemoryState` (length = ``delta_layers``) or ``None``
-                to reset that block.  Enables cross-segment persistence (cards
-                61f900ca + 571d50ec): seed each block's memory matrix AND its
-                causal-conv tail from the previous segment's final state.  Default
-                ``None`` resets every block — byte-for-byte the committed
-                within-sequence behaviour when the conv is disabled.
+                :class:`DeltaMemoryState` or ``None`` to reset that block.  The list
+                length is ``delta_layers`` for the standard backbone; in stacked mode
+                (``tandem_blocks >= 2``, card d05da2db) it is one state PER STACKED BLOCK
+                (``len(self.stacked_blocks)``).  Enables cross-segment persistence (cards
+                61f900ca + 571d50ec): seed each block's memory matrix AND its causal-conv
+                tail from the previous segment's final state.  Default ``None`` resets every
+                block — byte-for-byte the committed within-sequence behaviour when the conv
+                is disabled.
             return_states: When ``True`` the per-block final states are returned
                 as a third element so they can be threaded into the next segment.
 
@@ -820,6 +851,14 @@ class DeltaMemoryLM(nn.Module):
         unaffected by the gate, so this yields the identical ``states_out``.  Same
         return contract as :meth:`forward`.
         """
+        if len(self.stacked_blocks) > 0:
+            # The stacked LM route in _forward_impl runs before the memory_only branch
+            # and would silently ignore the flag (running the FULL stacked fusion, not
+            # the cheap memory-only pass) — fail loudly instead of quietly overpaying.
+            raise RuntimeError(
+                "memory_forward is not supported for stacked models (tandem_blocks >= 2); "
+                "the stacked LM forward has no memory-only fast path yet."
+            )
         loss, logits, states_out, _g, _a = self._forward_impl(
             x, None, states_in, return_states, memory_only=True
         )
@@ -965,6 +1004,86 @@ class DeltaMemoryLM(nn.Module):
         if self.training:
             self._tandem_step += 1
         return {"logits": logits, "gates": gates, "aux": final_aux, "step": step}
+
+    def _run_stacked_blocks(
+        self,
+        h: Tensor,
+        raw_tokens: Tensor,
+        states_in: list[DeltaMemoryState] | None,
+    ) -> tuple[Tensor, list[DeltaMemoryState], list[Tensor]]:
+        """Drive the N stacked blocks left-to-right on the FULL sequence (card d05da2db).
+
+        Block N's fused per-position output is block N+1's input stream; each block carries
+        its OWN cross-segment :class:`DeltaMemoryState` (seeded from ``states_in[bi]``, or reset
+        when ``states_in`` is ``None``).  Optional bounded readback re-grounds block-1's input
+        in the bottom embeddings ``h`` (strictly-causal window -> leak-free).  Returns
+        ``(final_hidden, states_out, gates)`` with one final state + one ``(B, T, 3)`` gate per
+        block.
+        """
+        emb = h  # bottom (front-end) embeddings — the readback K/V stream.
+        states_out: list[DeltaMemoryState] = []
+        gates: list[Tensor] = []
+        last = len(self.stacked_blocks) - 1
+        for bi, blk in enumerate(self.stacked_blocks):
+            assert isinstance(blk, StackedTandemBlock)
+            state_in = states_in[bi] if states_in is not None else None
+            h, w, state_out = blk.lm_forward(h, raw_tokens, state_in=state_in)
+            states_out.append(state_out)
+            gates.append(w)
+            # Bounded readback between block 0 and block 1 (full sequence, strictly causal).
+            if self.readback is not None and bi == 0 and last >= 1:
+                h = h + self.readback(h, emb)
+        return h, states_out, gates
+
+    def _stacked_lm_forward(
+        self,
+        x: Tensor,
+        targets: Tensor | None,
+        states_in: list[DeltaMemoryState] | None,
+        return_states: bool,
+    ) -> tuple[Tensor, Tensor, list[DeltaMemoryState] | None]:
+        """Plain LM forward for the stacked-tandem stack (card d05da2db).
+
+        Embeds the tokens (+ optional causal conv front-end) ONCE at the bottom, runs the N
+        stacked blocks per position (memory || reasoner || workhorse -> gate), and feeds the
+        FINAL block's fused hidden to ``norm_out`` + the (untied) ``lm_head`` at every position.
+        Each block carries its OWN cross-segment :class:`DeltaMemoryState`; the state list for
+        stacked mode has one entry PER BLOCK (length = ``len(self.stacked_blocks)``), threaded by
+        the SegmentedTrainer exactly like the non-stacked per-layer list (it rides the same
+        ``detach_states`` / ``perturb_states`` machinery unchanged).  This is the path that makes
+        the SegmentedTrainer / real-corpus LM actually train the stacked blocks.
+
+        Cross-segment carry is EXACT (segmented == full) for ``front_end="none"`` +
+        ``tandem_readback=False`` when ``segment_len == reasoning_segment_len`` (the reasoner's
+        window boundaries then coincide with the segment boundaries, and each block's memory
+        carries its matrix + conv tail).  The multiscale-conv front-end (left-zero-pads each
+        call) and the bounded readback (no carried K/V) do NOT carry across segment boundaries —
+        the same documented limitation as the single-fusion conv path.
+        """
+        raw_tokens = x
+        h = self._stacked_embed(x)  # (B, T, d): embed + optional causal conv front-end
+        h, states_out, _gates = self._run_stacked_blocks(h, raw_tokens, states_in)
+        logits = self.lm_head(self.norm_out(h))
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, self.vocab_size), targets.reshape(-1))
+        else:
+            loss = torch.zeros(1, device=x.device)
+        return loss, logits, (states_out if return_states else None)
+
+    @torch.no_grad()
+    def stacked_lm_gate_fractions(self, x: Tensor) -> list[Tensor]:
+        """Per-block mean gate distribution ``[mem, reason, mlp]`` over an LM batch (card d05da2db).
+
+        Runs the stacked LM forward (fresh per-block memory) on ``x (B, T)`` and averages each
+        block's per-position 3-way gate over all ``(B, T)`` positions -> one ``(3,)`` tensor per
+        block.  Read by the eval report's stacked routing-health branch so periodic reports show
+        the STACKED gate fractions.  Requires the stacked stack (``tandem_blocks >= 2``).
+        """
+        if len(self.stacked_blocks) == 0:
+            raise RuntimeError("stacked_lm_gate_fractions requires tandem_blocks >= 2.")
+        h = self._stacked_embed(x)
+        _h, _states, gates = self._run_stacked_blocks(h, x, None)
+        return [w.reshape(-1, 3).mean(dim=0) for w in gates]
 
     def num_parameters(self, trainable_only: bool = True) -> int:
         """Return total (or trainable-only) parameter count."""

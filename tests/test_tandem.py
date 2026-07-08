@@ -36,6 +36,7 @@ import graph_llm.models  # noqa: F401 — registers "delta_memory_lm" (+ baselin
 from graph_llm.config import Config, DataConfig, ModelConfig, TrainConfig
 from graph_llm.models import build_model
 from graph_llm.models.components.causal_reasoner import CausalReasoner
+from graph_llm.models.components.delta_memory import DeltaMemoryState
 from graph_llm.models.components.stacked_tandem import ComposableCausalReasoner
 from graph_llm.train.tandem import (
     TandemConfig,
@@ -1397,6 +1398,15 @@ def test_stacked_builds_blocks_not_single_fusion() -> None:
     assert blk.gate.in_features == 4 * on.d_model
 
 
+def test_stacked_memory_forward_raises() -> None:
+    """memory_forward has no stacked fast path — it must fail loudly, not silently run
+    the full stacked fusion (the memory_only flag would be dropped by the stacked route)."""
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2)))
+    x = torch.randint(1, 256, (2, 16))
+    with pytest.raises(RuntimeError, match="stacked"):
+        on.memory_forward(x)
+
+
 def test_stacked_step_shapes() -> None:
     """stacked_step returns per-example answer logits + one (B,3) gate per block + aux."""
     torch.manual_seed(0)
@@ -1755,11 +1765,11 @@ def test_stacked_block_forget_gate_remember_by_default_init() -> None:
         )
         alpha = torch.exp(-torch.nn.functional.softplus(bias))
         assert bool((alpha > 0.9).all()), f"remember-by-default broken (alpha={alpha.tolist()})"
-    # The outer backbone (self.blocks) still gets the same correction.
-    for b in m.blocks:
-        if b.mixer.alpha_proj is not None:
-            ob = b.mixer.alpha_proj.bias.detach()
-            assert torch.allclose(ob, torch.full_like(ob, -4.0))
+    # DEAD-OUTER-STACK decision (card d05da2db): in stacked mode the outer delta backbone
+    # (self.blocks) is NOT built — both stacked paths (stacked_step + the LM forward) drive the
+    # per-block memories above — so there is no outer backbone to correct (and no dead params).
+    assert len(m.blocks) == 0, "the outer delta backbone must not be built in stacked mode"
+    assert not any(k.startswith("blocks.") for k in m.state_dict())
 
 
 def test_stacked_block_forget_gate_honours_configured_bias() -> None:
@@ -1881,3 +1891,248 @@ def test_composable_reasoner_hidden_input_matches_shared_walk() -> None:
         comp, _ = r.query_forward_composed(h, qpos, torch.zeros(b, 24), steps=4, hidden_input=True)
     assert isinstance(base, torch.Tensor)
     assert torch.allclose(base, comp, atol=1e-6)
+
+
+# ===========================================================================================
+# STACKED LM FORWARD (card d05da2db): the plain forward() drives the stacked blocks per
+# position over the full sequence, so the SegmentedTrainer / real-corpus path trains them.
+# ===========================================================================================
+
+
+def _stacked_lm_leak_maxdiff(
+    model: torch.nn.Module, x: torch.Tensor, cut: int, reps: int = 6
+) -> float:
+    """Max |Δ logits| at positions <= ``cut`` when every token > ``cut`` is perturbed — the
+    plain-forward (per-position, full-sequence) stacked LM leak probe."""
+    model.eval()
+    with torch.no_grad():
+        _loss, base = model(x)
+    g = torch.Generator().manual_seed(20260707)
+    b, t = x.shape
+    md = 0.0
+    for _ in range(reps):
+        x2 = x.clone()
+        x2[:, cut + 1 :] = torch.randint(1, 256, (b, t - cut - 1), generator=g)
+        with torch.no_grad():
+            _loss2, pert = model(x2)
+        md = max(md, (base[:, : cut + 1] - pert[:, : cut + 1]).abs().max().item())
+    return md
+
+
+def test_stacked_lm_forward_shapes_and_state_list() -> None:
+    """The plain forward returns full-sequence (B, T, vocab) logits AND (with return_states) a
+    per-BLOCK state list (length = n_blocks, not delta_layers) — the stacked carry contract."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=3, reasoning_segment_len=64)))
+    on.eval()
+    x = torch.randint(1, 256, (2, 40))
+    with torch.no_grad():
+        loss, logits = on(x)
+        assert logits.shape == (2, 40, on.vocab_size)
+        tgt = torch.randint(0, 256, (2, 40))
+        loss2, logits2, states = on(x, tgt, None, True)
+    assert torch.isfinite(loss2)
+    assert len(states) == 3, "stacked state list must have one entry per stacked block"
+    assert all(isinstance(s, DeltaMemoryState) for s in states)
+
+
+def test_stacked_mode_omits_outer_backbone_but_lm_forward_works() -> None:
+    """DEAD-OUTER-STACK (card d05da2db): the outer delta backbone is NOT built in stacked mode
+    (no dead params / state_dict keys), yet the plain LM forward AND stacked_step both work —
+    proving self.blocks was genuinely unused on both stacked paths."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2)))
+    assert len(on.blocks) == 0
+    assert not any(k.startswith("blocks.") for k in on.state_dict())
+    on.eval()
+    x = torch.randint(1, 256, (2, 32))
+    with torch.no_grad():
+        _loss, logits = on(x)
+    assert logits.shape == (2, 32, on.vocab_size) and torch.isfinite(logits).all()
+    # stacked_step (the tandem-trainer path) still functions with no outer backbone.
+    seg = torch.randint(1, 256, (2, 2, 24))
+    with torch.no_grad():
+        out = on.stacked_step(seg, 1, torch.tensor([15, 15]), steps=4)
+    assert out["logits"].shape == (2, on.vocab_size)
+
+
+def test_stacked_lm_forward_leak_probe_exactly_zero() -> None:
+    """Perturbing tokens > t leaves the plain-forward logits at positions <= t EXACTLY
+    unchanged (0.0): memory recurrence + windowed causal reasoner + per-position gate."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2, reasoning_segment_len=64)))
+    x = torch.randint(1, 256, (2, 48))
+    assert _stacked_lm_leak_maxdiff(on, x, cut=20) == 0.0
+
+
+def test_stacked_lm_forward_leak_probe_conv_front_end_exactly_zero() -> None:
+    """The stacked LM forward + the causal multiscale-conv front-end stays EXACTLY causal."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, reasoning_segment_len=64, front_end="multiscale_conv",
+        conv_identity_init=True,
+    )))
+    assert on.front_end is not None
+    x = torch.randint(1, 256, (2, 48))
+    assert _stacked_lm_leak_maxdiff(on, x, cut=19) == 0.0
+
+
+def test_stacked_lm_forward_leak_probe_readback_exactly_zero() -> None:
+    """The stacked LM forward + the bounded readback stays EXACTLY causal (readback is a
+    strictly-causal windowed cross-attention over the FULL sequence)."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, reasoning_segment_len=64, tandem_readback=True,
+        tandem_readback_window=16, tandem_readback_heads=2,
+    )))
+    assert on.readback is not None
+    x = torch.randint(1, 256, (2, 48))
+    assert _stacked_lm_leak_maxdiff(on, x, cut=22) == 0.0
+
+
+def test_stacked_lm_forward_leak_probe_multiwindow_exactly_zero() -> None:
+    """Leak-free even when T spans MULTIPLE reasoner windows (the free-running LM regime):
+    each window is independent + causal, so a later window never leaks into an earlier one."""
+    torch.manual_seed(1)
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, reasoning_segment_len=16, max_seq_len=128,
+        front_end="multiscale_conv", conv_identity_init=True,
+    )))
+    x = torch.randint(1, 256, (2, 100))
+    assert _stacked_lm_leak_maxdiff(on, x, cut=37) == 0.0
+
+
+def test_stacked_lm_segmented_equals_full() -> None:
+    """Segmented == full EXACT for the stacked LM path (front_end none, readback off,
+    segment_len == reasoning_segment_len): N carried segments == one full-sequence forward,
+    matching the delta contract (each block carries its matrix + conv tail)."""
+    torch.manual_seed(0)
+    length = 16
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, reasoning_segment_len=length, segment_len=length,
+        front_end="none", tandem_readback=False, max_seq_len=64,
+    )))
+    on.eval()
+    n_seg = 3
+    x = torch.randint(1, 256, (2, n_seg * length))
+    with torch.no_grad():
+        _l, full_logits, _fs = on(x, None, None, True)
+        states: Any = None
+        seg_logits = []
+        for i in range(n_seg):
+            _ls, lg, states = on(x[:, i * length : (i + 1) * length], None, states, True)
+            seg_logits.append(lg)
+        seg_cat = torch.cat(seg_logits, dim=1)
+    assert seg_cat.shape == full_logits.shape
+    assert torch.allclose(full_logits, seg_cat, atol=1e-5), (
+        f"segmented-with-carry != full stacked LM (max Δ ="
+        f" {(full_logits - seg_cat).abs().max().item():.2e})"
+    )
+
+
+def test_stacked_lm_states_carry_across_segments() -> None:
+    """Each stacked block's OWN memory bridges segments on the LM path: perturbing an earlier
+    carried segment changes a later segment's prediction (the carry actually transports info)."""
+    torch.manual_seed(0)
+    length = 16
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, reasoning_segment_len=length, segment_len=length, max_seq_len=64,
+    )))
+    on.eval()
+    early = torch.randint(1, 256, (2, length))
+    later = torch.randint(1, 256, (2, length))
+    with torch.no_grad():
+        _l0, _lg0, st = on(early, None, None, True)
+        _l1, base_later, _st1 = on(later, None, st, True)
+        early2 = torch.randint(1, 256, (2, length))
+        _l0b, _lg0b, st2 = on(early2, None, None, True)
+        _l1b, pert_later, _st2b = on(later, None, st2, True)
+    assert (base_later - pert_later).abs().max().item() > 0.0, "carried state never reached later seg"
+
+
+def test_stacked_lm_forward_grads_reach_every_submodule() -> None:
+    """Criterion 4: one LM forward+backward sends nonzero grads to EVERY stacked submodule —
+    each block's memory, reasoner (incl. the interposed zero-init seed_ctx_proj), workhorse,
+    and gate."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2, reasoning_segment_len=64)))
+    on.train()
+    x = torch.randint(1, 256, (4, 40))
+    tgt = torch.randint(0, 256, (4, 40))
+    loss, _logits = on(x, tgt)
+    loss.backward()
+
+    def _live(mod: torch.nn.Module) -> bool:
+        return any(
+            p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
+            for p in mod.parameters()
+            if p.requires_grad
+        )
+
+    for i, blk in enumerate(on.stacked_blocks):
+        assert _live(blk.mem), f"no grad reached block {i} memory"
+        assert _live(blk.mlp), f"no grad reached block {i} workhorse"
+        assert _live(blk.gate), f"no grad reached block {i} gate"
+        assert blk.reasoner is not None and _live(blk.reasoner), f"no grad reached block {i} reasoner"
+        # the interposed identity-init composition projection must also earn gradient.
+        assert _live(blk.reasoner.seed_ctx_proj), f"no grad reached block {i} seed_ctx_proj"
+
+
+def test_stacked_lm_forward_readback_opens_under_training() -> None:
+    """Readback on the LM path is learnable, not a dead-gradient trap: alpha (init 0) has a
+    live grad after one LM backward, and once alpha moves off 0 the q/k/v/o projections receive
+    gradient too (the same sequential-opening doctrine as the stacked_step readback test)."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, reasoning_segment_len=64, tandem_readback=True,
+        tandem_readback_window=16, tandem_readback_heads=2,
+    )))
+    assert on.readback is not None
+    on.train()
+    x = torch.randint(1, 256, (2, 40))
+    tgt = torch.randint(0, 256, (2, 40))
+    on(x, tgt)[0].backward()
+    assert on.readback.alpha.grad is not None
+    assert float(on.readback.alpha.grad.abs().sum()) > 0.0, "alpha grad is zero -> dead readback"
+
+    def _gsum(mod: torch.nn.Module) -> float:
+        return sum(float(p.grad.abs().sum()) for p in mod.parameters() if p.grad is not None)
+
+    opt = torch.optim.SGD(on.readback.parameters(), lr=1.0)
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+    on.zero_grad(set_to_none=True)
+    on(x, tgt)[0].backward()
+    assert _gsum(on.readback.q_proj) > 0.0
+    assert _gsum(on.readback.k_proj) > 0.0
+    assert _gsum(on.readback.v_proj) > 0.0
+    assert _gsum(on.readback.o_proj) > 0.0
+
+
+def test_stacked_lm_gate_fractions_report() -> None:
+    """stacked_lm_gate_fractions returns one normalised (3,) [mem, reason, mlp] per block — the
+    routing-health signal the eval report surfaces for stacked models."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=3, reasoning_segment_len=32)))
+    on.eval()
+    x = torch.randint(1, 256, (4, 32))
+    fr = on.stacked_lm_gate_fractions(x)
+    assert len(fr) == 3
+    for f in fr:
+        assert f.shape == (3,)
+        assert torch.allclose(f.sum(), torch.tensor(1.0), atol=1e-5)
+
+
+def test_stacked_lm_forward_composed_zero_ctx_is_identity() -> None:
+    """The full-sequence forward_composed with the zero-init seed_ctx_proj == the shipped
+    windowed forward (composition channel closed at init — the identity-init doctrine, full path)."""
+    torch.manual_seed(0)
+    cfg = _on_cfg(d_model=24, reasoning_segment_len=16, causal_reasoner_steps=4)
+    r = ComposableCausalReasoner(cfg)
+    r.eval()
+    x = torch.randint(1, 256, (2, 40))  # spans multiple windows
+    with torch.no_grad():
+        base = r.forward(x, steps=4)
+        comp = r.forward_composed(x, seed_ctx=torch.randn(2, 40, 24), steps=4)
+    assert isinstance(base, torch.Tensor)
+    assert torch.equal(base, comp), "forward_composed(seed_ctx) != base forward at zero-init"

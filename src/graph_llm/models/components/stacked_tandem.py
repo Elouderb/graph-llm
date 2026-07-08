@@ -135,6 +135,35 @@ class ComposableCausalReasoner(CausalReasoner):
         assert isinstance(result, Tensor)
         return result, {"seed_logits": None, "walk_w": None}
 
+    def forward_composed(
+        self,
+        x: Tensor,
+        seed_ctx: Tensor,
+        steps: int | None = None,
+        hidden_input: bool = False,
+    ) -> Tensor:
+        """Full per-position locate-then-walk with the hidden-derived composition seed (LM path).
+
+        The full-sequence twin of :meth:`query_forward_composed` for the plain LM forward
+        (card d05da2db): EVERY position predicts, so every position needs a reasoning hidden.
+        ``seed_ctx`` is the BLOCK HIDDEN ``(B, T, d)`` (an earlier block's memory writes the
+        retrieved head there for the compositional type); it is projected PER POSITION to
+        ``(B, T, d_key)`` by the ZERO-INIT ``seed_ctx_proj`` and threaded into the base
+        :meth:`CausalReasoner.forward` seed via the ``seed_ctx_add`` hook — additive and inert
+        at step 0, so at init the composed walk == the shipped windowed walk (pinned by a test).
+        ``hidden_input`` addresses the grounded block hidden ``x (B, T, d)`` instead of raw
+        token ids (the ``reason_reads_hidden`` variant).
+
+        Returns ``h_reason (B, T, d_model)``.
+        """
+        seed_ctx_add = self.seed_ctx_proj(seed_ctx)  # (B, T, d_key), 0 at init
+        out = self.forward(
+            x, steps=steps, commit_seed=True, hidden_input=hidden_input,
+            seed_ctx_add=seed_ctx_add,
+        )
+        assert isinstance(out, Tensor)
+        return out
+
 
 class StackedTandemBlock(nn.Module):
     """{memory || reasoner(raw tokens) || workhorse -> 3-way gated fusion}.
@@ -252,6 +281,67 @@ class StackedTandemBlock(nn.Module):
                 gate_pred = w[ar, pred_pos]
         assert gate_pred is not None
         return fused_seg, gate_pred, aux
+
+    def lm_forward(
+        self,
+        h_in: Tensor,
+        raw_tokens: Tensor,
+        state_in: DeltaMemoryState | None = None,
+        steps: int | None = None,
+    ) -> tuple[Tensor, Tensor, DeltaMemoryState]:
+        """Full-sequence, per-position LM forward of ONE stacked block (card d05da2db).
+
+        Mirrors the single-fusion LM semantics PER BLOCK: memory over the block input
+        (carrying this block's OWN cross-segment :class:`DeltaMemoryState`) || the full
+        per-position causal reasoner (residual) || the per-position workhorse -> a
+        per-position 3-way softmax gate over ``[h_mem ; rea ; h_mlp ; h_in]`` -> the fused
+        per-position hidden that feeds the next block.  Unlike the segment/task-structured
+        :meth:`forward` (reasoner ONLY at ``pred_pos``, identity elsewhere), EVERY position
+        predicts in an LM, so the reasoner runs at every position via the windowed
+        :meth:`CausalReasoner.forward`.  Strictly causal at every position (memory recurrence
+        + windowed causal reasoner + per-position workhorse/gate), so the LM-leak guarantee
+        holds.  DISTINCT from :meth:`forward`/stacked_step, which are left byte-for-byte.
+
+        Args:
+            h_in: ``(B, T, d)`` block input stream (block 0 = the bottom embedding; block
+                i>0 = block i-1's fused output).
+            raw_tokens: ``(B, T)`` raw token ids for the reasoner's own encoder (the RAW
+                surface name structure the walk addresses).
+            state_in: this block's carried :class:`DeltaMemoryState` (matrix + conv tail)
+                from the previous segment, or ``None`` to reset it.
+            steps: walk depth K override (defaults to the reasoner's own ``self.steps``).
+
+        Returns:
+            ``(fused (B, T, d), gate_probs (B, T, 3), state_out)`` — ``state_out`` is this
+            block's final memory state for the next segment; ``gate_probs`` are the soft
+            per-expert weights [mem, reason, mlp] (routing-health reporting).
+        """
+        # MEMORY pathway over the block input, carrying THIS block's cross-segment state
+        # (matrix + conv tail) — the delta contract that makes segmented == full.
+        h_mem, state_out = self.mem(self.mem_norm(h_in), state_in=state_in, return_state=True)
+        # WORKHORSE pathway (per position -> leak-safe).
+        h_mlp = self.mlp(h_in)
+        # REASONER pathway (per position, full windowed walk), added as a residual to the
+        # block input — the LM analogue of ``_pathways``' at-``pred_pos`` residual.
+        if self.reasoner is not None:
+            rin = h_in if self.reason_reads_hidden else raw_tokens
+            h_reason = self.reasoner.forward_composed(
+                rin, seed_ctx=h_in, steps=steps, hidden_input=self.reason_reads_hidden,
+            )
+            rea = h_in + h_reason
+        else:
+            rea = h_in
+        # Per-position 3-way gate + fusion (mirrors ``forward`` WITHOUT the pred_pos gather).
+        logit = self.gate(torch.cat([h_mem, rea, h_mlp, h_in], dim=-1))  # (B, T, 3)
+        if not self.reason_enabled:
+            logit = logit + torch.tensor([0.0, _NEG, 0.0], device=logit.device)
+        w = F.softmax(logit, dim=-1)
+        fused = (
+            w[..., 0:1] * h_mem
+            + w[..., 1:2] * rea
+            + w[..., 2:3] * h_mlp
+        )
+        return fused, w, state_out
 
 
 def _rope_cache(

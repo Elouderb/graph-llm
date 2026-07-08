@@ -451,11 +451,15 @@ class CausalReasoner(nn.Module):
         walk_hard: bool = False,
         gamma_add: float = 0.0,
         clock_period: int | None = None,
+        *,
+        hidden_input: bool = False,
+        seed_ctx_add: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, dict]:
         """Per-position reasoning hidden over segment-bounded windows.
 
         Args:
-            x: ``(B, T)`` token ids.
+            x: ``(B, T)`` token ids, or — when ``hidden_input`` — an already-embedded
+                ``(B, T, d_model)`` hidden stream addressed directly.
             steps: walk depth K for this forward (defaults to ``self.steps``).
             commit_seed: gate the ``hard_seed`` straight-through commit.
             return_aux: also return ``{"seed_logits", "walk_w"}`` gathered at
@@ -471,11 +475,22 @@ class CausalReasoner(nn.Module):
                 (default) leaves the trained sharpen untouched.
             clock_period: EVAL-TIME walk step-clock period (see ``_walk_window``).
                 ``None`` (default) = the shipped stretch-to-fill clock.
+            hidden_input: when True, ``x`` is a GROUNDED hidden stream ``(B, T, d)``
+                addressed directly (the encoder skips the byte embed) — the stacked-
+                tandem ``reason_reads_hidden`` LM variant.  Default False (token ids).
+            seed_ctx_add: optional ``(B, T, d_key)`` tensor ADDED per position to the
+                locate seed query (the stacked-tandem composition channel over the FULL
+                sequence).  Threaded EXACTLY like ``query_forward``'s single-query hook,
+                but per position; chunked into windows alongside ``x``.  Default ``None``
+                (no change — byte-for-byte the shipped windowed walk).
 
         Returns:
             ``h_reason (B, T, d_model)`` or, when ``return_aux``, ``(h_reason, aux)``.
         """
-        b, t = x.shape
+        if hidden_input:
+            b, t = x.shape[0], x.shape[1]
+        else:
+            b, t = x.shape
         k = self.steps if steps is None else steps
         length = self.segment_len
 
@@ -489,6 +504,7 @@ class CausalReasoner(nn.Module):
             out, aux = self._walk_window(
                 x, k, commit_seed, aux_query_pos, tf_seed, collect_aux=return_aux,
                 walk_hard=walk_hard, gamma_add=gamma_add, clock_period=clock_period,
+                hidden_input=hidden_input, seed_ctx_add=seed_ctx_add,
             )
             if return_aux:
                 assert aux is not None
@@ -500,12 +516,25 @@ class CausalReasoner(nn.Module):
         # the window) -> O(K*L)/position, linear in T.
         n_win = (t + length - 1) // length
         pad = n_win * length - t
-        if pad:
-            x = F.pad(x, (0, pad))
-        xw = x.view(b, n_win, length).reshape(b * n_win, length)
+        if hidden_input:
+            d = x.shape[-1]
+            if pad:
+                x = F.pad(x, (0, 0, 0, pad))  # pad the TIME axis of (B, T, d)
+            xw = x.reshape(b, n_win, length, d).reshape(b * n_win, length, d)
+        else:
+            if pad:
+                x = F.pad(x, (0, pad))
+            xw = x.view(b, n_win, length).reshape(b * n_win, length)
+        sca: Tensor | None = None
+        if seed_ctx_add is not None:
+            dk = seed_ctx_add.shape[-1]
+            if pad:
+                seed_ctx_add = F.pad(seed_ctx_add, (0, 0, 0, pad))  # pad the TIME axis
+            sca = seed_ctx_add.reshape(b, n_win, length, dk).reshape(b * n_win, length, dk)
         out, _ = self._walk_window(
             xw, k, commit_seed, aux_query_pos=None, tf_seed=None, collect_aux=False,
             walk_hard=walk_hard, gamma_add=gamma_add, clock_period=clock_period,
+            hidden_input=hidden_input, seed_ctx_add=sca,
         )
         out = out.view(b, n_win, length, self.d_model).reshape(b, n_win * length, self.d_model)
         return out[:, :t]

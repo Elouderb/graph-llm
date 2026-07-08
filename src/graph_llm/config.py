@@ -394,9 +394,13 @@ class ModelConfig:
     # tandem_blocks=1 (default) builds the SHIPPED single-fusion tandem BYTE-FOR-BYTE (no
     # stacked module, no readback, no extra params / RNG draws / state_dict keys) -> a clean
     # default-off flag.  tandem_blocks>=2 requires tandem_enabled=True and builds the stacked
-    # blocks INSTEAD of the single causal_reasoner/gate/mlp; the stacked path is driven by the
-    # separate ``stacked_step`` entry (the plain ``forward`` still returns the memory-backbone
-    # (loss, logits), like ``tandem_step`` for the single tandem).
+    # blocks INSTEAD of the single causal_reasoner/gate/mlp.  Two entry points drive the stack:
+    # ``stacked_step`` (the segment/task-structured tandem-trainer path, reasoner only at the
+    # prediction position) and the plain ``forward`` LM path (card d05da2db, per-position over
+    # the full sequence) that the SegmentedTrainer / real-corpus training uses.  In stacked mode
+    # the OUTER delta backbone (delta_layers ``self.blocks``) is NOT built — it is unused by both
+    # stacked paths (each stacked block owns its own delta memory), so delta_layers is inert in
+    # stacked mode and does not inflate the stacked param budget.
     tandem_blocks: int = 1
     # Inner-block routing mode (mitigation ladder): "mix" (the WINNING arm — every block is a
     # full 3-way tandem, unsupervised inner gate), "share" (inner blocks tie the outer gate's

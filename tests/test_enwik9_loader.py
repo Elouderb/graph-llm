@@ -271,3 +271,13 @@ def test_fetch_enwik9_bytes_extracts_single_member_zip(monkeypatch) -> None:
     monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
     result = _fetch_enwik9_bytes()
     assert result == payload
+
+def test_cache_path_expands_user_home(tmp_path, monkeypatch):
+    """A '~' in data_dir must expand to the real home — an unexpanded tilde silently
+    creates a literal './~' directory in the CWD (found as a stray 954MB dir in the
+    repo root; card d05da2db review note)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = DataConfig(source="enwik9", data_dir="~/graph_llm_cache")
+    path = _cache_path(cfg, "enwik9")
+    assert "~" not in str(path)
+    assert str(path).startswith(str(tmp_path))

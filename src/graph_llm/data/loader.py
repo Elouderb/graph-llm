@@ -431,7 +431,7 @@ def _try_load_enwik8(cfg: DataConfig) -> _TextChunkDataset | None:
     try:
         from datasets import load_dataset  # type: ignore[import-untyped]
 
-        data_dir = Path(cfg.data_dir)
+        data_dir = Path(cfg.data_dir).expanduser()
         cache = str(data_dir / "enwik8_cache")
         ds = load_dataset("enwik8", split="train", cache_dir=cache, trust_remote_code=True)
         # Use first 5 MB for smoke runs
@@ -450,7 +450,7 @@ def _try_load_tinystories(cfg: DataConfig) -> _TextChunkDataset | None:
     try:
         from datasets import load_dataset  # type: ignore[import-untyped]
 
-        data_dir = Path(cfg.data_dir)
+        data_dir = Path(cfg.data_dir).expanduser()
         cache = str(data_dir / "tinystories_cache")
         ds = load_dataset("roneneldan/TinyStories", split="train", cache_dir=cache)
         # Concatenate first 5000 stories
@@ -541,7 +541,7 @@ def canonical_byte_splits(
 
 def _cache_path(cfg: DataConfig, name: str) -> Path:
     """Return the lazy on-disk cache path for a raw corpus dump (gitignored)."""
-    return Path(cfg.data_dir) / f"{name}.bin"
+    return Path(cfg.data_dir).expanduser() / f"{name}.bin"
 
 
 # Known-exact corpus byte sizes (card 69776c3e review, comment 264): checked

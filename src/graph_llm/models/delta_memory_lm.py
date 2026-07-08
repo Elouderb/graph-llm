@@ -49,6 +49,11 @@ from graph_llm.models.components.causal_reasoner import CausalReasoner
 from graph_llm.models.components.delta_memory import DeltaMemoryState, GatedDeltaMemory
 from graph_llm.models.components.multiscale_conv_embed import MultiScaleConvEmbedding
 from graph_llm.models.components.reasoning_field import ReasoningField
+from graph_llm.models.components.stacked_tandem import (
+    ReadbackAttention,
+    StackedTandemBlock,
+    gather_positions,
+)
 from graph_llm.models.registry import get_embedding_init, register_model
 
 if TYPE_CHECKING:
@@ -227,7 +232,19 @@ class DeltaMemoryLM(nn.Module):
         # b1926d5d).  EMPTY (no modules/params/state_dict keys/RNG draws) unless
         # tandem_mlp_depth >= 2 -> the depth-1 / 2-way / OFF states are byte-for-byte.
         self.tandem_mlp_blocks: nn.ModuleList = nn.ModuleList()
-        if getattr(m, "tandem_enabled", False):
+        # Stacked-tandem topology (card 3ac77deb): a VERTICAL stack of N whole tandem
+        # blocks.  EMPTY (no modules / params / state_dict keys / RNG draws) unless
+        # tandem_blocks >= 2 -> the single-fusion / OFF states are byte-for-byte.  When
+        # stacked, the single-fusion causal_reasoner/gate/mlp above are NOT built; the
+        # stack (+ optional readback) is driven by ``stacked_step``.
+        self.stacked_blocks: nn.ModuleList = nn.ModuleList()
+        self.readback: ReadbackAttention | None = None
+        tandem_blocks = int(getattr(m, "tandem_blocks", 1))
+        if getattr(m, "tandem_enabled", False) and tandem_blocks >= 2:
+            self._build_stacked(m, tandem_blocks)
+            self.register_buffer("_tandem_step", torch.zeros((), dtype=torch.long))
+            self._gate_noise_std = m.gate_noise_std
+        elif getattr(m, "tandem_enabled", False):
             self.causal_reasoner = CausalReasoner(m)
             self._tandem_scalar = m.tandem_gate_scalar
             if getattr(m, "tandem_mlp_enabled", False):
@@ -276,6 +293,61 @@ class DeltaMemoryLM(nn.Module):
             init_fn = get_embedding_init(m.embedding_init)
             init_fn(self.embed.weight, m.vocab_size, m.d_model)
 
+        # Bounded readback (card 3ac77deb) is constructed LAST — after ``_init_weights`` +
+        # the embedding hook — so its construction-time RNG never perturbs the deterministic
+        # re-init of the shared embed / delta stack / head.  Combined with its own zero-init
+        # output projection, this makes readback-on == readback-off at step 0 EXACTLY.
+        if len(self.stacked_blocks) > 0 and getattr(m, "tandem_readback", False):
+            self.readback = ReadbackAttention(
+                m.d_model,
+                window=m.tandem_readback_window,
+                n_heads=m.tandem_readback_heads,
+            )
+
+    def _build_stacked(self, m: ModelConfig, n_blocks: int) -> None:
+        """Build the N-block stacked-tandem topology (card 3ac77deb).
+
+        Each block is a whole ``{memory || reasoner || workhorse -> 3-way gate}`` unit;
+        block N's fused output feeds block N+1.  ``stacked_inner_mode``:
+          * ``mix`` (WIN) — every block is a full 3-way tandem (unsupervised inner gate);
+          * ``share`` — inner blocks TIE the outer gate's weights;
+          * ``asym`` — memory+workhorse per block, ONE reasoner in the FINAL block.
+        Optional ``tandem_readback`` inserts the bounded cross-attention readback between
+        block 0 and block 1.  The stacked modules keep their CONSTRUCTION-native init
+        (they are excluded from the generic ``_init_weights`` re-init, mirroring the
+        standalone probe) — including the zero-init ``seed_ctx_proj`` / readback output.
+        """
+        inner_mode = getattr(m, "stacked_inner_mode", "mix")
+        if inner_mode not in ("mix", "share", "asym"):
+            raise ValueError(
+                f"stacked_inner_mode={inner_mode!r} not in ('mix', 'share', 'asym')."
+            )
+        self._stacked_inner_mode = inner_mode
+        reason_flags = [True] * n_blocks
+        if inner_mode == "asym" and n_blocks > 1:
+            reason_flags = [False] * (n_blocks - 1) + [True]
+        reads_hidden = bool(getattr(m, "stacked_reason_reads_hidden", False))
+        self.stacked_blocks = nn.ModuleList(
+            [
+                StackedTandemBlock(
+                    m,
+                    reason_enabled=reason_flags[i],
+                    gate_bias_init=m.stacked_gate_bias_init,
+                    mlp_ff_mult=m.stacked_mlp_ff_mult,
+                    # only INNER (>=2nd) blocks can re-ground on the block hidden.
+                    reason_reads_hidden=reads_hidden and i > 0,
+                )
+                for i in range(n_blocks)
+            ]
+        )
+        if inner_mode == "share" and n_blocks > 1:
+            for i in range(1, n_blocks):
+                self.stacked_blocks[i].gate = self.stacked_blocks[0].gate
+        # NOTE: the optional readback is constructed LAST — AFTER ``_init_weights`` (see
+        # __init__) — so its construction-time RNG never shifts the deterministic re-init
+        # of the shared embed / delta stack / head.  With that isolation + its own zero-init
+        # output, readback-on == readback-off at step 0 EXACTLY.
+
     def _init_weights(self, m: ModelConfig) -> None:
         """GPT-2 style init with depth-aware residual-projection scaling.
 
@@ -286,7 +358,21 @@ class DeltaMemoryLM(nn.Module):
         """
         std = 0.02
         nn.init.normal_(self.embed.weight, mean=0.0, std=std)
+        # Stacked-tandem blocks (card 3ac77deb) keep their CONSTRUCTION-native init for the
+        # reasoner / workhorse / gate (the reasoner self-initializes in its own __init__ via
+        # reset_parameters; the zero-init seed_ctx_proj stays zero) -> EXCLUDE them from the
+        # generic std=0.02 re-init below.  The stacked memory (GatedDeltaMemory) has NO
+        # self-init, so its forget-gate bias is corrected explicitly further down (BLOCKER 1).
+        # RNG isolation for the optional readback comes from CONSTRUCTION ORDER — it is built
+        # AFTER _init_weights (see __init__), so it is not present in ``self.modules()`` here
+        # and cannot perturb the shared embed/backbone/head init; that is what makes
+        # readback-on == readback-off at step 0, not any check in this loop.
+        stacked_skip: set[nn.Module] = set()
+        for blk in self.stacked_blocks:
+            stacked_skip.update(blk.modules())
         for module in self.modules():
+            if module in stacked_skip:
+                continue
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=std)
                 if module.bias is not None:
@@ -333,6 +419,17 @@ class DeltaMemoryLM(nn.Module):
             for block in self.blocks:
                 if block.mixer.alpha_proj is not None:
                     nn.init.constant_(block.mixer.alpha_proj.bias, m.delta_forget_bias_init)
+            # BLOCKER 1 fix (card 3ac77deb review): each stacked block's GatedDeltaMemory was
+            # EXCLUDED from the generic loop above, and GatedDeltaMemory has no self-init, so
+            # without this its alpha_proj.bias sits at the raw PyTorch default -> alpha~=0.5
+            # (the card-1e9245f4 too-aggressive-forget regression) instead of the intended
+            # remember-by-default alpha~=0.98.  Apply the SAME per-block correction so
+            # tandem_blocks>=2 honours delta_forget_bias_init exactly like the outer backbone.
+            # (The memory's other weights stay construction-native — fidelity to the standalone
+            # probe; only the forget bias is a correctness requirement here.)
+            for sblk in self.stacked_blocks:
+                if sblk.mem.alpha_proj is not None:
+                    nn.init.constant_(sblk.mem.alpha_proj.bias, m.delta_forget_bias_init)
 
         # Reasoning-field head-bias priors (card 9907dc9e).  The generic loop above
         # zeros ALL linear biases — including the reasoner's controller heads, whose
@@ -795,6 +892,79 @@ class DeltaMemoryLM(nn.Module):
             "step": step,
             "gate_mix": gate_mix,
         }
+
+    def _stacked_embed(self, x: Tensor) -> Tensor:
+        """Bottom of the stacked tandem: token embed (+ optional conv front-end), applied
+        ONCE per segment.  Mirrors the standard trunk input (``h_embed``) used by the
+        single tandem; the front-end (when built) is the cheap causal local combiner, so
+        the bottom stays strictly causal."""
+        h = self.embed_drop(self.embed(x))
+        if self.front_end is not None:
+            h = self.front_end(h)
+        return h
+
+    def stacked_step(
+        self,
+        seg_tokens: Tensor,
+        answer_seg: int,
+        answer_pos: Tensor,
+        *,
+        steps: int | None = None,
+        force_gate: list[Tensor | None] | None = None,
+        gate_mix: list[bool] | None = None,
+        gate_noise: float = 0.0,
+        tf_seed: Tensor | None = None,
+    ) -> dict:
+        """Stacked-tandem training/eval forward over ``seg_tokens (B, n_seg, L)`` (card 3ac77deb).
+
+        Processes every segment through the bottom (``embed`` + optional conv front-end),
+        then the N stacked blocks left-to-right (block N's fused output = block N+1's input;
+        each block carries its OWN cross-segment memory state); only the FINAL block feeds
+        ``norm_out`` + the untied ``lm_head``.  The reasoner is run leak-free at
+        ``pred_pos = answer_pos - 1`` (never at the answer byte); teacher-forcing + aux feed
+        the FINAL block only.  Optional bounded readback re-grounds block-1's input in the
+        bottom embeddings.
+
+        Args mirror the scratchpad probe: per-block ``force_gate`` (an expert index per row
+        for curriculum / dissociation, or ``None``) and ``gate_mix`` (uniform-mix warmup per
+        block).  Returns ``{logits (B, vocab), gates: list of (B, 3), aux, step}``; the answer
+        logits are gathered at ``pred_pos``.
+        """
+        if len(self.stacked_blocks) == 0:
+            raise RuntimeError("stacked_step requires tandem_blocks >= 2.")
+        assert bool((answer_pos >= 1).all()), "answer_pos==0 would reintroduce the copy leak"
+        pred_pos = answer_pos - 1
+        n_seg = seg_tokens.shape[1]
+        raw_ans = seg_tokens[:, answer_seg]  # RAW answer-segment tokens for the reasoner
+        emb = [self._stacked_embed(seg_tokens[:, i]) for i in range(n_seg)]
+        seg_hidden = list(emb)
+        gates: list[Tensor] = []
+        final_aux: dict | None = None
+        last = len(self.stacked_blocks) - 1
+        for bi, blk in enumerate(self.stacked_blocks):
+            fg = force_gate[bi] if force_gate is not None else None
+            gm = bool(gate_mix[bi]) if gate_mix is not None else False
+            tfs = tf_seed if bi == last else None
+            seg_hidden, g, aux = blk(
+                seg_hidden, raw_ans, answer_seg, pred_pos, steps=steps,
+                force_gate=fg, gate_mix=gm, gate_noise=gate_noise, tf_seed=tfs,
+            )
+            gates.append(g)
+            if bi == last:
+                final_aux = aux
+            # Bounded readback (between block 0 and block 1): re-ground block-1's input
+            # stream in the bottom surface embeddings.  Strictly-causal window -> leak-free.
+            if self.readback is not None and bi == 0 and last >= 1:
+                seg_hidden = [
+                    seg_hidden[si] + self.readback(seg_hidden[si], emb[si])
+                    for si in range(n_seg)
+                ]
+        ctx = gather_positions(seg_hidden[answer_seg], pred_pos)
+        logits = self.lm_head(self.norm_out(ctx))
+        step = int(self._tandem_step.item())
+        if self.training:
+            self._tandem_step += 1
+        return {"logits": logits, "gates": gates, "aux": final_aux, "step": step}
 
     def num_parameters(self, trainable_only: bool = True) -> int:
         """Return total (or trainable-only) parameter count."""

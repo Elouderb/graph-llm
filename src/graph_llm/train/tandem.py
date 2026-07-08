@@ -145,6 +145,32 @@ class TandemConfig:
     # exact pass-through at step 0, so the optimizer opens the multi-scale mixing where it
     # helps rather than paying the random-condense re-learning cost.  front_end != "none".
     conv_identity_init: bool = False
+    # --- STACKED TANDEM BLOCKS + stage-wise type-warmup (card 3ac77deb) ---
+    # ``tandem_blocks>=2`` builds the VERTICAL stack of whole tandem blocks (each =
+    # {memory || reasoner || workhorse -> 3-way gate}); block N's fused output feeds block
+    # N+1 and only the FINAL block reaches the head.  Driven by the model's ``stacked_step``
+    # (the mixed M/R/P/C stream + type-C compositional data live in the scratchpad probe /
+    # card-2 data harness, so the stacked training LOOP is a scratchpad driver — this repo
+    # trainer owns the model-build forwarding + the SCHEDULE helpers below).  ``1`` (default)
+    # is the shipped single-fusion tandem.
+    tandem_blocks: int = 1
+    stacked_inner_mode: str = "mix"     # mix | share | asym (see the model)
+    # STAGE-WISE type-warmup (the WIN, card 3ac77deb): a compositional routing-coordination
+    # basin — the two-stage C strategy earns gradient only if BOTH gates commit at once
+    # (block-0 retrieval has no payoff until block-1 uses it), so independent unsupervised
+    # inner gates cannot discover it.  With stagewise, WARMUP forces the KNOWN decomposition
+    # at BOTH gates (C->mem@block0, C->reason@inner; M/R/P->their expert at both) for
+    # ``type_warmup`` steps, then RELEASES both together into the unsupervised commit/anneal.
+    # REQUIRES ``type_warmup>0`` (the forced-decomposition window) — guarded by
+    # ``_resolve_stagewise_release`` so there is no silent broken default.
+    stagewise_warmup: bool = False
+    # NON-stagewise inner-gate warmup (rung a, the FAILED mitigation kept for the ablation):
+    # inner blocks train under a uniform forced-mix for this many steps, then release.
+    inner_mix_warmup: int = 1000
+    # Optional bounded cross-attention readback between block 0 and block 1 (default off).
+    readback: bool = False
+    readback_window: int = 32
+    readback_heads: int = 2
     # --- PROGRESSIVE R-depth curriculum (card cff8f5ee; recipe from card 0a98292b) ---
     # The shipped fixed ``train_r_depths=(4,5,6)`` + ``k_train=8`` caps the reasoner at a
     # TRAINED-WALK-BUDGET CLIFF at hop==k_train: within budget the per-hop walk is fine, but
@@ -233,6 +259,109 @@ def _resolve_ramp_delay(cfg: TandemConfig) -> int:
     return cfg.r_depth_ramp_delay
 
 
+# ---------------------------------------------------------------------------
+# Stacked-tandem stage-wise type-warmup schedule (card 3ac77deb)
+# ---------------------------------------------------------------------------
+# The compositional (retrieve-then-reason) type earns gradient only if BOTH gates commit at
+# once — independent unsupervised inner gates cannot bootstrap the two-stage strategy.  The
+# WIN is a STAGE-WISE warmup that forces the KNOWN decomposition at BOTH gates during the
+# ``type_warmup`` window (C->mem@block0, C->reason@inner; M/R/P->their expert at both), then
+# RELEASES both together into the unsupervised commit/anneal.  These are pure, unit-testable
+# schedule functions (the ``_ramp_depth`` / ``_resolve_ramp_delay`` discipline); the stacked
+# training loop itself (mixed M/R/P/C stream) is a scratchpad driver that consumes them + the
+# model's ``stacked_step``, since the type-C data generator lives with the card-2 data harness.
+
+# Type ids on the mixed stream: M=0, R=1, P=2, C=3 (compositional).  Block-0 expert target per
+# type: M->mem(0), R->reason(1), P->mlp(2), C->mem(0) (RETRIEVE); the stage-wise inner blocks
+# force C->reason(1) (WALK the retrieved chain).
+_TYPE_ID_C = 3
+_INNER_C_EXPERT = 1  # reasoner
+
+
+def _resolve_stagewise_release(cfg: TandemConfig) -> int:
+    """Resolve/validate the stage-wise warmup RELEASE step (card 3ac77deb).
+
+    Stage-wise warmup forces the known C decomposition at every gate for ``type_warmup``
+    steps, then releases them together.  It REQUIRES ``type_warmup > 0`` — without the
+    forced-decomposition window the two-stage strategy has no way to bootstrap (independent
+    unsupervised inner gates provably cannot discover it), so this raises rather than
+    silently training the known-broken schedule.  Returns the release step (``type_warmup``),
+    which is also the routing-lock point the depth-ramp delay composes with
+    (``_resolve_ramp_delay`` already uses ``release = type_warmup`` when it is > 0, so routing
+    locks before the ramp).  A non-stagewise stacked run has no such coupling and returns the
+    later of the outer (``type_warmup``) and inner (``inner_mix_warmup``) releases.
+    """
+    if not cfg.stagewise_warmup:
+        return max(cfg.type_warmup, cfg.inner_mix_warmup)
+    if cfg.type_warmup <= 0:
+        raise ValueError(
+            "stagewise_warmup requires type_warmup > 0 (the forced-decomposition window that "
+            "commits BOTH gates at once); with type_warmup=0 the two-stage compositional "
+            "strategy cannot bootstrap (card 3ac77deb).  Set a positive type_warmup."
+        )
+    return cfg.type_warmup
+
+
+def _stacked_block_controls(
+    cfg: TandemConfig, step: int, kind: torch.Tensor, type_id: torch.Tensor
+) -> tuple[list[torch.Tensor | None], list[bool]]:
+    """Per-block ``(force_gate, gate_mix)`` for a stacked training step (card 3ac77deb).
+
+    STAGE-WISE: during ``type_warmup`` force the KNOWN decomposition at BOTH gates — block 0
+    to ``kind`` (M->mem, R->reason, P->mlp, C->mem RETRIEVE), inner blocks to ``kind`` but
+    with C->reason (WALK the retrieved chain) — then both release together.  DEFAULT (rung a):
+    block 0 type-warmup; inner blocks uniform forced-mix until ``inner_mix_warmup``, then free.
+    """
+    n = int(cfg.tandem_blocks)
+    force_gate: list[torch.Tensor | None] = [None] * n
+    gate_mix: list[bool] = [False] * n
+    if cfg.stagewise_warmup:
+        if step < cfg.type_warmup:
+            force_gate[0] = kind
+            inner = kind.clone()
+            inner[type_id == _TYPE_ID_C] = _INNER_C_EXPERT  # C -> reasoner at inner blocks
+            for bi in range(1, n):
+                force_gate[bi] = inner
+    else:
+        if step < cfg.type_warmup:
+            force_gate[0] = kind
+        for bi in range(1, n):
+            if step < cfg.inner_mix_warmup:
+                gate_mix[bi] = True
+    return force_gate, gate_mix
+
+
+def _stacked_gate_losses(
+    cfg: TandemConfig, gates: list[torch.Tensor], step: int
+) -> torch.Tensor:
+    """Unsupervised 3-way gate losses (label-free) per gate that is OUT of its warmup.
+
+    Load-balance to uniform (1/3) anti-collapse + annealed per-example entropy commitment.
+    Stage-wise: inner gates release WITH the outer at ``type_warmup``; default: inner gates
+    release at ``inner_mix_warmup``.  ``gates`` are the per-block ``(B, 3)`` gate distributions
+    at the prediction position (``stacked_step``'s ``gates``).
+    """
+    loss = gates[0].new_zeros(())
+    for bi, g in enumerate(gates):
+        if bi == 0 or cfg.stagewise_warmup:
+            release = cfg.type_warmup
+        else:
+            release = cfg.inner_mix_warmup
+        if step < release:
+            continue
+        if cfg.gate_balance_weight > 0:
+            loss = loss + cfg.gate_balance_weight * ((g.mean(0) - 1.0 / 3.0) ** 2).sum()
+        if cfg.gate_commit_weight > 0:
+            commit_w = cfg.gate_commit_weight
+            if cfg.gate_commit_anneal > 0:
+                commit_w = commit_w * min(
+                    1.0, max(0, step - release) / max(1, cfg.gate_commit_anneal)
+                )
+            ent = -(g.clamp_min(1e-9).log() * g).sum(-1).mean()
+            loss = loss + commit_w * ent
+    return loss
+
+
 def build_tandem_model(cfg: TandemConfig, device: torch.device) -> torch.nn.Module:
     """Build the repo DeltaMemoryLM with the tandem ON + the validated memory config.
 
@@ -285,6 +414,12 @@ def build_tandem_model(cfg: TandemConfig, device: torch.device) -> torch.nn.Modu
         front_end=cfg.front_end,
         front_end_workhorse_only=cfg.front_end_workhorse_only,
         conv_identity_init=cfg.conv_identity_init,
+        # Stacked-tandem topology (card 3ac77deb): a no-op at the default tandem_blocks=1.
+        tandem_blocks=cfg.tandem_blocks,
+        stacked_inner_mode=cfg.stacked_inner_mode,
+        tandem_readback=cfg.readback,
+        tandem_readback_window=cfg.readback_window,
+        tandem_readback_heads=cfg.readback_heads,
     )
     full = Config(
         model=m,

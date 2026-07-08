@@ -104,9 +104,14 @@ class CausalGRUEncoder(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.conv_kernel = conv_kernel
 
-    def forward(self, x: Tensor) -> Tensor:
-        """``(N, L) int -> (N, L, d_model)`` with strictly-causal carried context."""
-        h = self.embed(x)
+    def encode_hidden(self, h: Tensor) -> Tensor:
+        """Causal conv + unidirectional GRU + norm on an ALREADY-EMBEDDED stream ``(N, L, d)``.
+
+        The recurrence-carrying core shared by :meth:`forward` (which embeds token ids first)
+        and callers that address a GROUNDED hidden stream directly (skip the byte embed) —
+        e.g. the stacked-tandem reasoner's ``reason_reads_hidden`` mode.  Strictly causal
+        (left-padded conv + unidirectional GRU): position ``t`` depends only on ``<= t``.
+        """
         pad = self.conv_kernel - 1
         for conv, pw in zip(self.convs, self.pointwise):
             hc = h.transpose(1, 2)
@@ -115,6 +120,10 @@ class CausalGRUEncoder(nn.Module):
             h = h + pw(F.gelu(hc))
         out, _ = self.gru(h)  # unidirectional GRU -> strictly causal carry
         return self.norm(out)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """``(N, L) int -> (N, L, d_model)`` with strictly-causal carried context."""
+        return self.encode_hidden(self.embed(x))
 
 
 class CausalReasoner(nn.Module):
@@ -262,12 +271,21 @@ class CausalReasoner(nn.Module):
         gamma_add: float = 0.0,
         clock_period: int | None = None,
         query_pos: Tensor | None = None,
+        hidden_input: bool = False,
+        seed_ctx_add: Tensor | None = None,
     ) -> tuple[Tensor, dict | None]:
         """Run the per-position locate-then-walk over ONE batch of windows.
 
         Args:
-            x: ``(N, L)`` token ids (N = B * n_windows).
+            x: ``(N, L)`` token ids (N = B * n_windows), or — when ``hidden_input`` — an
+                already-embedded ``(N, L, d_model)`` hidden stream addressed directly.
             steps: walk depth K for this call.
+            hidden_input: when True, ``x`` is a GROUNDED hidden stream ``(N, L, d)`` and the
+                encoder skips the byte embed (``CausalGRUEncoder.encode_hidden``) — the
+                stacked-tandem ``reason_reads_hidden`` variant.  Default False (token ids).
+            seed_ctx_add: optional ``(N, Lq, d_key)`` tensor ADDED to the locate seed query
+                ``q0`` (the stacked-tandem composition channel: an earlier block's retrieval
+                blended into the seed).  Default ``None`` (no change — exact base behaviour).
             commit_seed: gate the ``hard_seed`` straight-through commit.
             aux_query_pos: ``(N,)`` per-row answer position to collect aux at, or
                 ``None``.  Only valid when N == the original batch (single window).
@@ -303,11 +321,12 @@ class CausalReasoner(nn.Module):
         Returns:
             ``(h_reason (N, L, d_model), aux | None)``.
         """
-        n, length = x.shape
+        n, length = x.shape[0], x.shape[1]  # x is (N,L) ids OR (N,L,d) hidden (hidden_input)
         device = x.device
         rows = torch.arange(n, device=device)
         qmode = query_pos is not None                    # single-query fast path
-        h = self.encoder(x)                              # (N, L, d)
+        # Encode: byte ids -> embed -> causal core, OR a grounded hidden stream directly.
+        h = self.encoder.encode_hidden(x) if hidden_input else self.encoder(x)  # (N, L, d)
         keys_n = F.normalize(self.name_key(h), dim=-1)   # (N, L, dk)
         ptr_keys = self.ptr_key(h)                       # (N, L, dk)
         vals = self.val(h)                               # (N, L, d)
@@ -336,6 +355,10 @@ class CausalReasoner(nn.Module):
             assert query_pos is not None
             pooled = pooled[rows, query_pos].unsqueeze(1)  # (N, 1, d)
         q0 = self.query_pool(pooled)                     # (N, Lq, dk)
+        if seed_ctx_add is not None:
+            # Composition channel (stacked tandem): blend a hidden-derived seed into the
+            # locate query.  ``None`` (default) leaves q0 exactly as the base reasoner.
+            q0 = q0 + seed_ctx_add
         q0_n = F.normalize(q0, dim=-1)
         seed_cos = torch.einsum("nqd,nkd->nqk", q0_n, seed_keys_n)
         seed_pre = (scale * seed_cos).masked_fill(~addr_mask, neg_inf)  # (N,Lq,Lk)
@@ -498,6 +521,8 @@ class CausalReasoner(nn.Module):
         walk_hard: bool = False,
         gamma_add: float = 0.0,
         clock_period: int | None = None,
+        hidden_input: bool = False,
+        seed_ctx_add: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, dict]:
         """Single-query fast path: the reasoning hidden AT ``query_pos`` only.
 
@@ -508,15 +533,18 @@ class CausalReasoner(nn.Module):
         ``forward(x, ..., return_aux=True)`` gathered at ``query_pos`` (pinned by a test).
 
         Args:
-            x: ``(B, T)`` token ids (single window: ``T <= segment_len``).
+            x: ``(B, T)`` token ids (single window: ``T <= segment_len``), or ``(B, T, d)``
+                when ``hidden_input`` (a grounded hidden stream addressed directly).
             query_pos: ``(B,)`` the one position per row to run the walk at.
+            hidden_input / seed_ctx_add: see :meth:`_walk_window` — the stacked-tandem
+                grounded-address + composition hooks (default off = exact base behaviour).
             (Remaining args mirror :meth:`forward`.)
 
         Returns:
             ``h_reason (B, d_model)`` or, when ``return_aux``, ``(h_reason, aux)`` with
             ``aux = {"seed_logits" (B, T), "walk_w" (B, K, T)}``.
         """
-        b, t = x.shape
+        t = x.shape[1]
         k = self.steps if steps is None else steps
         if t > self.segment_len:
             raise ValueError(
@@ -526,7 +554,8 @@ class CausalReasoner(nn.Module):
         out, aux = self._walk_window(
             x, k, commit_seed, aux_query_pos=query_pos, tf_seed=tf_seed,
             collect_aux=return_aux, walk_hard=walk_hard, gamma_add=gamma_add,
-            clock_period=clock_period, query_pos=query_pos,
+            clock_period=clock_period, query_pos=query_pos, hidden_input=hidden_input,
+            seed_ctx_add=seed_ctx_add,
         )
         out = out[:, 0]  # (B, d_model) — the single query row
         if return_aux:

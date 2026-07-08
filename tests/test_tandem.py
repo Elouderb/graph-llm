@@ -36,11 +36,15 @@ import graph_llm.models  # noqa: F401 — registers "delta_memory_lm" (+ baselin
 from graph_llm.config import Config, DataConfig, ModelConfig, TrainConfig
 from graph_llm.models import build_model
 from graph_llm.models.components.causal_reasoner import CausalReasoner
+from graph_llm.models.components.stacked_tandem import ComposableCausalReasoner
 from graph_llm.train.tandem import (
     TandemConfig,
     _build_run_config,
     _ramp_depth,
     _resolve_ramp_delay,
+    _resolve_stagewise_release,
+    _stacked_block_controls,
+    _stacked_gate_losses,
     _train_one,
 )
 
@@ -1287,3 +1291,593 @@ def test_cli_conv_identity_init() -> None:
     assert cfg.front_end == "multiscale_conv" and cfg.conv_identity_init is True
     default_cfg, _, _ = _build_run_config([])
     assert default_cfg.conv_identity_init is False
+
+
+# ---------------------------------------------------------------------------
+# STACKED TANDEM BLOCKS + stage-wise warmup + optional readback (card 3ac77deb)
+# ---------------------------------------------------------------------------
+# A VERTICAL stack of whole tandem blocks: block N's fused output = block N+1's input;
+# only the FINAL block feeds the (untied) head.  tandem_blocks=1 (default) is byte-for-byte
+# the shipped single-fusion tandem; the stacked path is driven by ``stacked_step``.
+
+
+def _stk_cfg(**overrides: Any) -> ModelConfig:
+    """A small stacked-tandem config (2 blocks) on top of the tiny tandem config."""
+    base: dict[str, Any] = {"tandem_blocks": 2}
+    base.update(overrides)
+    return _on_cfg(**base)
+
+
+def _stacked_leak_maxdiff(
+    model: torch.nn.Module,
+    seg: torch.Tensor,
+    answer_seg: int,
+    answer_pos: torch.Tensor,
+    steps: int,
+    reps: int = 6,
+) -> float:
+    """Max |Δ logits| at the prediction position under perturbation of the answer byte +
+    every token AFTER it in the answer segment (the stacked-step leak probe)."""
+    model.eval()
+    b, _, length = seg.shape
+    with torch.no_grad():
+        base = model.stacked_step(seg, answer_seg, answer_pos, steps=steps)["logits"]
+    g = torch.Generator().manual_seed(1234)
+    max_diff = 0.0
+    for _ in range(reps):
+        seg2 = seg.clone()
+        for row in range(b):
+            p = int(answer_pos[row])
+            seg2[row, answer_seg, p:] = torch.randint(1, 256, (length - p,), generator=g)
+        with torch.no_grad():
+            pert = model.stacked_step(seg2, answer_seg, answer_pos, steps=steps)["logits"]
+        max_diff = max(max_diff, (base - pert).abs().max().item())
+    return max_diff
+
+
+def test_tandem_blocks_default_is_one() -> None:
+    assert ModelConfig().tandem_blocks == 1
+    assert ModelConfig().tandem_readback is False
+    assert ModelConfig().stacked_inner_mode == "mix"
+
+
+def test_stacked_off_is_byte_for_byte_the_shipped_tandem() -> None:
+    """tandem_blocks=1 (explicit) builds/behaves byte-for-byte like the shipped tandem: no
+    stacked module / state_dict key, identical params + forward logits under a fixed seed."""
+    torch.manual_seed(0)
+    shipped = build_model(_full_cfg(_on_cfg()))
+    torch.manual_seed(0)
+    blocks1 = build_model(_full_cfg(_on_cfg(tandem_blocks=1)))
+    assert len(shipped.stacked_blocks) == 0
+    assert shipped.readback is None
+    assert not any(k.startswith("stacked_blocks") for k in shipped.state_dict())
+    assert not any(k.startswith("readback") for k in shipped.state_dict())
+    assert set(shipped.state_dict()) == set(blocks1.state_dict())
+    assert shipped.num_parameters() == blocks1.num_parameters()
+    shipped.eval()
+    blocks1.eval()
+    x = torch.randint(1, 256, (2, 24))
+    with torch.no_grad():
+        _, la = shipped(x)
+        _, lb = blocks1(x)
+    assert torch.equal(la, lb), "tandem_blocks=1 is not byte-for-byte the shipped tandem"
+
+
+def test_stacked_flag_noop_when_tandem_off() -> None:
+    """tandem_blocks>=2 with tandem_enabled=False builds NOTHING (the stack needs the tandem)."""
+    torch.manual_seed(5)
+    baseline = build_model(_full_cfg(_mem_cfg()))
+    torch.manual_seed(5)
+    stk_off = build_model(_full_cfg(_mem_cfg(tandem_blocks=3, tandem_readback=True)))
+    assert len(stk_off.stacked_blocks) == 0
+    assert stk_off.readback is None
+    assert set(baseline.state_dict()) == set(stk_off.state_dict())
+    assert baseline.num_parameters() == stk_off.num_parameters()
+    baseline.eval()
+    stk_off.eval()
+    x = torch.randint(0, 256, (2, 16))
+    with torch.no_grad():
+        _, la = baseline(x)
+        _, lb = stk_off(x)
+    assert torch.equal(la, lb), "the stacked flag is not a no-op when the tandem is OFF"
+
+
+def test_stacked_builds_blocks_not_single_fusion() -> None:
+    """tandem_blocks>=2 builds the N-block stack INSTEAD of the single causal_reasoner/gate."""
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=3)))
+    assert len(on.stacked_blocks) == 3
+    assert on.causal_reasoner is None
+    assert on.tandem_gate is None
+    assert on.tandem_mlp is None
+    assert any(k.startswith("stacked_blocks") for k in on.state_dict())
+    # every block owns its OWN memory + reasoner + workhorse + 3-way gate.
+    blk = on.stacked_blocks[0]
+    assert blk.reasoner is not None
+    assert blk.gate.out_features == 3
+    assert blk.gate.in_features == 4 * on.d_model
+
+
+def test_stacked_step_shapes() -> None:
+    """stacked_step returns per-example answer logits + one (B,3) gate per block + aux."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2, reasoning_segment_len=48)))
+    on.train()
+    b, n_seg, length = 3, 2, 40
+    seg = torch.randint(1, 256, (b, n_seg, length))
+    ans = torch.tensor([30, 25, 20])
+    tf = torch.tensor([5, 8, 3])
+    out = on.stacked_step(seg, answer_seg=1, answer_pos=ans, steps=4, tf_seed=tf)
+    assert out["logits"].shape == (b, on.vocab_size)
+    assert len(out["gates"]) == 2
+    for g in out["gates"]:
+        assert g.shape == (b, 3)
+        assert torch.allclose(g.sum(-1), torch.ones(b), atol=1e-5)
+    assert out["aux"]["seed_logits"].shape == (b, length)
+    assert out["aux"]["walk_w"].shape == (b, 4, length)
+    assert int(on._tandem_step.item()) == 1
+
+
+def test_stacked_lm_leak_probe_exactly_zero() -> None:
+    """Perturbing the answer byte + all later tokens leaves the prediction-position logits
+    EXACTLY unchanged (0.0): memory scan + reasoner walk + workhorse + gate are all causal."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2, reasoning_segment_len=64)))
+    seg = torch.randint(1, 256, (2, 2, 48))
+    ans = torch.tensor([30, 25])
+    assert _stacked_leak_maxdiff(on, seg, 1, ans, steps=4) == 0.0
+
+
+def test_stacked_lm_leak_probe_with_conv_front_end_exactly_zero() -> None:
+    """The stacked stack + the causal multi-scale conv front-end stays EXACTLY causal."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, reasoning_segment_len=64, front_end="multiscale_conv",
+        conv_identity_init=True,
+    )))
+    assert on.front_end is not None
+    seg = torch.randint(1, 256, (2, 2, 48))
+    ans = torch.tensor([31, 22])
+    assert _stacked_leak_maxdiff(on, seg, 1, ans, steps=4) == 0.0
+
+
+def test_stacked_three_blocks_leak_probe_exactly_zero() -> None:
+    """Deeper stack (3 blocks) is still exactly causal at the prediction position."""
+    torch.manual_seed(1)
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=3, reasoning_segment_len=64)))
+    seg = torch.randint(1, 256, (2, 2, 44))
+    ans = torch.tensor([28, 20])
+    assert _stacked_leak_maxdiff(on, seg, 1, ans, steps=4) == 0.0
+
+
+def test_stacked_force_gate_curriculum_routes_each_row() -> None:
+    """A per-block per-row expert-index force_gate routes each row to its specialist: the
+    final-block gate argmax equals the assigned expert (mem/reason/mlp)."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2)))
+    on.eval()
+    b, n_seg, length = 3, 2, 24
+    seg = torch.randint(1, 256, (b, n_seg, length))
+    ans = torch.tensor([15, 15, 15])
+    fg = [torch.tensor([0, 1, 2]), torch.tensor([0, 1, 2])]
+    with torch.no_grad():
+        out = on.stacked_step(seg, 1, ans, steps=4, force_gate=fg)
+    assert out["gates"][1].argmax(-1).tolist() == [0, 1, 2]
+
+
+def test_stacked_gate_mix_uniform_warmup() -> None:
+    """gate_mix per block pins the reported gate to the uniform 1/3 forced mix."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2)))
+    on.train()
+    seg = torch.randint(1, 256, (2, 2, 24))
+    ans = torch.tensor([15, 15])
+    out = on.stacked_step(seg, 1, ans, steps=4, gate_mix=[True, True])
+    for g in out["gates"]:
+        assert torch.allclose(g, torch.full_like(g, 1.0 / 3.0), atol=1e-5)
+
+
+def test_stacked_finite_grads_reach_reasoner_gate_memory() -> None:
+    """A stacked answer-CE loss sends finite non-zero grads to every block's reasoner,
+    gate, and memory."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2)))
+    on.train()
+    b, n_seg, length = 4, 2, 32
+    seg = torch.randint(1, 256, (b, n_seg, length))
+    ans = torch.full((b,), length - 2)
+    tgt = torch.randint(0, 256, (b,))
+    out = on.stacked_step(seg, 1, ans, steps=4, tf_seed=ans - 1)
+    loss = torch.nn.functional.cross_entropy(out["logits"], tgt)
+    loss = loss + torch.nn.functional.cross_entropy(out["aux"]["seed_logits"], (ans - 1).clamp(0, length - 1))
+    loss.backward()
+
+    def _has_grad(mod: torch.nn.Module) -> bool:
+        return any(
+            p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
+            for p in mod.parameters()
+            if p.requires_grad
+        )
+
+    for blk in on.stacked_blocks:
+        assert blk.reasoner is not None and _has_grad(blk.reasoner), "no grad reached a block reasoner"
+        assert _has_grad(blk.gate), "no grad reached a block gate"
+        assert _has_grad(blk.mem), "no grad reached a block memory"
+
+
+def test_stacked_states_carry_across_segments() -> None:
+    """Each block carries its OWN cross-segment memory: perturbing a NON-answer (binding)
+    segment changes the prediction (the memory bridged the gap)."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2)))
+    on.eval()
+    seg = torch.randint(1, 256, (2, 3, 24))
+    ans = torch.tensor([15, 15])
+    with torch.no_grad():
+        base = on.stacked_step(seg, 2, ans, steps=4)["logits"]
+        seg2 = seg.clone()
+        seg2[:, 0, :] = torch.randint(1, 256, (2, 24))  # perturb the earliest (binding) segment
+        pert = on.stacked_step(seg2, 2, ans, steps=4)["logits"]
+    assert (base - pert).abs().max().item() > 0.0, "earlier-segment info never reached the answer"
+
+
+# --- ComposableCausalReasoner seed_ctx identity-init (the doctrine) ----------
+
+
+def test_composable_reasoner_seed_ctx_zero_init_is_identity() -> None:
+    """seed_ctx_proj is ZERO-INIT: at step 0 the composed seed == the raw-token pool, so the
+    composition channel is CLOSED — feeding any seed_ctx gives the SAME output as seed_ctx=0
+    (an exact superset of the working single-stage reasoner)."""
+    torch.manual_seed(0)
+    cfg = _on_cfg(d_model=24, reasoning_segment_len=32, causal_reasoner_steps=4)
+    r = ComposableCausalReasoner(cfg)
+    r.eval()
+    assert float(r.seed_ctx_proj.weight.detach().abs().max()) == 0.0
+    assert float(r.seed_ctx_proj.bias.detach().abs().max()) == 0.0
+    b, t = 2, 28
+    x = torch.randint(1, 256, (b, t))
+    qpos = torch.tensor([t - 1, 15])
+    with torch.no_grad():
+        o_zero, _ = r.query_forward_composed(x, qpos, torch.zeros(b, 24), steps=4)
+        o_rand, _ = r.query_forward_composed(x, qpos, torch.randn(b, 24), steps=4)
+    assert torch.equal(o_zero, o_rand), "seed_ctx_proj not zero-init: composition channel open at init"
+
+
+def test_composable_reasoner_query_forward_matches_base_at_zero_ctx() -> None:
+    """With seed_ctx=0 (zero-init) the composed single-query walk equals the shipped
+    reasoner's query_forward (same locate-then-walk, one Lq row)."""
+    torch.manual_seed(0)
+    cfg = _on_cfg(d_model=24, reasoning_segment_len=32, causal_reasoner_steps=5)
+    r = ComposableCausalReasoner(cfg)
+    r.eval()
+    b, t = 3, 28
+    x = torch.randint(1, 256, (b, t))
+    qpos = torch.tensor([t - 1, 15, 9])
+    with torch.no_grad():
+        base = r.query_forward(x, qpos, steps=5)
+        comp, _ = r.query_forward_composed(x, qpos, torch.zeros(b, 24), steps=5)
+    assert isinstance(base, torch.Tensor)
+    assert torch.allclose(base, comp, atol=1e-5), "composed(seed_ctx=0) != base query_forward"
+
+
+# --- Optional bounded readback (identity-at-init + leak-free) ----------------
+
+
+def test_stacked_readback_default_off() -> None:
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2)))
+    assert on.readback is None
+    assert not any(k.startswith("readback") for k in on.state_dict())
+
+
+def test_stacked_readback_noop_without_blocks() -> None:
+    """readback=True with tandem_blocks=1 builds NOTHING (readback needs the stack)."""
+    torch.manual_seed(3)
+    a = build_model(_full_cfg(_on_cfg()))
+    torch.manual_seed(3)
+    b = build_model(_full_cfg(_on_cfg(tandem_readback=True)))
+    assert b.readback is None
+    assert set(a.state_dict()) == set(b.state_dict())
+    a.eval()
+    b.eval()
+    x = torch.randint(1, 256, (2, 20))
+    with torch.no_grad():
+        _, la = a(x)
+        _, lb = b(x)
+    assert torch.equal(la, lb), "readback flag is not a no-op without the stack"
+
+
+def test_stacked_readback_identity_at_init_is_exact() -> None:
+    """Readback ON == readback OFF at step 0 (EXACT): the readback is built LAST (RNG-isolated)
+    and zero-inits its output projection, so the stack is unchanged at init and the readback
+    starts as an exact no-op (the identity-init doctrine)."""
+    torch.manual_seed(7)
+    off = build_model(_full_cfg(_stk_cfg(tandem_blocks=2, tandem_readback=False)))
+    torch.manual_seed(7)
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, tandem_readback=True, tandem_readback_window=16, tandem_readback_heads=2,
+    )))
+    assert on.readback is not None
+    # the non-readback state is byte-for-byte identical (readback's RNG never perturbed it).
+    off_sd = off.state_dict()
+    on_sd = {k: v for k, v in on.state_dict().items() if not k.startswith("readback")}
+    assert set(off_sd) == set(on_sd)
+    assert all(torch.equal(off_sd[k], on_sd[k]) for k in off_sd)
+    off.eval()
+    on.eval()
+    seg = torch.randint(1, 256, (2, 2, 40))
+    ans = torch.tensor([25, 20])
+    with torch.no_grad():
+        lo = off.stacked_step(seg, 1, ans, steps=4)["logits"]
+        ln = on.stacked_step(seg, 1, ans, steps=4)["logits"]
+    assert torch.equal(lo, ln), "readback-on != readback-off at step 0 (identity-init broken)"
+
+
+def test_stacked_readback_lm_leak_probe_exactly_zero() -> None:
+    """The bounded strictly-causal readback adds NO future dependence: leak stays EXACTLY 0."""
+    torch.manual_seed(1)
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, reasoning_segment_len=64, tandem_readback=True,
+        tandem_readback_window=16, tandem_readback_heads=2,
+    )))
+    seg = torch.randint(1, 256, (2, 2, 48))
+    ans = torch.tensor([30, 25])
+    assert _stacked_leak_maxdiff(on, seg, 1, ans, steps=4) == 0.0
+
+
+def test_stacked_readback_bad_window_and_heads_raise() -> None:
+    from graph_llm.models.components.stacked_tandem import ReadbackAttention
+
+    with pytest.raises(ValueError):
+        ReadbackAttention(32, window=0)
+    with pytest.raises(ValueError):
+        ReadbackAttention(30, n_heads=4)  # 30 % 4 != 0
+
+
+def test_stacked_bad_inner_mode_raises() -> None:
+    with pytest.raises(ValueError, match="stacked_inner_mode"):
+        build_model(_full_cfg(_stk_cfg(tandem_blocks=2, stacked_inner_mode="bogus")))
+
+
+def test_stacked_asym_inner_mode_disables_inner_reasoner() -> None:
+    """asym: only the FINAL block has a reasoner; inner blocks are memory + workhorse."""
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2, stacked_inner_mode="asym")))
+    assert on.stacked_blocks[0].reasoner is None
+    assert on.stacked_blocks[1].reasoner is not None
+
+
+# --- Stage-wise warmup schedule derivation (the tested-guard pattern) --------
+
+
+def test_resolve_stagewise_release_requires_type_warmup() -> None:
+    """stagewise_warmup with type_warmup<=0 RAISES (no silent broken schedule) — without the
+    forced-decomposition window the two-stage compositional strategy cannot bootstrap."""
+    with pytest.raises(ValueError, match="type_warmup"):
+        _resolve_stagewise_release(TandemConfig(stagewise_warmup=True, type_warmup=0))
+
+
+def test_resolve_stagewise_release_returns_type_warmup() -> None:
+    """Stage-wise release == type_warmup (both gates release together); this is also the
+    routing-lock point the depth-ramp delay composes with (release=type_warmup)."""
+    cfg = TandemConfig(stagewise_warmup=True, type_warmup=600, gate_commit_anneal=800)
+    assert _resolve_stagewise_release(cfg) == 600
+    # routing-locks-before-ramp: the existing ramp-delay resolver uses release=type_warmup.
+    ramp = TandemConfig(
+        stagewise_warmup=True, type_warmup=600, gate_commit_anneal=800, r_depth_ramp=True
+    )
+    assert _resolve_ramp_delay(ramp) == 600 + 800
+
+
+def test_resolve_stagewise_release_non_stagewise_is_max_of_releases() -> None:
+    """A non-stagewise stacked run releases at the later of the outer/inner warmups."""
+    cfg = TandemConfig(stagewise_warmup=False, type_warmup=600, inner_mix_warmup=1000)
+    assert _resolve_stagewise_release(cfg) == 1000
+
+
+def test_stacked_block_controls_stagewise_forces_both_gates() -> None:
+    """During type_warmup, stage-wise forces BOTH gates to the known decomposition (block 0
+    to ``kind``; inner blocks to ``kind`` but with C rows -> reasoner), then releases."""
+    cfg = TandemConfig(tandem_blocks=2, stagewise_warmup=True, type_warmup=100)
+    kind = torch.tensor([0, 1, 2, 0])   # M->mem, R->reason, P->mlp, C->mem (retrieve)
+    tid = torch.tensor([0, 1, 2, 3])    # ... with the last row a C example (type id 3)
+    fg, gm = _stacked_block_controls(cfg, step=10, kind=kind, type_id=tid)
+    assert fg[0] is not None and fg[0].tolist() == [0, 1, 2, 0]   # block 0 = kind (C->mem)
+    assert fg[1] is not None and fg[1].tolist() == [0, 1, 2, 1]   # inner: C row -> reasoner
+    assert gm == [False, False]
+    # after release: no forcing anywhere.
+    fg2, gm2 = _stacked_block_controls(cfg, step=200, kind=kind, type_id=tid)
+    assert fg2 == [None, None] and gm2 == [False, False]
+
+
+def test_stacked_block_controls_default_inner_mix() -> None:
+    """Non-stagewise (rung a): block 0 type-warmup; inner blocks uniform forced-mix until
+    inner_mix_warmup, then free."""
+    cfg = TandemConfig(
+        tandem_blocks=2, stagewise_warmup=False, type_warmup=100, inner_mix_warmup=200
+    )
+    kind = torch.tensor([0, 1, 2])
+    tid = torch.tensor([0, 1, 2])
+    fg, gm = _stacked_block_controls(cfg, step=50, kind=kind, type_id=tid)
+    assert fg[0] is not None and fg[1] is None
+    assert gm == [False, True]     # inner block in forced-mix
+    fg2, gm2 = _stacked_block_controls(cfg, step=150, kind=kind, type_id=tid)
+    assert fg2[0] is None and gm2 == [False, True]   # outer released, inner still mixing
+    _, gm3 = _stacked_block_controls(cfg, step=250, kind=kind, type_id=tid)
+    assert gm3 == [False, False]   # both free
+
+
+def test_stacked_gate_losses_finite_and_gated_by_warmup() -> None:
+    """The unsupervised 3-way gate loss is zero during the warmup and finite/positive after."""
+    cfg = TandemConfig(
+        tandem_blocks=2, stagewise_warmup=True, type_warmup=100, gate_commit_anneal=100
+    )
+    gates = [torch.softmax(torch.randn(8, 3), dim=-1) for _ in range(2)]
+    during = _stacked_gate_losses(cfg, gates, step=10)
+    after = _stacked_gate_losses(cfg, gates, step=250)
+    assert float(during) == 0.0        # both gates still in the stage-wise warmup
+    assert torch.isfinite(after) and float(after) > 0.0
+
+
+def test_build_tandem_model_wires_stacked_blocks_and_readback() -> None:
+    """The trainer build path forwards tandem_blocks + readback into the model (composes CPU)."""
+    from graph_llm.train.tandem import build_tandem_model
+
+    cfg = TandemConfig(
+        d_model=32, delta_layers=1, delta_n_heads=4, delta_head_dim=16, seg_len=64, k_train=8,
+        tandem_blocks=2, readback=True, readback_window=16, readback_heads=2,
+    )
+    model = build_tandem_model(cfg, torch.device("cpu"))
+    assert len(model.stacked_blocks) == 2
+    assert model.readback is not None
+    seg = torch.randint(1, 256, (2, 2, 64))
+    out = model.stacked_step(seg, 1, torch.tensor([50, 40]), steps=8)
+    assert out["logits"].shape == (2, 256)
+    assert len(out["gates"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (card 3ac77deb comment 272): forget-gate init, readback learnability,
+# reason_reads_hidden coverage, combined leak path
+# ---------------------------------------------------------------------------
+
+
+def test_stacked_block_forget_gate_remember_by_default_init() -> None:
+    """BLOCKER-1 regression guard: each stacked block's GatedDeltaMemory is EXCLUDED from the
+    generic init loop and has no self-init, so without the explicit correction its forget gate
+    would sit at the raw PyTorch default (alpha~=0.5 — the card-1e9245f4 regression).  With the
+    fix every stacked block's alpha_proj.bias == delta_forget_bias_init (alpha~=0.98), matching
+    the outer backbone.  Exercises the ModelConfig DEFAULT (delta_use_forget_gate=True)."""
+    cfg = _stk_cfg(tandem_blocks=2, delta_use_forget_gate=True, delta_forget_bias_init=-4.0)
+    m = build_model(_full_cfg(cfg))
+    for blk in m.stacked_blocks:
+        assert blk.mem.alpha_proj is not None, "forget gate ON must build alpha_proj"
+        bias = blk.mem.alpha_proj.bias.detach()
+        assert torch.allclose(bias, torch.full_like(bias, -4.0)), (
+            f"stacked block forget bias {bias.tolist()} != delta_forget_bias_init (-4.0)"
+        )
+        alpha = torch.exp(-torch.nn.functional.softplus(bias))
+        assert bool((alpha > 0.9).all()), f"remember-by-default broken (alpha={alpha.tolist()})"
+    # The outer backbone (self.blocks) still gets the same correction.
+    for b in m.blocks:
+        if b.mixer.alpha_proj is not None:
+            ob = b.mixer.alpha_proj.bias.detach()
+            assert torch.allclose(ob, torch.full_like(ob, -4.0))
+
+
+def test_stacked_block_forget_gate_honours_configured_bias() -> None:
+    """A non-default delta_forget_bias_init flows to the stacked blocks too."""
+    m = build_model(_full_cfg(_stk_cfg(tandem_blocks=2, delta_use_forget_gate=True,
+                                       delta_forget_bias_init=-2.0)))
+    for blk in m.stacked_blocks:
+        assert blk.mem.alpha_proj is not None
+        bias = blk.mem.alpha_proj.bias.detach()
+        assert torch.allclose(bias, torch.full_like(bias, -2.0))
+
+
+def test_readback_is_learnable_not_a_dead_gradient_trap() -> None:
+    """BLOCKER-2 regression guard: the readback must be able to OPEN under training.  It is a
+    residual scaled by ``alpha`` (init 0) so ``alpha * o_proj(o) == 0`` at init (identity), but
+    ``o_proj`` keeps its NORMAL init so ``alpha``'s gradient == o_proj(o) is NONZERO — the
+    pathway is learnable.  (Zero-initialising o_proj too would make BOTH factors zero -> every
+    grad a fixed point at zero forever.)  The module opens sequentially: alpha first (step 1),
+    then q/k/v/o_proj once alpha has moved off 0."""
+    torch.manual_seed(0)
+    rb = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, tandem_readback=True, tandem_readback_window=16, tandem_readback_heads=2,
+    )))
+    assert rb.readback is not None
+    rb.train()
+    seg = torch.randint(1, 256, (2, 2, 40))
+    ans = torch.tensor([25, 20])
+    tgt = torch.randint(0, 256, (2,))
+    out = rb.stacked_step(seg, 1, ans, steps=4)
+    torch.nn.functional.cross_entropy(out["logits"], tgt).backward()
+    # After ONE forward+backward alpha has a live (nonzero) gradient -> the channel can open.
+    assert rb.readback.alpha.grad is not None
+    assert float(rb.readback.alpha.grad.abs().sum()) > 0.0, "alpha grad is zero -> dead-gradient trap"
+
+    def _gsum(mod: torch.nn.Module) -> float:
+        return sum(float(p.grad.abs().sum()) for p in mod.parameters() if p.grad is not None)
+
+    # Move alpha off 0, then the whole projection stack receives gradient (the module trains).
+    opt = torch.optim.SGD(rb.parameters(), lr=1.0)
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+    out2 = rb.stacked_step(seg, 1, ans, steps=4)
+    torch.nn.functional.cross_entropy(out2["logits"], tgt).backward()
+    assert _gsum(rb.readback.q_proj) > 0.0
+    assert _gsum(rb.readback.k_proj) > 0.0
+    assert _gsum(rb.readback.v_proj) > 0.0
+    assert _gsum(rb.readback.o_proj) > 0.0
+
+
+def test_readback_oproj_not_zero_init() -> None:
+    """The o_proj weight must NOT be zero-init (that was the dead-gradient trap)."""
+    from graph_llm.models.components.stacked_tandem import ReadbackAttention
+
+    rb = ReadbackAttention(32, window=16, n_heads=2)
+    assert float(rb.o_proj.weight.detach().abs().sum()) > 0.0, "o_proj is zero-init (dead trap)"
+    assert float(rb.alpha.detach().abs().sum()) == 0.0, "alpha must be zero-init (identity-at-init)"
+
+
+def test_stacked_reason_reads_hidden_shape_leak_and_grads() -> None:
+    """MAJOR-2 coverage: stacked_reason_reads_hidden=True (inner reasoner addresses the block
+    HIDDEN via its own GRU re-encoder) is a shipped reachable path — assert it is shape-correct,
+    EXACTLY leak-free, and gradients reach every block's reasoner."""
+    torch.manual_seed(0)
+    m = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, stacked_reason_reads_hidden=True, reasoning_segment_len=64,
+    )))
+    # inner block re-grounds on the hidden; block 0 keeps the raw-token tap.
+    assert m.stacked_blocks[0].reason_reads_hidden is False
+    assert m.stacked_blocks[1].reason_reads_hidden is True
+    # shape
+    m.train()
+    b, n_seg, length = 3, 2, 40
+    seg = torch.randint(1, 256, (b, n_seg, length))
+    ans = torch.tensor([30, 25, 20])
+    out = m.stacked_step(seg, 1, ans, steps=4, tf_seed=ans - 1)
+    assert out["logits"].shape == (b, m.vocab_size)
+    assert out["aux"]["walk_w"].shape == (b, 4, length)
+    # leak exactly 0.0 on this new path
+    assert _stacked_leak_maxdiff(m, seg, 1, ans, steps=4) == 0.0
+    # grads reach every block's reasoner (including the hidden-reading inner one)
+    tgt = torch.randint(0, 256, (b,))
+    loss = torch.nn.functional.cross_entropy(out["logits"], tgt)
+    loss = loss + torch.nn.functional.cross_entropy(out["aux"]["seed_logits"], (ans - 1).clamp(0, length - 1))
+    loss.backward()
+    for blk in m.stacked_blocks:
+        assert blk.reasoner is not None
+        assert any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in blk.reasoner.parameters() if p.requires_grad
+        ), "no grad reached a block reasoner in reason_reads_hidden mode"
+
+
+def test_stacked_readback_plus_conv_combined_leak_probe_exactly_zero() -> None:
+    """MINOR (b): the combined stacked + readback + multiscale-conv front-end path stays
+    EXACTLY causal (criterion 2 asks for every new path, not just pairwise)."""
+    torch.manual_seed(0)
+    m = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, reasoning_segment_len=64, front_end="multiscale_conv",
+        tandem_readback=True, tandem_readback_window=16, tandem_readback_heads=2,
+    )))
+    assert m.front_end is not None and m.readback is not None
+    seg = torch.randint(1, 256, (2, 2, 48))
+    for t_pert in (30, 25):  # both answer positions
+        assert _stacked_leak_maxdiff(m, seg, 1, torch.tensor([t_pert, t_pert]), steps=4) == 0.0
+
+
+def test_composable_reasoner_hidden_input_matches_shared_walk() -> None:
+    """The refactor routes reason_reads_hidden through the shared _walk_window(hidden_input=
+    True); with seed_ctx=0 it equals query_forward(hidden_input=True) on the same hidden."""
+    torch.manual_seed(0)
+    cfg = _on_cfg(d_model=24, reasoning_segment_len=32, causal_reasoner_steps=4)
+    r = ComposableCausalReasoner(cfg)
+    r.eval()
+    b, t = 2, 28
+    h = torch.randn(b, t, 24)
+    qpos = torch.tensor([t - 1, 15])
+    with torch.no_grad():
+        base = r.query_forward(h, qpos, steps=4, hidden_input=True)
+        comp, _ = r.query_forward_composed(h, qpos, torch.zeros(b, 24), steps=4, hidden_input=True)
+    assert isinstance(base, torch.Tensor)
+    assert torch.allclose(base, comp, atol=1e-6)

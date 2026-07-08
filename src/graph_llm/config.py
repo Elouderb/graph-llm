@@ -382,6 +382,55 @@ class ModelConfig:
     # LM-leak-safe (logits[t] depend only on tokens <= t) property is preserved at any depth.
     tandem_mlp_depth: int = 1
 
+    # --- Stacked tandem blocks: vertical stacking of the tandem block (card 3ac77deb) ---
+    # An OPTIONAL VERTICAL stack of N whole tandem blocks — each block =
+    # {delta memory || causal reasoner || per-position workhorse} -> 3-way softmax gate ->
+    # fused per-position hidden; block N's full-sequence fused output is block N+1's input
+    # stream and only the FINAL block feeds the (untied) LM head.  Because a single fusion
+    # point runs memory and reasoner in PARALLEL on the same input, a single block PROVABLY
+    # fails a two-stage compositional (retrieve-then-reason) task; a SECOND block reasoning
+    # over the FIRST block's retrieval composes it (validated 3/3 seeds, card 3ac77deb).
+    #
+    # tandem_blocks=1 (default) builds the SHIPPED single-fusion tandem BYTE-FOR-BYTE (no
+    # stacked module, no readback, no extra params / RNG draws / state_dict keys) -> a clean
+    # default-off flag.  tandem_blocks>=2 requires tandem_enabled=True and builds the stacked
+    # blocks INSTEAD of the single causal_reasoner/gate/mlp; the stacked path is driven by the
+    # separate ``stacked_step`` entry (the plain ``forward`` still returns the memory-backbone
+    # (loss, logits), like ``tandem_step`` for the single tandem).
+    tandem_blocks: int = 1
+    # Inner-block routing mode (mitigation ladder): "mix" (the WINNING arm — every block is a
+    # full 3-way tandem, unsupervised inner gate), "share" (inner blocks tie the outer gate's
+    # weights), or "asym" (memory+workhorse per block, ONE reasoner in the FINAL block).
+    stacked_inner_mode: str = "mix"
+    # Per-block 3-way gate bias init (stacked).  0.0 (neutral) is the validated stacked
+    # default (the controlled M/R/P/C repro routes cleanest from a neutral gate; distinct
+    # from the single tandem's memory-favoring ``tandem_gate_bias_init``).
+    stacked_gate_bias_init: float = 0.0
+    # GatedMLP (GELU) inner expansion for each stacked block's per-position workhorse.
+    stacked_mlp_ff_mult: int = 2
+    # Structural-necessity variant: inner (block>=2) reasoners address the READBACK-grounded
+    # block HIDDEN (via their own GRU re-encoder) instead of their raw-token tap.  False
+    # (default) = the validated raw-token reasoner (neither a raw hidden tap nor the readback
+    # is structurally required — card 3ac77deb).
+    stacked_reason_reads_hidden: bool = False
+
+    # --- Optional bounded cross-attention READBACK between block 0 and block 1 (card 3ac77deb) ---
+    # A small bounded strictly-causal cross-attention that re-grounds block-1's input in the
+    # surface (front-end) embeddings block-0's fusion may have abstracted away: Q = block-0
+    # fused output, K/V = the bottom front-end embedding stream, window-relative RoPE, a causal
+    # BOUNDED window (t attends only to j in (t-window, t], O(T*W)), 1-2 heads.  A learned
+    # residual scale (alpha) is init 0, so it is an EXACT no-op at step 0 (readback-on ==
+    # readback-off); the output projection keeps its normal random init — zero-initing BOTH
+    # factors makes every gradient in the module exactly 0 forever (a dead pathway that can
+    # never learn to open; card 3ac77deb review blocker 2).  alpha's gradient is o_proj(o),
+    # so the channel opens under training.  The bounded causal window keeps the prediction
+    # position leak-free.  Only meaningful when tandem_blocks>=2; a no-op otherwise.
+    #
+    # tandem_readback=False (default) builds NOTHING (no module, no params, no state_dict keys).
+    tandem_readback: bool = False
+    tandem_readback_window: int = 32     # bounded causal window W (positions the query attends to)
+    tandem_readback_heads: int = 2       # number of readback attention heads (d_model % heads == 0)
+
     # --- Unsupervised gate-routing losses (card 31fe6b00, applied by TandemTrainer) ---
     # Label-free routing: the main answer loss decides DIRECTION per example; these force
     # DIFFERENTIATION.  The load-bearing rung is the forced-mix warmup (both pathways

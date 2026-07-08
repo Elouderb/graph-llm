@@ -456,9 +456,10 @@ class ModelConfig:
 class DataConfig:
     """Dataset and tokenization settings."""
 
-    # source: "synthetic" | "enwik8" | "text8" | "wikitext103" | "tinystories"
-    # enwik8/text8 use the canonical 90M/5M/5M byte split; wikitext103 is loaded
-    # byte-level (BPB) for now (token-level ppl seam documented in loader.py).
+    # source: "synthetic" | "enwik8" | "text8" | "wikitext103" | "tinystories" | "enwik9"
+    # enwik8/text8 use the canonical 90M/5M/5M byte split; enwik9 (card 69776c3e, the
+    # next rung above text8 for the parameter mini-ladder) uses 990M/5M/5M; wikitext103
+    # is loaded byte-level (BPB) for now (token-level ppl seam documented in loader.py).
     source: str = "synthetic"
     encoder: str = "byte"              # "byte" | "bpe" (card e1644700)
     bpe_tokenizer_path: str | None = None  # path to saved BPETokenizer JSON
@@ -485,6 +486,15 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints/"
     resume_from: str | None = None
     log_every: int = 100
+
+    # --- Unified eval-report hook (card 69776c3e) ---
+    # Consumed by SegmentedTrainer to periodically write the unified eval report
+    # (val bpb + cross-segment retrieval + in-model reasoning-depth accuracy +
+    # routing health -- see eval/report.py) to disk during a long run.
+    # ``eval_every=0`` (default) == off, byte-for-byte the existing behaviour (no
+    # extra eval passes, no report I/O).
+    eval_every: int = 0
+    eval_run_dir: str = "eval_reports/"
 
 
 # ---------------------------------------------------------------------------

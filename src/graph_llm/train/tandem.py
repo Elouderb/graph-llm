@@ -33,6 +33,7 @@ import random
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -42,6 +43,12 @@ from graph_llm.config import Config, DataConfig, ModelConfig, TrainConfig
 from graph_llm.data.loader import load_text8_bytes
 from graph_llm.data.reasoning_tasks import make_reasoning_example
 from graph_llm.models import build_model
+from graph_llm.train.checkpoint import (
+    capture_rng_state,
+    load_training_checkpoint,
+    restore_rng_state,
+    save_training_checkpoint,
+)
 
 
 @dataclass
@@ -201,6 +208,23 @@ class TandemConfig:
     # An explicit ``0`` ramps concurrently with the type-warmup (the Option-B ablation) and is
     # WARNED; any explicit value shorter than the safe point is also warned.
     r_depth_ramp_delay: int = -1
+
+    # --- Checkpoint / resume (card 69776c3e) ---
+    # Periodic checkpointing for multi-day runs.  ``checkpoint_dir=None`` (default) ==
+    # off, byte-for-byte the existing behaviour (no checkpoint I/O, no extra RNG
+    # bookkeeping).  When enabled, a checkpoint is written every ``checkpoint_every``
+    # steps capturing model + optimizer + scheduler + the loop's own ``step`` + EVERY
+    # RNG stream the loop draws from (the python ``rng``, the plain-text ``np_tr``/
+    # ``np_ev`` generators when ``mlp_enabled``, and torch CPU + CUDA) — see
+    # train/checkpoint.py.  A resumed run continues the depth-ramp / type-warmup /
+    # forced-mix / commit-anneal curriculum EXACTLY: every one of those is a pure
+    # function of the restored ``step`` (the curriculum functions all take ``step``
+    # as an explicit argument) or of the model's own ``_tandem_step`` buffer (already
+    # part of ``model.state_dict()``), so no separate counters are needed beyond what
+    # is captured here (verified by the resume-equivalence test).
+    checkpoint_dir: str | None = None
+    checkpoint_every: int = 0        # 0 == never save
+    resume_from: str | None = None   # path to a checkpoint saved by this trainer
 
 
 def _ramp_depth(cfg: TandemConfig, step: int, rng: random.Random) -> int:
@@ -543,7 +567,27 @@ def _answer_gather(t: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
     return t[torch.arange(b, device=t.device), pos]
 
 
-def _train_one(cfg: TandemConfig, seed: int, device: torch.device, verbose: bool) -> dict:
+def _train_one(
+    cfg: TandemConfig,
+    seed: int,
+    device: torch.device,
+    verbose: bool,
+    *,
+    capture_model: bool = False,
+) -> dict:
+    """Train one seed and return its eval report.
+
+    Args:
+        cfg: Run configuration.
+        seed: RNG seed for the model init + the M/R/P example stream.
+        device: Training device.
+        verbose: Print per-``log_every``-step progress.
+        capture_model: When ``True``, include a deep-copied ``"final_model_state"``
+            (the trained model's ``state_dict()``) in the returned dict, for exact
+            state comparison in the resume-equivalence test (card 69776c3e).
+            Default ``False`` keeps the returned dict byte-for-byte the shipped
+            shape plus the (always-included, cheap) ``"loss_history"`` list.
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
     # Progressive-ramp invariants (enforced at the RUNTIME path so they hold for EVERY entry
@@ -575,9 +619,37 @@ def _train_one(cfg: TandemConfig, seed: int, device: torch.device, verbose: bool
         np_tr = np.random.default_rng(2024 + seed)
         np_ev = np.random.default_rng(9090 + seed)
     stream_kinds = ("M", "R", "P") if cfg.mlp_enabled else ("M", "R")
+
+    # Resume (card 69776c3e): restore model/optimizer/scheduler + every RNG stream
+    # this loop draws from, then continue the step counter where the checkpoint left
+    # off.  Every curriculum quantity below (`_ramp_depth`, `type_warmup`, the gate
+    # commit-anneal weight) is a pure function of `step` + those RNG streams, so
+    # nothing else needs restoring for the schedule to continue correctly.
+    start_step = 0
+    if cfg.resume_from:
+        # NOTE: load onto CPU (the default), NOT map_location=device -- the payload's
+        # rng_state["torch_cpu"] must stay a CPU ByteTensor (torch.set_rng_state
+        # requires it); model.load_state_dict / optimizer.load_state_dict both cast
+        # the loaded (CPU) tensors to the model's/optimizer's own device automatically,
+        # so this is safe regardless of what device `model`/`opt` already live on.
+        ckpt = load_training_checkpoint(cfg.resume_from)
+        model.load_state_dict(ckpt["model_state"])
+        opt.load_state_dict(ckpt["optimizer_state"])
+        if ckpt.get("scheduler_state") is not None:
+            sched.load_state_dict(ckpt["scheduler_state"])
+        start_step = int(ckpt["step"])
+        if ckpt.get("rng_state") is not None:
+            np_rngs = {}
+            if np_tr is not None:
+                np_rngs["np_tr"] = np_tr
+            if np_ev is not None:
+                np_rngs["np_ev"] = np_ev
+            restore_rng_state(ckpt["rng_state"], py_rng=rng, np_rngs=np_rngs)
+
+    loss_history: list[float] = []
     model.train()
     t0 = time.time()
-    for step in range(cfg.train_steps):
+    for step in range(start_step, cfg.train_steps):
         kinds = [rng.choice(stream_kinds) for _ in range(cfg.batch_size)]
         depth = _ramp_depth(cfg, step, rng)
         nb = make_stream_batch(rng, kinds, depth, cfg, text8_tr, np_tr)
@@ -657,6 +729,28 @@ def _train_one(cfg: TandemConfig, seed: int, device: torch.device, verbose: bool
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         sched.step()
+        loss_history.append(float(loss.item()))
+
+        # Periodic checkpoint (card 69776c3e): off by default (checkpoint_dir=None).
+        if cfg.checkpoint_dir and cfg.checkpoint_every > 0 and (step + 1) % cfg.checkpoint_every == 0:
+            np_rngs = {}
+            if np_tr is not None:
+                np_rngs["np_tr"] = np_tr
+            if np_ev is not None:
+                np_rngs["np_ev"] = np_ev
+            rng_state = capture_rng_state(py_rng=rng, np_rngs=np_rngs)
+            ckpt_path = Path(cfg.checkpoint_dir) / f"tandem_ckpt_seed{seed}_step{step + 1:06d}.pt"
+            save_training_checkpoint(
+                ckpt_path,
+                step=step + 1,
+                model=model,
+                optimizer=opt,
+                scheduler=sched,
+                rng_state=rng_state,
+            )
+            if verbose:
+                print(f"    [tandem s{seed}] wrote checkpoint {ckpt_path}", flush=True)
+
         if verbose and (step % cfg.log_every == 0 or step == cfg.train_steps - 1):
             mixflag = "MIX" if out["gate_mix"] is not None else "   "
             mixflag = f"{mixflag} d{depth:>2d}" if cfg.r_depth_ramp else mixflag
@@ -681,8 +775,22 @@ def _train_one(cfg: TandemConfig, seed: int, device: torch.device, verbose: bool
                           f"gate[R={gr:.3f} M={gm:.3f} sep={gr - gm:+.3f}]", flush=True)
 
     erng = random.Random(7777 + seed)
+
+    def _attach_resume_debug(result: dict) -> dict:
+        """Add the (always-cheap) loss history + optional full model-state capture
+        used by the resume-equivalence test (card 69776c3e) -- never consulted by
+        the shipped ``report()``/CLI paths, so this is purely additive."""
+        result["loss_history"] = loss_history
+        if capture_model:
+            result["final_model_state"] = {
+                k: v.detach().clone() for k, v in model.state_dict().items()
+            }
+        return result
+
     if cfg.mlp_enabled:
-        return _finish_3way(model, cfg, seed, device, erng, text8_ev, np_ev, params, t0, verbose)
+        return _attach_resume_debug(
+            _finish_3way(model, cfg, seed, device, erng, text8_ev, np_ev, params, t0, verbose)
+        )
     accM, gM = _eval_M(model, cfg, erng, device)
     accR: dict[int, float] = {}
     gR: dict[int, float] = {}
@@ -705,12 +813,12 @@ def _train_one(cfg: TandemConfig, seed: int, device: torch.device, verbose: bool
               f"| gate[M={gM:.3f} {gstr}]", flush=True)
         print(f"      DISSOCIATION memory_only[M={mem_M:.3f} R={mem_R:.3f}] "
               f"reasoner_only[M={rea_M:.3f} R={rea_R:.3f}]", flush=True)
-    return {
+    return _attach_resume_debug({
         "seed": seed, "params": params, "acc_M": accM,
         "acc_R": {str(depth): accR[depth] for depth in cfg.test_r_depths},
         "gate_M": gM, "gate_R": {str(depth): gR[depth] for depth in cfg.test_r_depths},
         "dissociation": dissoc, "wall_seconds": dt,
-    }
+    })
 
 
 def _fmt3(v) -> str:

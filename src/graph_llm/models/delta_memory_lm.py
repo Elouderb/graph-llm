@@ -343,6 +343,7 @@ class DeltaMemoryLM(nn.Module):
         if inner_mode == "asym" and n_blocks > 1:
             reason_flags = [False] * (n_blocks - 1) + [True]
         reads_hidden = bool(getattr(m, "stacked_reason_reads_hidden", False))
+        gate_per_channel = bool(getattr(m, "stacked_gate_per_channel", False))
         self.stacked_blocks = nn.ModuleList(
             [
                 StackedTandemBlock(
@@ -352,6 +353,7 @@ class DeltaMemoryLM(nn.Module):
                     mlp_ff_mult=m.stacked_mlp_ff_mult,
                     # only INNER (>=2nd) blocks can re-ground on the block hidden.
                     reason_reads_hidden=reads_hidden and i > 0,
+                    gate_per_channel=gate_per_channel,
                 )
                 for i in range(n_blocks)
             ]

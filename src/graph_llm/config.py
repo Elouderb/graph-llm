@@ -417,6 +417,20 @@ class ModelConfig:
     # (default) = the validated raw-token reasoner (neither a raw hidden tap nor the readback
     # is structurally required — card 3ac77deb).
     stacked_reason_reads_hidden: bool = False
+    # Per-channel stacked gate (rung-1 Stage B scalar-vs-per-channel A/B, card 1cfe0cb8):
+    # mirrors the single-fusion tandem's ``tandem_gate_scalar=False`` per-channel gate. False
+    # (default) == the SHIPPED, validated SCALAR stacked gate (``Linear(4*d_model, 3)``, one
+    # 3-way softmax per position, broadcast over channels) — byte-for-byte the committed
+    # stacked recipe (same params / RNG draws / state_dict shapes). True builds a PER-CHANNEL
+    # gate instead (``Linear(4*d_model, 3*d_model)`` reshaped to ``(..., d_model, 3)``, an
+    # independent 3-way softmax PER CHANNEL so each output channel can route to a different
+    # expert), applied identically at both stacked entry points
+    # (``StackedTandemBlock.forward``/``stacked_step`` and ``StackedTandemBlock.lm_forward``).
+    # Gate-fraction REPORTING always returns a ``(..., 3)`` tensor regardless of this flag (the
+    # per-channel gate is reduced by an equal-weight mean over channels before being
+    # returned/logged), so downstream consumers (``_stacked_gate_losses``,
+    # ``stacked_lm_gate_fractions``, the eval report) need no per-channel-aware branch.
+    stacked_gate_per_channel: bool = False
 
     # --- Optional bounded cross-attention READBACK between block 0 and block 1 (card 3ac77deb) ---
     # A small bounded strictly-causal cross-attention that re-grounds block-1's input in the

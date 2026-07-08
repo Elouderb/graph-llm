@@ -2136,3 +2136,151 @@ def test_stacked_lm_forward_composed_zero_ctx_is_identity() -> None:
         comp = r.forward_composed(x, seed_ctx=torch.randn(2, 40, 24), steps=4)
     assert isinstance(base, torch.Tensor)
     assert torch.equal(base, comp), "forward_composed(seed_ctx) != base forward at zero-init"
+
+
+# ===========================================================================================
+# PER-CHANNEL STACKED GATE (card 1cfe0cb8): stacked_gate_per_channel mirrors the single-fusion
+# tandem's tandem_gate_scalar=False per-channel gate.  Default False = the shipped SCALAR
+# stacked gate (byte-for-byte); True widens Linear(4d, 3) -> Linear(4d, 3*d) and reshapes to
+# (..., d, 3) so each channel gets its own 3-way softmax.  Gate-fraction REPORTING always comes
+# back as (..., 3) (per-channel is reduced by an equal-weight mean over channels).
+# ===========================================================================================
+
+
+def test_stacked_gate_per_channel_default_is_false() -> None:
+    assert ModelConfig().stacked_gate_per_channel is False
+
+
+def test_stacked_gate_per_channel_flag_off_is_byte_for_byte() -> None:
+    """Explicit stacked_gate_per_channel=False (the new plumbing) matches the flag-omitted
+    baseline EXACTLY under a fixed seed: same state_dict keys, param count, and logits."""
+    torch.manual_seed(3)
+    baseline = build_model(_full_cfg(_stk_cfg(tandem_blocks=2)))
+    torch.manual_seed(3)
+    explicit_off = build_model(_full_cfg(_stk_cfg(tandem_blocks=2, stacked_gate_per_channel=False)))
+    assert set(baseline.state_dict()) == set(explicit_off.state_dict())
+    assert baseline.num_parameters() == explicit_off.num_parameters()
+    baseline.eval()
+    explicit_off.eval()
+    x = torch.randint(1, 256, (2, 24))
+    with torch.no_grad():
+        _, la = baseline(x)
+        _, lb = explicit_off(x)
+    assert torch.equal(la, lb), "stacked_gate_per_channel=False is not byte-for-byte HEAD"
+
+
+def test_stacked_gate_per_channel_builds_wider_gate() -> None:
+    """gate_per_channel=True widens each block's gate to Linear(4d, 3d) (reshaped (..., d, 3))
+    instead of the shipped Linear(4d, 3); the gate input width is unchanged."""
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2, stacked_gate_per_channel=True)))
+    for blk in on.stacked_blocks:
+        assert blk.gate_per_channel is True
+        assert blk.gate.in_features == 4 * on.d_model
+        assert blk.gate.out_features == 3 * on.d_model
+    scalar_on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2)))
+    assert scalar_on.num_parameters() < on.num_parameters(), "per-channel gate must add params"
+
+
+def test_stacked_step_gate_per_channel_shapes_and_sums_to_one() -> None:
+    """stacked_step's reported per-block gate stays (B, 3) (equal-weight channel mean) and
+    each row still sums to 1 over experts, matching the scalar gate's reporting contract."""
+    torch.manual_seed(0)
+    on = build_model(
+        _full_cfg(_stk_cfg(tandem_blocks=2, reasoning_segment_len=48, stacked_gate_per_channel=True))
+    )
+    on.train()
+    b, n_seg, length = 3, 2, 40
+    seg = torch.randint(1, 256, (b, n_seg, length))
+    ans = torch.tensor([30, 25, 20])
+    tf = torch.tensor([5, 8, 3])
+    out = on.stacked_step(seg, answer_seg=1, answer_pos=ans, steps=4, tf_seed=tf)
+    assert len(out["gates"]) == 2
+    for g in out["gates"]:
+        assert g.shape == (b, 3)
+        assert torch.allclose(g.sum(-1), torch.ones(b), atol=1e-5)
+
+
+def test_stacked_step_leak_probe_per_channel_exactly_zero() -> None:
+    """The segment/task-structured stacked_step path stays EXACTLY causal with the per-channel
+    gate on."""
+    torch.manual_seed(0)
+    on = build_model(
+        _full_cfg(_stk_cfg(tandem_blocks=2, reasoning_segment_len=64, stacked_gate_per_channel=True))
+    )
+    seg = torch.randint(1, 256, (2, 2, 48))
+    ans = torch.tensor([30, 25])
+    assert _stacked_leak_maxdiff(on, seg, 1, ans, steps=4) == 0.0
+
+
+def test_stacked_lm_forward_leak_probe_per_channel_exactly_zero() -> None:
+    """The plain-forward (per-position, full-sequence) stacked LM path stays EXACTLY causal
+    with the per-channel gate on."""
+    torch.manual_seed(0)
+    on = build_model(
+        _full_cfg(_stk_cfg(tandem_blocks=2, reasoning_segment_len=64, stacked_gate_per_channel=True))
+    )
+    x = torch.randint(1, 256, (2, 48))
+    assert _stacked_lm_leak_maxdiff(on, x, cut=20) == 0.0
+
+
+def test_stacked_gate_per_channel_finite_grads_reach_gate_reasoner_memory() -> None:
+    """A stacked answer-CE loss sends finite non-zero grads to every block's (widened)
+    per-channel gate, reasoner, and memory."""
+    torch.manual_seed(0)
+    on = build_model(
+        _full_cfg(_stk_cfg(tandem_blocks=2, stacked_gate_per_channel=True))
+    )
+    on.train()
+    b, n_seg, length = 4, 2, 32
+    seg = torch.randint(1, 256, (b, n_seg, length))
+    ans = torch.full((b,), length - 2)
+    tgt = torch.randint(0, 256, (b,))
+    out = on.stacked_step(seg, 1, ans, steps=4, tf_seed=ans - 1)
+    loss = torch.nn.functional.cross_entropy(out["logits"], tgt)
+    loss.backward()
+
+    def _has_grad(mod: torch.nn.Module) -> bool:
+        return any(
+            p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
+            for p in mod.parameters()
+            if p.requires_grad
+        )
+
+    for blk in on.stacked_blocks:
+        assert _has_grad(blk.gate), "per-channel gate has no live gradient"
+        assert _has_grad(blk.mem), "memory has no live gradient under the per-channel gate"
+        if blk.reasoner is not None:
+            assert _has_grad(blk.reasoner), "reasoner has no live gradient under the per-channel gate"
+
+
+def test_stacked_gate_per_channel_lm_gate_fractions_report_sane() -> None:
+    """stacked_lm_gate_fractions still returns one normalised (3,) per block when the gate is
+    per-channel — the reshape(-1, 3).mean(0) reduction composes with the channel-mean already
+    applied inside lm_forward (an equal-weight nested mean == the flat mean)."""
+    torch.manual_seed(0)
+    on = build_model(
+        _full_cfg(_stk_cfg(tandem_blocks=3, reasoning_segment_len=32, stacked_gate_per_channel=True))
+    )
+    on.eval()
+    x = torch.randint(1, 256, (4, 32))
+    fr = on.stacked_lm_gate_fractions(x)
+    assert len(fr) == 3
+    for f in fr:
+        assert f.shape == (3,)
+        assert torch.allclose(f.sum(), torch.tensor(1.0), atol=1e-5)
+        assert bool((f >= 0).all())
+
+
+def test_stacked_gate_per_channel_force_gate_routes_each_row() -> None:
+    """force_gate still routes each row to its specialist with the per-channel gate on: the
+    final-block gate argmax (post channel-mean) equals the assigned expert."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2, stacked_gate_per_channel=True)))
+    on.eval()
+    b, n_seg, length = 3, 2, 24
+    seg = torch.randint(1, 256, (b, n_seg, length))
+    ans = torch.tensor([15, 15, 15])
+    fg = [torch.tensor([0, 1, 2]), torch.tensor([0, 1, 2])]
+    with torch.no_grad():
+        out = on.stacked_step(seg, 1, ans, steps=4, force_gate=fg)
+    assert out["gates"][1].argmax(-1).tolist() == [0, 1, 2]

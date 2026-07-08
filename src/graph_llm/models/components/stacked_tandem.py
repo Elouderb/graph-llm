@@ -181,6 +181,7 @@ class StackedTandemBlock(nn.Module):
         gate_bias_init: float = 0.0,
         mlp_ff_mult: int = 2,
         reason_reads_hidden: bool = False,
+        gate_per_channel: bool = False,
     ) -> None:
         super().__init__()
         self.d_model = cfg.d_model
@@ -195,7 +196,14 @@ class StackedTandemBlock(nn.Module):
         else:
             self.reasoner = None
         self.mlp = StackedWorkhorseMLP(cfg.d_model, mlp_ff_mult)
-        self.gate = nn.Linear(4 * cfg.d_model, 3)
+        # Per-channel gate option (card 1cfe0cb8): False (default) == the shipped SCALAR gate,
+        # one 3-way softmax per position (``Linear(4d, 3)``) — byte-for-byte the committed
+        # stacked recipe.  True builds a PER-CHANNEL gate (``Linear(4d, 3*d)``, reshaped to
+        # ``(..., d, 3)`` in ``forward``/``lm_forward`` — an independent 3-way softmax per
+        # output channel).  Applied consistently to BOTH stacked entry points.
+        self.gate_per_channel = gate_per_channel
+        gate_out = 3 * cfg.d_model if gate_per_channel else 3
+        self.gate = nn.Linear(4 * cfg.d_model, gate_out)
         with torch.no_grad():
             self.gate.bias.fill_(gate_bias_init)
 
@@ -257,7 +265,9 @@ class StackedTandemBlock(nn.Module):
         gate_pred: Tensor | None = None
         for si in range(len(seg_hidden)):
             gin = torch.cat([mem_seq[si], rea_seq[si], mlp_seq[si], seg_hidden[si]], dim=-1)
-            logit = self.gate(gin)  # (B, L, 3)
+            logit = self.gate(gin)  # (B, L, 3) scalar, or (B, L, 3*d_model) per-channel
+            if self.gate_per_channel:
+                logit = logit.view(*logit.shape[:-1], self.d_model, 3)  # (B, L, d, 3)
             if not self.reason_enabled:
                 logit = logit + torch.tensor([0.0, _NEG, 0.0], device=logit.device)
             if gate_noise > 0.0 and self.training:
@@ -269,16 +279,30 @@ class StackedTandemBlock(nn.Module):
                 else:
                     w = torch.tensor([0.5, 0.0, 0.5], device=w.device).expand_as(w)
             if force_gate is not None:
-                oh = F.one_hot(force_gate.clamp(0, 2), num_classes=3).to(w.dtype)
-                w = oh.unsqueeze(1).expand_as(w)
-            fused = (
-                w[..., 0:1] * mem_seq[si]
-                + w[..., 1:2] * rea_seq[si]
-                + w[..., 2:3] * mlp_seq[si]
-            )
+                oh = F.one_hot(force_gate.clamp(0, 2), num_classes=3).to(w.dtype)  # (B, 3)
+                oh_b = oh.unsqueeze(1).unsqueeze(1) if self.gate_per_channel else oh.unsqueeze(1)
+                w = oh_b.expand_as(w)
+            if self.gate_per_channel:
+                # Independent per-channel softmax weights (B, L, d, 3): combine via an
+                # explicit stack + weighted sum.  Summation order is immaterial here — there
+                # is no prior byte-for-byte baseline for this NEW mode, unlike the scalar path
+                # below (card 1cfe0cb8).
+                paths = torch.stack([mem_seq[si], rea_seq[si], mlp_seq[si]], dim=-1)
+                fused = (paths * w).sum(dim=-1)
+            else:
+                # SHIPPED scalar path — kept EXACTLY as committed (identical op order) so the
+                # default stays byte-for-byte ``torch.equal`` against HEAD.
+                fused = (
+                    w[..., 0:1] * mem_seq[si]
+                    + w[..., 1:2] * rea_seq[si]
+                    + w[..., 2:3] * mlp_seq[si]
+                )
             fused_seg.append(fused)
             if si == answer_seg:
-                gate_pred = w[ar, pred_pos]
+                g = w[ar, pred_pos]
+                # Gate-fraction reporting is shape-stable ((B, 3)) regardless of the flag: the
+                # per-channel gate is reduced by an equal-weight mean over channels.
+                gate_pred = g.mean(dim=-2) if self.gate_per_channel else g
         assert gate_pred is not None
         return fused_seg, gate_pred, aux
 
@@ -332,16 +356,31 @@ class StackedTandemBlock(nn.Module):
         else:
             rea = h_in
         # Per-position 3-way gate + fusion (mirrors ``forward`` WITHOUT the pred_pos gather).
-        logit = self.gate(torch.cat([h_mem, rea, h_mlp, h_in], dim=-1))  # (B, T, 3)
+        logit = self.gate(
+            torch.cat([h_mem, rea, h_mlp, h_in], dim=-1)
+        )  # (B, T, 3) scalar, or (B, T, 3*d_model) per-channel
+        if self.gate_per_channel:
+            logit = logit.view(*logit.shape[:-1], self.d_model, 3)  # (B, T, d, 3)
         if not self.reason_enabled:
             logit = logit + torch.tensor([0.0, _NEG, 0.0], device=logit.device)
         w = F.softmax(logit, dim=-1)
-        fused = (
-            w[..., 0:1] * h_mem
-            + w[..., 1:2] * rea
-            + w[..., 2:3] * h_mlp
-        )
-        return fused, w, state_out
+        if self.gate_per_channel:
+            # See ``forward`` — summation order is immaterial for this new mode.
+            paths = torch.stack([h_mem, rea, h_mlp], dim=-1)
+            fused = (paths * w).sum(dim=-1)
+            # Gate-fraction reporting is shape-stable ((B, T, 3)) regardless of the flag: the
+            # per-channel gate is reduced by an equal-weight mean over channels.
+            w_report = w.mean(dim=-2)
+        else:
+            # SHIPPED scalar path — kept EXACTLY as committed (identical op order) so the
+            # default stays byte-for-byte ``torch.equal`` against HEAD.
+            fused = (
+                w[..., 0:1] * h_mem
+                + w[..., 1:2] * rea
+                + w[..., 2:3] * h_mlp
+            )
+            w_report = w
+        return fused, w_report, state_out
 
 
 def _rope_cache(

@@ -162,6 +162,11 @@ class TandemConfig:
     # is the shipped single-fusion tandem.
     tandem_blocks: int = 1
     stacked_inner_mode: str = "mix"     # mix | share | asym (see the model)
+    # INPUT-ROUTED stacked gate (sparse-reasoner-invocation card 75ada834): route BEFORE the
+    # experts — each block's gate reads ``[h_mem ; h_mlp ; ctx]`` (no reasoner output).  Default
+    # False == the shipped output-mixture gate; True re-passes the mechanism gate to prove the
+    # routing survives losing the output-comparison (the decisive risk of the sparse invocation).
+    stacked_gate_input_routed: bool = False
     # STAGE-WISE type-warmup (the WIN, card 3ac77deb): a compositional routing-coordination
     # basin — the two-stage C strategy earns gradient only if BOTH gates commit at once
     # (block-0 retrieval has no payoff until block-1 uses it), so independent unsupervised
@@ -441,6 +446,8 @@ def build_tandem_model(cfg: TandemConfig, device: torch.device) -> torch.nn.Modu
         # Stacked-tandem topology (card 3ac77deb): a no-op at the default tandem_blocks=1.
         tandem_blocks=cfg.tandem_blocks,
         stacked_inner_mode=cfg.stacked_inner_mode,
+        # Input-routed stacked gate (card 75ada834): a no-op at the default False.
+        stacked_gate_input_routed=cfg.stacked_gate_input_routed,
         tandem_readback=cfg.readback,
         tandem_readback_window=cfg.readback_window,
         tandem_readback_heads=cfg.readback_heads,

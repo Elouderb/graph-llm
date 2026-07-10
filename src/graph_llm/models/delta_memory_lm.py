@@ -344,6 +344,8 @@ class DeltaMemoryLM(nn.Module):
             reason_flags = [False] * (n_blocks - 1) + [True]
         reads_hidden = bool(getattr(m, "stacked_reason_reads_hidden", False))
         gate_per_channel = bool(getattr(m, "stacked_gate_per_channel", False))
+        gate_input_routed = bool(getattr(m, "stacked_gate_input_routed", False))
+        reason_threshold = float(getattr(m, "stacked_reason_threshold", 0.0))
         self.stacked_blocks = nn.ModuleList(
             [
                 StackedTandemBlock(
@@ -354,6 +356,11 @@ class DeltaMemoryLM(nn.Module):
                     # only INNER (>=2nd) blocks can re-ground on the block hidden.
                     reason_reads_hidden=reads_hidden and i > 0,
                     gate_per_channel=gate_per_channel,
+                    # INPUT-ROUTED gate + eval sparse-invocation threshold (card 75ada834):
+                    # every block routes BEFORE its reasoner and honours the same tau; the
+                    # StackedTandemBlock ctor validates (scalar-only, tau>=0, tau requires routed).
+                    gate_input_routed=gate_input_routed,
+                    reason_threshold=reason_threshold,
                 )
                 for i in range(n_blocks)
             ]

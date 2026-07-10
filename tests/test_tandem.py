@@ -37,7 +37,10 @@ from graph_llm.config import Config, DataConfig, ModelConfig, TrainConfig
 from graph_llm.models import build_model
 from graph_llm.models.components.causal_reasoner import CausalReasoner
 from graph_llm.models.components.delta_memory import DeltaMemoryState
-from graph_llm.models.components.stacked_tandem import ComposableCausalReasoner
+from graph_llm.models.components.stacked_tandem import (
+    ComposableCausalReasoner,
+    StackedTandemBlock,
+)
 from graph_llm.train.tandem import (
     TandemConfig,
     _build_run_config,
@@ -2284,3 +2287,286 @@ def test_stacked_gate_per_channel_force_gate_routes_each_row() -> None:
     with torch.no_grad():
         out = on.stacked_step(seg, 1, ans, steps=4, force_gate=fg)
     assert out["gates"][1].argmax(-1).tolist() == [0, 1, 2]
+
+
+# ===========================================================================================
+# SPARSE REASONER INVOCATION (card 75ada834): stacked_gate_input_routed routes BEFORE the
+# reasoner (gate reads [h_mem; h_mlp; ctx], scalar 3d->3) so the walk can be SKIPPED; the
+# eval-only stacked_reason_threshold (tau) skips the walk at positions whose reasoner weight is
+# < tau (identity there; EXACT at invoked positions).  Both default-off / byte-for-byte.
+# ===========================================================================================
+
+
+def _routed_block(**ov: Any) -> StackedTandemBlock:
+    """A single input-routed StackedTandemBlock (d_model 32, window 16) for the per-block
+    sparse-invocation mechanism tests."""
+    cfg = _on_cfg(d_model=32, reasoning_segment_len=16, causal_reasoner_steps=4)
+    return StackedTandemBlock(cfg, gate_input_routed=True, **ov)
+
+
+def test_stacked_gate_input_routed_default_is_false() -> None:
+    assert ModelConfig().stacked_gate_input_routed is False
+
+
+def test_stacked_reason_threshold_default_is_zero() -> None:
+    assert ModelConfig().stacked_reason_threshold == 0.0
+
+
+def test_stacked_gate_input_routed_off_is_byte_for_byte() -> None:
+    """Explicit stacked_gate_input_routed=False matches the flag-omitted baseline EXACTLY under
+    a fixed seed: same state_dict keys, param count, and full-model logits."""
+    torch.manual_seed(3)
+    baseline = build_model(_full_cfg(_stk_cfg(tandem_blocks=2)))
+    torch.manual_seed(3)
+    explicit_off = build_model(_full_cfg(_stk_cfg(tandem_blocks=2, stacked_gate_input_routed=False)))
+    assert set(baseline.state_dict()) == set(explicit_off.state_dict())
+    assert baseline.num_parameters() == explicit_off.num_parameters()
+    baseline.eval()
+    explicit_off.eval()
+    x = torch.randint(1, 256, (2, 24))
+    with torch.no_grad():
+        _, la = baseline(x)
+        _, lb = explicit_off(x)
+    assert torch.equal(la, lb), "stacked_gate_input_routed=False is not byte-for-byte HEAD"
+
+
+def test_stacked_gate_input_routed_builds_narrower_gate() -> None:
+    """input_routed=True narrows each block's gate to Linear(3d, 3) (drops h_reason from the
+    gate input) instead of the shipped Linear(4d, 3); the gate output stays 3 experts."""
+    on = build_model(_full_cfg(_stk_cfg(tandem_blocks=2, stacked_gate_input_routed=True)))
+    for blk in on.stacked_blocks:
+        assert blk.gate_input_routed is True
+        assert blk.gate.in_features == 3 * on.d_model
+        assert blk.gate.out_features == 3
+    routed_params = on.num_parameters()
+    shipped = build_model(_full_cfg(_stk_cfg(tandem_blocks=2)))
+    assert routed_params < shipped.num_parameters(), "input-routed gate must be NARROWER (fewer params)"
+
+
+def test_stacked_gate_input_routed_and_per_channel_raises() -> None:
+    """input-routing is scalar-only (the locked ladder gate) — combining it with the per-channel
+    gate raises at construction."""
+    with pytest.raises(ValueError, match="scalar-only"):
+        build_model(_full_cfg(_stk_cfg(
+            tandem_blocks=2, stacked_gate_input_routed=True, stacked_gate_per_channel=True
+        )))
+
+
+def test_stacked_reason_threshold_requires_input_routed_raises() -> None:
+    """A positive threshold without the input-routed gate raises (the gate must route WITHOUT
+    the reasoner output for the walk to be skippable)."""
+    with pytest.raises(ValueError, match="requires stacked_gate_input_routed"):
+        build_model(_full_cfg(_stk_cfg(tandem_blocks=2, stacked_reason_threshold=0.1)))
+
+
+def test_stacked_reason_threshold_negative_raises() -> None:
+    with pytest.raises(ValueError, match=">= 0"):
+        build_model(_full_cfg(_stk_cfg(
+            tandem_blocks=2, stacked_gate_input_routed=True, stacked_reason_threshold=-0.5
+        )))
+
+
+def test_stacked_gate_input_routed_lm_leak_probe_exactly_zero() -> None:
+    """The dense input-routed stacked LM forward stays EXACTLY causal (0.0): the narrower gate
+    reads only causal pathways and the reasoner walk is windowed + causal."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, reasoning_segment_len=64, stacked_gate_input_routed=True
+    )))
+    x = torch.randint(1, 256, (2, 48))
+    assert _stacked_lm_leak_maxdiff(on, x, cut=20) == 0.0
+
+
+def test_stacked_gate_input_routed_finite_grads_reach_gate() -> None:
+    """Gradient liveness (criterion 2): one LM forward+backward sends finite non-zero grads to
+    every input-routed gate (routing is trainable from ctx alone), plus memory/reasoner/workhorse."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, reasoning_segment_len=64, stacked_gate_input_routed=True
+    )))
+    on.train()
+    x = torch.randint(1, 256, (4, 40))
+    tgt = torch.randint(0, 256, (4, 40))
+    loss, _logits = on(x, tgt)
+    loss.backward()
+
+    def _live(mod: torch.nn.Module) -> bool:
+        return any(
+            p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
+            for p in mod.parameters()
+            if p.requires_grad
+        )
+
+    for i, blk in enumerate(on.stacked_blocks):
+        assert _live(blk.gate), f"no grad reached block {i} input-routed gate"
+        assert _live(blk.mem), f"no grad reached block {i} memory"
+        assert _live(blk.mlp), f"no grad reached block {i} workhorse"
+        assert blk.reasoner is not None and _live(blk.reasoner), f"no grad reached block {i} reasoner"
+
+
+@pytest.mark.parametrize("tau", [0.1, 0.2, 0.34])
+def test_stacked_sparse_matches_dense_exactly_at_invoked_positions(tau: float) -> None:
+    """Per block: with the input-routed gate, the tau-sparse lm_forward output equals the dense
+    (tau=0) output EXACTLY at positions whose reasoner weight >= tau (the walk there is the SAME
+    single-query walk over the SAME window), and the gate weights are UNCHANGED by tau (routing
+    is decided before the reasoner).  Multi-window T (40 over L=16)."""
+    torch.manual_seed(1)
+    blk = _routed_block()
+    blk.eval()
+    h_in = torch.randn(3, 40, 32)
+    raw = torch.randint(1, 256, (3, 40))
+    with torch.no_grad():
+        fused_dense, w_dense, _ = blk.lm_forward(h_in, raw)
+        blk.reason_threshold = tau
+        fused_sparse, w_sparse, _ = blk.lm_forward(h_in, raw)
+    assert torch.equal(w_dense, w_sparse), "input-routed gate weights must not depend on tau"
+    invoked = w_dense[..., 1] >= tau
+    assert bool(invoked.any()), "test needs some invoked positions"
+    dev_invoked = (fused_dense - fused_sparse)[invoked].abs().max().item()
+    # EXACT to the fp tolerance the repo pins query_forward vs the full walk at (atol 1e-5);
+    # measured 0.0-2e-7 (the single-query walk is the batched full walk at that position).
+    assert dev_invoked <= 1e-5, f"sparse != dense at invoked positions (Δ={dev_invoked:.2e})"
+
+
+@pytest.mark.parametrize("tau", [0.2, 0.34])
+def test_stacked_sparse_deviation_bounded_at_skipped_positions(tau: float) -> None:
+    """At skipped positions (reasoner weight < tau) the sparse fused output deviates from dense
+    by EXACTLY ``w_reason * h_reason`` (h_reason dropped), which is <= ``tau * |h_reason|``
+    elementwise — the card's tau-scaled deviation bound."""
+    torch.manual_seed(2)
+    blk = _routed_block()
+    blk.eval()
+    h_in = torch.randn(3, 40, 32)
+    raw = torch.randint(1, 256, (3, 40))
+    with torch.no_grad():
+        fused_dense, w_dense, _ = blk.lm_forward(h_in, raw)
+        h_reason = blk.reasoner.forward_composed(raw, seed_ctx=h_in, steps=None)  # type: ignore[union-attr]
+        blk.reason_threshold = tau
+        fused_sparse, _w, _ = blk.lm_forward(h_in, raw)
+    skipped = w_dense[..., 1] < tau
+    assert bool(skipped.any()), "test needs some skipped positions"
+    dev = (fused_dense - fused_sparse).abs()
+    # exact deviation == w_reason * h_reason (dropped residual, weighted by the reason gate).
+    expected = (w_dense[..., 1:2] * h_reason).abs()
+    assert torch.allclose(dev[skipped], expected[skipped], atol=1e-5)
+    # tau-scaled bound: |w_reason| < tau at skipped positions -> |dev| <= tau * |h_reason|.
+    bound = tau * h_reason.abs()
+    assert bool((dev[skipped] <= bound[skipped] + 1e-6).all()), "skipped deviation exceeds tau bound"
+
+
+def test_stacked_sparse_walk_runs_only_at_invoked_positions() -> None:
+    """The sparse path runs the walk on EXACTLY the invoked-position count (it gathers those
+    positions and runs Lq=1 walks) — not a compute-everything-then-mask over all B*T positions."""
+    torch.manual_seed(0)
+    blk = _routed_block()
+    blk.eval()
+    h_in = torch.randn(3, 40, 32)
+    raw = torch.randint(1, 256, (3, 40))
+    with torch.no_grad():
+        _f, w, _s = blk.lm_forward(h_in, raw)  # dense: read the gate weights
+    tau = 0.34
+    invoked_count = int((w[..., 1] >= tau).sum())
+    assert 0 < invoked_count < 3 * 40, "test needs a strict subset invoked"
+    blk.reason_threshold = tau
+    seen: dict[str, int] = {}
+    assert blk.reasoner is not None
+    orig = blk.reasoner.query_forward_composed
+
+    def _spy(x: torch.Tensor, *a: Any, **k: Any):  # type: ignore[no-untyped-def]
+        seen["n"] = int(x.shape[0])
+        return orig(x, *a, **k)
+
+    blk.reasoner.query_forward_composed = _spy  # type: ignore[method-assign]
+    with torch.no_grad():
+        blk.lm_forward(h_in, raw)
+    assert seen.get("n") == invoked_count, (
+        f"walk ran on {seen.get('n')} rows but only {invoked_count} positions were invoked"
+    )
+
+
+def test_stacked_sparse_nothing_invoked_is_well_defined() -> None:
+    """tau above every gate weight -> ZERO walks run, h_reason contributes 0 everywhere, and
+    the forward still returns finite outputs (the idx.numel()==0 gather edge; card 75ada834
+    review note)."""
+    torch.manual_seed(0)
+    blk = _routed_block(reason_threshold=0.999)
+    blk.eval()
+    h_in = torch.randn(2, 40, 32)
+    raw = torch.randint(1, 256, (2, 40))
+    seen: dict[str, int] = {"n": 0}
+    assert blk.reasoner is not None
+    orig = blk.reasoner.query_forward_composed
+
+    def _spy(x: torch.Tensor, *a: Any, **k: Any):  # type: ignore[no-untyped-def]
+        seen["n"] += int(x.shape[0])
+        return orig(x, *a, **k)
+
+    blk.reasoner.query_forward_composed = _spy  # type: ignore[method-assign]
+    with torch.no_grad():
+        out, w, _s = blk.lm_forward(h_in, raw)
+    assert (w[..., 1] < 0.999).all(), "test needs NO position above tau"
+    assert seen["n"] == 0, "no walk may run when nothing is invoked"
+    assert torch.isfinite(out).all()
+
+
+def test_stacked_sparse_training_stays_dense() -> None:
+    """TRAINING ignores tau (the routing recipe needs dense gates): in train mode the tau>0
+    lm_forward equals the dense (tau=0) forward EXACTLY, so no position is skipped."""
+    torch.manual_seed(0)
+    blk = _routed_block(reason_threshold=0.3)
+    blk.train()
+    h_in = torch.randn(2, 40, 32)
+    raw = torch.randint(1, 256, (2, 40))
+    out_tau, _wt, _st = blk.lm_forward(h_in, raw)
+    blk.reason_threshold = 0.0
+    out_dense, _wd, _sd = blk.lm_forward(h_in, raw)
+    assert torch.equal(out_tau, out_dense), "training must stay dense (tau ignored under .train())"
+
+
+def test_stacked_sparse_lm_leak_probe_exactly_zero() -> None:
+    """The eval-sparse stacked LM forward stays EXACTLY causal (0.0) even across MULTIPLE reasoner
+    windows: the skipped identity + the gathered single-query walks are all strictly causal."""
+    torch.manual_seed(1)
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2, reasoning_segment_len=16, max_seq_len=128,
+        stacked_gate_input_routed=True, stacked_reason_threshold=0.15,
+    )))
+    x = torch.randint(1, 256, (2, 100))
+    assert _stacked_lm_leak_maxdiff(on, x, cut=37) == 0.0
+
+
+def test_stacked_sparse_reads_hidden_matches_dense_at_invoked() -> None:
+    """Sparse invocation is EXACT at invoked positions in the reason_reads_hidden variant too
+    (the walk addresses the gathered block-hidden window instead of raw tokens)."""
+    torch.manual_seed(3)
+    cfg = _on_cfg(d_model=32, reasoning_segment_len=16, causal_reasoner_steps=4)
+    blk = StackedTandemBlock(cfg, gate_input_routed=True, reason_reads_hidden=True)
+    blk.eval()
+    h_in = torch.randn(2, 40, 32)
+    raw = torch.randint(1, 256, (2, 40))
+    with torch.no_grad():
+        fused_dense, w_dense, _ = blk.lm_forward(h_in, raw)
+        blk.reason_threshold = 0.34
+        fused_sparse, _w, _ = blk.lm_forward(h_in, raw)
+    invoked = w_dense[..., 1] >= 0.34
+    assert bool(invoked.any())
+    assert (fused_dense - fused_sparse)[invoked].abs().max().item() <= 1e-5
+
+
+def test_build_tandem_model_wires_input_routed_gate() -> None:
+    """build_tandem_model forwards stacked_gate_input_routed into the model (the mechanism-gate
+    harness path); default False builds the shipped 4d gate."""
+    from graph_llm.train.tandem import build_tandem_model
+
+    off = build_tandem_model(
+        TandemConfig(tandem_blocks=2, stacked_inner_mode="mix", seg_len=32), torch.device("cpu")
+    )
+    assert off.stacked_blocks[0].gate.in_features == 4 * off.d_model  # type: ignore[attr-defined]
+    on = build_tandem_model(
+        TandemConfig(
+            tandem_blocks=2, stacked_inner_mode="mix", seg_len=32, stacked_gate_input_routed=True
+        ),
+        torch.device("cpu"),
+    )
+    for blk in on.stacked_blocks:  # type: ignore[attr-defined]
+        assert blk.gate_input_routed is True and blk.gate.in_features == 3 * on.d_model

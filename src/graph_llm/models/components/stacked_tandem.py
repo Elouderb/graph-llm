@@ -182,6 +182,8 @@ class StackedTandemBlock(nn.Module):
         mlp_ff_mult: int = 2,
         reason_reads_hidden: bool = False,
         gate_per_channel: bool = False,
+        gate_input_routed: bool = False,
+        reason_threshold: float = 0.0,
     ) -> None:
         super().__init__()
         self.d_model = cfg.d_model
@@ -202,8 +204,33 @@ class StackedTandemBlock(nn.Module):
         # ``(..., d, 3)`` in ``forward``/``lm_forward`` — an independent 3-way softmax per
         # output channel).  Applied consistently to BOTH stacked entry points.
         self.gate_per_channel = gate_per_channel
+        # INPUT-ROUTED gate (card 75ada834): route BEFORE the experts (MoE routing).  False
+        # (default) == the shipped OUTPUT-mixture gate reading ``[h_mem ; h_reason ; h_mlp ; ctx]``
+        # (``Linear(4d, ...)``).  True narrows the gate to ``[h_mem ; h_mlp ; ctx]``
+        # (``Linear(3d, 3)``) so routing is decided WITHOUT the reasoner output — the precondition
+        # for skipping the walk (``reason_threshold``).  SCALAR-only (the locked ladder gate): it
+        # is incompatible with the per-channel gate.
+        if gate_input_routed and gate_per_channel:
+            raise ValueError(
+                "stacked_gate_input_routed is scalar-only (the locked ladder gate); it cannot "
+                "be combined with stacked_gate_per_channel."
+            )
+        self.gate_input_routed = gate_input_routed
+        # EVAL/INFERENCE-ONLY sparse-invocation threshold (card 75ada834): positions whose
+        # reasoner gate weight is ``< tau`` skip the walk on the LM path.  Requires the
+        # input-routed gate (the gate must route WITHOUT the reasoner output); a negative tau is
+        # invalid.  0.0 (default) == OFF (dense everywhere).
+        if reason_threshold < 0.0:
+            raise ValueError(f"stacked_reason_threshold must be >= 0, got {reason_threshold}.")
+        if reason_threshold > 0.0 and not gate_input_routed:
+            raise ValueError(
+                "stacked_reason_threshold > 0 requires stacked_gate_input_routed=True (the gate "
+                "must decide the reasoner weight WITHOUT its output so the walk can be skipped)."
+            )
+        self.reason_threshold = reason_threshold
+        gate_in = 3 if gate_input_routed else 4
         gate_out = 3 * cfg.d_model if gate_per_channel else 3
-        self.gate = nn.Linear(4 * cfg.d_model, gate_out)
+        self.gate = nn.Linear(gate_in * cfg.d_model, gate_out)
         with torch.no_grad():
             self.gate.bias.fill_(gate_bias_init)
 
@@ -264,7 +291,12 @@ class StackedTandemBlock(nn.Module):
         fused_seg: list[Tensor] = []
         gate_pred: Tensor | None = None
         for si in range(len(seg_hidden)):
-            gin = torch.cat([mem_seq[si], rea_seq[si], mlp_seq[si], seg_hidden[si]], dim=-1)
+            if self.gate_input_routed:
+                # INPUT-ROUTED (card 75ada834): route BEFORE the reasoner — the gate omits
+                # ``rea_seq`` (h_reason) and reads only the cheap ``[h_mem ; h_mlp ; ctx]``.
+                gin = torch.cat([mem_seq[si], mlp_seq[si], seg_hidden[si]], dim=-1)
+            else:
+                gin = torch.cat([mem_seq[si], rea_seq[si], mlp_seq[si], seg_hidden[si]], dim=-1)
             logit = self.gate(gin)  # (B, L, 3) scalar, or (B, L, 3*d_model) per-channel
             if self.gate_per_channel:
                 logit = logit.view(*logit.shape[:-1], self.d_model, 3)  # (B, L, d, 3)
@@ -345,6 +377,11 @@ class StackedTandemBlock(nn.Module):
         h_mem, state_out = self.mem(self.mem_norm(h_in), state_in=state_in, return_state=True)
         # WORKHORSE pathway (per position -> leak-safe).
         h_mlp = self.mlp(h_in)
+        # INPUT-ROUTED gate (card 75ada834): route BEFORE the reasoner so the (expensive) walk
+        # can be skipped at low-weight positions.  DISTINCT code path (scalar gate, no h_reason
+        # in the gate input); the shipped output-mixture path below is left byte-for-byte.
+        if self.gate_input_routed:
+            return self._lm_forward_input_routed(h_in, raw_tokens, h_mem, h_mlp, state_out, steps)
         # REASONER pathway (per position, full windowed walk), added as a residual to the
         # block input — the LM analogue of ``_pathways``' at-``pred_pos`` residual.
         if self.reasoner is not None:
@@ -381,6 +418,90 @@ class StackedTandemBlock(nn.Module):
             )
             w_report = w
         return fused, w_report, state_out
+
+    def _lm_forward_input_routed(
+        self,
+        h_in: Tensor,
+        raw_tokens: Tensor,
+        h_mem: Tensor,
+        h_mlp: Tensor,
+        state_out: DeltaMemoryState,
+        steps: int | None,
+    ) -> tuple[Tensor, Tensor, DeltaMemoryState]:
+        """INPUT-ROUTED per-position gate + (optionally sparse) reasoner fusion (card 75ada834).
+
+        The gate reads only ``[h_mem ; h_mlp ; h_in]`` (scalar, 3*d_model -> 3), so the routing
+        weights are known BEFORE the reasoner runs.  The reasoner pathway is then DENSE (training,
+        or ``reason_threshold == 0``) or SPARSE (eval + ``reason_threshold > 0``: positions whose
+        reasoner weight is ``< tau`` skip the walk, ``h_reason == 0`` there).  Fusion + reporting
+        match the shipped scalar gate ((B, T, 3) weights), so ``_run_stacked_blocks`` /
+        ``stacked_lm_gate_fractions`` need no per-mode branch.
+        """
+        logit = self.gate(torch.cat([h_mem, h_mlp, h_in], dim=-1))  # (B, T, 3) scalar
+        if not self.reason_enabled:
+            logit = logit + torch.tensor([0.0, _NEG, 0.0], device=logit.device)
+        w = F.softmax(logit, dim=-1)  # (B, T, 3): [mem, reason, mlp]
+        if self.reasoner is None:
+            rea = h_in
+        elif self.reason_threshold > 0.0 and not self.training:
+            # EVAL sparsity: run the walk ONLY where the reasoner weight >= tau; identity
+            # (h_reason == 0) elsewhere.  The walk cost scales with the invoked count.
+            rea = self._sparse_reason(h_in, raw_tokens, w[..., 1], steps)
+        else:
+            # DENSE (training / tau == 0): full per-position windowed walk (residual).
+            rin = h_in if self.reason_reads_hidden else raw_tokens
+            h_reason = self.reasoner.forward_composed(
+                rin, seed_ctx=h_in, steps=steps, hidden_input=self.reason_reads_hidden,
+            )
+            rea = h_in + h_reason
+        fused = (
+            w[..., 0:1] * h_mem
+            + w[..., 1:2] * rea
+            + w[..., 2:3] * h_mlp
+        )
+        return fused, w, state_out
+
+    def _sparse_reason(
+        self, h_in: Tensor, raw_tokens: Tensor, w_reason: Tensor, steps: int | None
+    ) -> Tensor:
+        """Reasoner residual ``rea = h_in + h_reason`` with the walk run ONLY at positions whose
+        reasoner gate weight ``w_reason >= tau`` (card 75ada834).
+
+        Skipped positions keep ``rea == h_in`` (``h_reason`` treated as 0 -> the fused deviation
+        vs the dense forward is ``w_reason * h_reason`` with ``w_reason < tau``, i.e. tau-scaled).
+        Invoked positions run the EXACT dense walk: each is a single-query walk over the SAME
+        FIXED window the dense windowed path chunks into (``[w*L : (w+1)*L]``) at its own
+        within-window position, addressing only positions ``<= t_local`` — so the tail pad (beyond
+        T) is masked out and the output matches the dense per-position walk.  Cost scales with the
+        invoked-position count (gathered ``Lq = 1`` walks via ``query_forward_composed``), NOT
+        with T.  Eval/inference only + ``self.reasoner`` non-None (both guaranteed by the caller).
+        """
+        assert self.reasoner is not None
+        _b, t, _d = h_in.shape
+        length = self.reasoner.segment_len
+        device = h_in.device
+        rea = h_in.clone()  # identity where the walk is skipped
+        invoked = w_reason >= self.reason_threshold  # (B, T)
+        idx = invoked.nonzero(as_tuple=False)  # (N, 2): [row, pos]
+        if idx.numel() == 0:
+            return rea
+        rows, pos = idx[:, 0], idx[:, 1]
+        win_start = (pos // length) * length              # window the dense path chunks into
+        t_local = pos - win_start                          # query position within that window
+        gather = win_start.unsqueeze(1) + torch.arange(length, device=device)  # (N, L)
+        keep = gather < t                                  # positions beyond T are the dense pad
+        gather = gather.clamp_max(t - 1)
+        if self.reason_reads_hidden:
+            xw = h_in[rows.unsqueeze(1), gather] * keep.unsqueeze(-1)  # (N, L, d), zero pad tail
+        else:
+            xw = raw_tokens[rows.unsqueeze(1), gather] * keep          # (N, L), token-id-0 pad
+        seed_ctx = h_in[rows, pos]  # (N, d): the block hidden at the query position
+        h_q, _aux = self.reasoner.query_forward_composed(
+            xw, query_pos=t_local, seed_ctx=seed_ctx, steps=steps,
+            commit_seed=True, return_aux=False, hidden_input=self.reason_reads_hidden,
+        )  # (N, d)
+        rea[rows, pos] = h_in[rows, pos] + h_q
+        return rea
 
 
 def _rope_cache(

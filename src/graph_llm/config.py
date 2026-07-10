@@ -431,6 +431,29 @@ class ModelConfig:
     # returned/logged), so downstream consumers (``_stacked_gate_losses``,
     # ``stacked_lm_gate_fractions``, the eval report) need no per-channel-aware branch.
     stacked_gate_per_channel: bool = False
+    # INPUT-ROUTED stacked gate (sparse-reasoner-invocation card 75ada834): route BEFORE the
+    # experts (standard MoE routing) — each block's 3-way gate reads ``[h_mem ; h_mlp ; ctx]``
+    # (3*d_model, SCALAR form only) instead of the shipped ``[h_mem ; h_reason ; h_mlp ; ctx]``
+    # (4*d_model).  The gate then decides the reasoner's weight WITHOUT its output, so the
+    # (expensive) reasoner walk can be SKIPPED at low-weight positions (see
+    # ``stacked_reason_threshold``).  False (default) == the shipped output-mixture gate
+    # (``Linear(4*d_model, 3)``) — byte-for-byte the committed stacked recipe (the default
+    # construction still draws the identical ``nn.Linear(4*d_model, 3)``).  True narrows the
+    # gate to ``Linear(3*d_model, 3)`` at BOTH stacked entry points (``StackedTandemBlock.forward``
+    # /``stacked_step`` and ``StackedTandemBlock.lm_forward``).  SCALAR-ONLY: combining it with
+    # ``stacked_gate_per_channel`` raises (input-routing applies to the locked SCALAR ladder gate).
+    stacked_gate_input_routed: bool = False
+    # SPARSE reasoner invocation threshold (sparse-reasoner-invocation card 75ada834): an
+    # EVAL/INFERENCE-ONLY sparsity gate on the LM path (``StackedTandemBlock.lm_forward``).
+    # Requires ``stacked_gate_input_routed=True`` (the gate must route WITHOUT the reasoner
+    # output; raises otherwise, and rejects a negative tau).  At eval, positions whose reasoner
+    # gate weight is ``< tau`` SKIP the walk entirely (``h_reason`` treated as 0 there — the fused
+    # deviation is bounded by ``tau * ||h_reason||``); positions ``>= tau`` run the walk EXACTLY
+    # via the gathered single-query fast path, so the walk cost scales with the invoked-position
+    # count.  TRAINING stays DENSE regardless (the unsupervised routing recipe needs dense gates;
+    # training compute is not the pain point).  0.0 (default) == OFF (dense everywhere) — a clean
+    # default-off flag with no behavioural change.
+    stacked_reason_threshold: float = 0.0
 
     # --- Optional bounded cross-attention READBACK between block 0 and block 1 (card 3ac77deb) ---
     # A small bounded strictly-causal cross-attention that re-grounds block-1's input in the

@@ -537,6 +537,18 @@ class TrainConfig:
     eval_every: int = 0
     eval_run_dir: str = "eval_reports/"
 
+    # --- Periodic checkpoint / resume for SegmentedTrainer (card 53e55fd2) ---
+    # Consumed by SegmentedTrainer only (Trainer never reads it: Trainer has no
+    # automatic periodic-checkpoint call in its own train() loop, so this addition
+    # is a pure no-op for it).  Reuses ``checkpoint_dir`` / ``resume_from`` above --
+    # SegmentedTrainer writes checkpoints via the RNG-capturing
+    # train/checkpoint.py machinery (card 69776c3e), a different (superset) format
+    # from Trainer.save_checkpoint()'s own scheme.  ``checkpoint_every=0`` (default)
+    # == off, byte-for-byte the existing behaviour (no checkpoint I/O, no extra RNG
+    # bookkeeping); a checkpoint is written every ``checkpoint_every`` completed
+    # steps when > 0 AND ``checkpoint_dir`` is set.
+    checkpoint_every: int = 0
+
 
 # ---------------------------------------------------------------------------
 # Top-level config

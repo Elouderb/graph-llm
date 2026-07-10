@@ -32,6 +32,7 @@ import torch
 def capture_rng_state(
     py_rng: random.Random | None = None,
     np_rngs: dict[str, np.random.Generator] | None = None,
+    torch_generators: dict[str, torch.Generator] | None = None,
 ) -> dict[str, Any]:
     """Snapshot every RNG stream a training loop might draw from.
 
@@ -40,16 +41,25 @@ def capture_rng_state(
             kinds / curriculum depths), or ``None`` to skip.
         np_rngs: Named ``np.random.Generator`` instances (e.g. plain-text
             train/eval samplers), or ``None``/empty to skip.
+        torch_generators: Named ``torch.Generator`` instances OTHER than the
+            global default generator (e.g. a trainer's own dedicated schedule /
+            noise generators, card 53e55fd2's ``SegmentedTrainer._sched_rng`` /
+            ``_noise_rng``) -- these are NOT touched by ``torch.get_rng_state()``
+            (that only covers the global default generator), so they must be
+            captured separately via each ``Generator.get_state()``.  ``None``/empty
+            to skip.
 
     Returns:
         A plain dict safe to ``torch.save``: ``"python_random"`` (the
         ``random.Random`` state tuple, or ``None``), ``"numpy"`` (name ->
-        bit-generator state dict), ``"torch_cpu"`` (a ``torch.ByteTensor``), and
+        bit-generator state dict), ``"torch_cpu"`` (a ``torch.ByteTensor``),
         ``"torch_cuda"`` (list of per-device ``torch.ByteTensor``, or ``None`` when
-        CUDA is unavailable).  Torch's CPU (and CUDA) global RNG matters whenever
-        model code draws from it during training -- e.g. the tandem gate's
-        exploration noise (``gate_noise_std``, ``torch.randn_like``), which fires
-        every training step by default.
+        CUDA is unavailable), and ``"torch_generators"`` (name -> ``Generator``
+        state ``torch.ByteTensor``, always a CPU tensor even for a CUDA-device
+        generator -- same shape as ``torch_cpu``).  Torch's CPU (and CUDA) global
+        RNG matters whenever model code draws from it during training -- e.g. the
+        tandem gate's exploration noise (``gate_noise_std``, ``torch.randn_like``),
+        which fires every training step by default.
     """
     return {
         "python_random": py_rng.getstate() if py_rng is not None else None,
@@ -60,6 +70,11 @@ def capture_rng_state(
         "torch_cuda": (
             torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         ),
+        "torch_generators": (
+            {name: g.get_state() for name, g in torch_generators.items()}
+            if torch_generators
+            else {}
+        ),
     }
 
 
@@ -67,6 +82,7 @@ def restore_rng_state(
     state: dict[str, Any],
     py_rng: random.Random | None = None,
     np_rngs: dict[str, np.random.Generator] | None = None,
+    torch_generators: dict[str, torch.Generator] | None = None,
 ) -> None:
     """Restore RNG streams captured by :func:`capture_rng_state`, in place.
 
@@ -76,6 +92,9 @@ def restore_rng_state(
             object the trainer continues to draw from), or ``None`` to skip.
         np_rngs: Named ``np.random.Generator`` instances to restore into (keys must
             match those passed to :func:`capture_rng_state`), or ``None``/empty.
+        torch_generators: Named ``torch.Generator`` instances to restore into (keys
+            must match those passed to :func:`capture_rng_state`), or
+            ``None``/empty to skip.
     """
     if py_rng is not None and state.get("python_random") is not None:
         py_rng.setstate(state["python_random"])
@@ -87,6 +106,10 @@ def restore_rng_state(
     cuda_state = state.get("torch_cuda")
     if cuda_state is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(cuda_state)
+    saved_generators = state.get("torch_generators") or {}
+    for name, g in (torch_generators or {}).items():
+        if name in saved_generators:
+            g.set_state(saved_generators[name])
 
 
 def save_training_checkpoint(

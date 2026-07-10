@@ -208,17 +208,44 @@ class OrderedSegmentStream:
     def __len__(self) -> int:
         return self._n_segments
 
-    def __iter__(self):  # noqa: ANN204 — Iterator[OrderedSegment]
+    def _iter_range(self, start: int):  # noqa: ANN202 — Iterator[OrderedSegment]
+        """Yield segments ``start, start+1, ..., n_segments-1`` of the CURRENT epoch.
+
+        Shared by ``__iter__`` (``start=0``) and :meth:`iter_from` (an arbitrary
+        resume offset, card 53e55fd2) so both produce IDENTICAL ``OrderedSegment``s
+        at a given index — this is the sole place the index -> segment /
+        ``stream_reset`` mapping is computed.
+        """
         T = self._segment_len
-        for i in range(self._n_segments):
-            start = i * T
-            inputs = self._grid[:, start : start + T]
-            targets = self._grid[:, start + 1 : start + T + 1]
+        for i in range(start, self._n_segments):
+            seg_start = i * T
+            inputs = self._grid[:, seg_start : seg_start + T]
+            targets = self._grid[:, seg_start + 1 : seg_start + T + 1]
             if self._stream_reset_interval == 0:
                 reset = i == 0
             else:
                 reset = i % self._stream_reset_interval == 0
             yield OrderedSegment(inputs=inputs, targets=targets, stream_reset=reset)
+
+    def __iter__(self):  # noqa: ANN204 — Iterator[OrderedSegment]
+        return self._iter_range(0)
+
+    def iter_from(self, start_index: int):  # noqa: ANN201 — Iterator[OrderedSegment]
+        """Resume iteration at an ABSOLUTE segment count already consumed (card 53e55fd2).
+
+        ``start_index`` is the TOTAL number of segments ever drawn from this stream
+        since a (possibly checkpointed) run began -- NOT an epoch-relative index; it
+        is reduced mod ``len(self)`` internally.  This is safe because every epoch
+        yields the identical ``stream_reset`` schedule (``__iter__`` always restarts
+        at relative index 0), so the absolute count alone determines the correct
+        resume position regardless of how many epochs have already elapsed.  Yields
+        the remainder of that epoch then stops -- exactly like ``__iter__`` -- so a
+        caller that already catches ``StopIteration`` and recreates via
+        ``iter(self)`` on epoch exhaustion (e.g. :class:`~graph_llm.train.segmented.SegmentedTrainer`)
+        needs no other change to resume a checkpointed run exactly.
+        ``iter_from(0)`` is identical to ``iter(self)``.
+        """
+        return self._iter_range(start_index % self._n_segments)
 
 
 def iter_ordered_segments(

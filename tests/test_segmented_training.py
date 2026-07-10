@@ -266,6 +266,48 @@ def test_iter_ordered_segments_matches_class() -> None:
     assert a == b
 
 
+def test_iter_from_zero_matches_iter() -> None:
+    """``iter_from(0)`` must be byte-for-byte identical to ``iter(self)`` (card
+    53e55fd2) -- the untouched-by-resume default path."""
+    tokens = np.arange(40, dtype=np.int64)
+    stream = OrderedSegmentStream(tokens, segment_len=4, batch_size=2, stream_reset_interval=2)
+    a = list(stream)
+    b = list(stream.iter_from(0))
+    assert [s.inputs.tolist() for s in a] == [s.inputs.tolist() for s in b]
+    assert [s.stream_reset for s in a] == [s.stream_reset for s in b]
+
+
+def test_iter_from_resumes_at_the_correct_epoch_relative_index() -> None:
+    """``iter_from(n)`` yields the SAME tail a full pass would yield starting at
+    epoch-relative index ``n % len(stream)`` -- the resume position (card 53e55fd2)."""
+    tokens = np.arange(40, dtype=np.int64)
+    stream = OrderedSegmentStream(tokens, segment_len=4, batch_size=2)
+    full = list(stream)
+    assert len(full) == 4
+    # Resume mid-epoch (absolute count 2 == epoch-relative index 2).
+    resumed = list(stream.iter_from(2))
+    assert [s.inputs.tolist() for s in resumed] == [s.inputs.tolist() for s in full[2:]]
+    assert [s.stream_reset for s in resumed] == [s.stream_reset for s in full[2:]]
+
+
+def test_iter_from_wraps_modulo_absolute_count_across_epochs() -> None:
+    """An absolute count spanning multiple epochs reduces mod ``len(stream)`` to the
+    correct epoch-relative resume position (the modular-arithmetic argument that
+    makes an ABSOLUTE segments-consumed counter sufficient to resume exactly, even
+    after the ordered stream has wrapped one or more times, card 53e55fd2)."""
+    tokens = np.arange(40, dtype=np.int64)
+    stream = OrderedSegmentStream(tokens, segment_len=4, batch_size=2)
+    n = len(stream)
+    assert n == 4
+    full = list(stream)
+    # 2 full epochs (8 segments) + 1 -> epoch-relative index 1, same as iter_from(1).
+    resumed = list(stream.iter_from(2 * n + 1))
+    expected = list(stream.iter_from(1))
+    assert [s.inputs.tolist() for s in resumed] == [s.inputs.tolist() for s in expected]
+    assert [s.stream_reset for s in resumed] == [s.stream_reset for s in expected]
+    assert [s.inputs.tolist() for s in resumed] == [s.inputs.tolist() for s in full[1:]]
+
+
 # ---------------------------------------------------------------------------
 # Synthetic cross-segment retrieval task generator
 # ---------------------------------------------------------------------------

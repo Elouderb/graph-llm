@@ -45,6 +45,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -58,6 +59,12 @@ from graph_llm.data.loader import OrderedSegmentStream, _TextChunkDataset
 from graph_llm.data.synthetic_tasks import CrossSegmentTaskSampler, masked_token_loss
 from graph_llm.eval.report import build_eval_report, write_eval_report
 from graph_llm.models.components.delta_memory import DeltaMemoryState
+from graph_llm.train.checkpoint import (
+    capture_rng_state,
+    load_training_checkpoint,
+    restore_rng_state,
+    save_training_checkpoint,
+)
 from graph_llm.train.optim import build_optimizer, build_scheduler
 from graph_llm.utils.logging import get_logger, log_metrics, setup_logging
 from graph_llm.utils.seed import seed_everything
@@ -100,6 +107,39 @@ def detach_states(
     if states is None:
         return None
     return [_detach_one(s) for s in states]
+
+
+def _state_to_device(
+    s: DeltaMemoryState | Tensor, device: torch.device
+) -> DeltaMemoryState | Tensor:
+    """Move one per-layer carried state (a :class:`DeltaMemoryState` or a bare Tensor)
+    onto ``device``."""
+    if isinstance(s, DeltaMemoryState):
+        return DeltaMemoryState(
+            memory=s.memory.to(device),
+            conv_tail=None if s.conv_tail is None else s.conv_tail.to(device),
+        )
+    return s.to(device)
+
+
+def states_to_device(
+    states: Sequence[DeltaMemoryState | Tensor] | None, device: torch.device
+) -> list[DeltaMemoryState | Tensor] | None:
+    """Move every per-layer/per-block carried state onto ``device`` (card 53e55fd2).
+
+    Shape-agnostic, following the same element-wise mapping pattern as
+    :func:`detach_states`: the list length is never inspected, only mapped
+    element-wise, so this works identically for the standard per-LAYER carried-state
+    list (length ``delta_layers``) AND the STACKED per-BLOCK list (length
+    ``len(model.stacked_blocks)``, card d05da2db / since commit cda73d0 the two
+    shapes diverge from ``delta_layers``).  Used to move a checkpointed carried
+    state -- loaded on CPU per the map_location trap (card 69776c3e comment 264 /
+    this card's own acceptance bar) -- onto the trainer's live device.  Returns
+    ``None`` if ``states`` is ``None``.
+    """
+    if states is None:
+        return None
+    return [_state_to_device(s, device) for s in states]
 
 
 def _perturb_tensor(
@@ -256,6 +296,31 @@ class SegmentedTrainer:
                 val_ds, batch_size=cfg.data.batch_size, shuffle=False, drop_last=False
             )
 
+        # ------------------------------------------------------------------
+        # Periodic checkpoint / resume (card 53e55fd2).  Default-off
+        # (``checkpoint_every=0``, ``resume_from=None``) -- byte-for-byte the prior
+        # behaviour until enabled.  Reuses the generic RNG-capture/save/load
+        # machinery from card 69776c3e (train/checkpoint.py), extended with named
+        # ``torch.Generator`` capture for this trainer's OWN schedule/noise
+        # generators (``_sched_rng`` / ``_noise_rng``), which sit outside torch's
+        # global RNG and so are NOT covered by ``torch.get_rng_state()`` alone.
+        # ``_segments_consumed`` is the ABSOLUTE count of LM-stream segments drawn
+        # so far (across the whole run, resumed or not); it lets a resumed run
+        # reconstruct the exact ordered-segment stream position via
+        # ``OrderedSegmentStream.iter_from`` (O(1), no need to replay segments).
+        # The carried DeltaMemoryState is a LOCAL in train()'s frame (see its
+        # docstring), so save/load thread it through ``_save_checkpoint``'s
+        # argument / ``_resume_carried_state`` rather than through instance state.
+        self._checkpoint_dir = cfg.train.checkpoint_dir
+        self._checkpoint_every = cfg.train.checkpoint_every
+        self._segments_consumed = 0
+        self._resume_carried_state: list[DeltaMemoryState | Tensor] | None = None
+        # Exposed after train() returns (see its tail) so a caller/test can inspect
+        # the final carried memory state without changing train()'s own return type.
+        self._last_carried_state: list[DeltaMemoryState | Tensor] | None = None
+        if cfg.train.resume_from:
+            self._load_checkpoint(cfg.train.resume_from)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -266,14 +331,23 @@ class SegmentedTrainer:
         Each *step* is one truncated-BPTT window of ``K`` consecutive segments (LM
         stream) OR one synthetic cross-segment task, chosen per step with probability
         ``synthetic_task_fraction``.  Returns the per-step loss history.
+
+        When resuming from a checkpoint (``cfg.train.resume_from``), the returned
+        list covers only the steps run in THIS call (``step`` continues from the
+        checkpoint) -- matching ``train/tandem.py``'s ``_train_one`` resume
+        convention, not a replay of pre-checkpoint history.
         """
         self.model.train()
         max_steps = self.cfg.train.max_steps
 
-        segment_iter = iter(self._stream)
+        # ``iter_from(0)`` (the untouched-by-resume default) is identical to
+        # ``iter(self._stream)`` -- see OrderedSegmentStream.iter_from -- so this is
+        # byte-for-byte the prior behaviour when no resume occurred.
+        segment_iter = self._stream.iter_from(self._segments_consumed)
         # ``carried`` is the live (graph-connected) state threaded between segments
-        # WITHIN a window; it is detached at each window boundary.
-        carried: list[DeltaMemoryState | Tensor] | None = None
+        # WITHIN a window; it is detached at each window boundary.  Seeded from a
+        # resumed checkpoint's final carried state (None when not resuming).
+        carried: list[DeltaMemoryState | Tensor] | None = self._resume_carried_state
 
         while self.state.step < max_steps:
             use_synthetic = (
@@ -304,7 +378,106 @@ class SegmentedTrainer:
             if self._eval_every > 0 and self.state.step % self._eval_every == 0:
                 self._run_periodic_eval()
 
+            if (
+                self._checkpoint_every > 0
+                and self._checkpoint_dir
+                and self.state.step % self._checkpoint_every == 0
+            ):
+                self._save_checkpoint(carried)
+
+        self._last_carried_state = carried
         return self.state.loss_history
+
+    # ------------------------------------------------------------------
+    # Checkpoint / resume (card 53e55fd2)
+    # ------------------------------------------------------------------
+
+    def _save_checkpoint(self, carried: list[DeltaMemoryState | Tensor] | None) -> Path:
+        """Write a full resumable checkpoint at the CURRENT step.
+
+        ``carried`` is the window-boundary DETACHED state ``train()`` is about to
+        thread into its next window (or ``None``) -- passed in explicitly because it
+        is a local in ``train()``'s frame, not instance state (see the class
+        docstring / ``train()``).  Captures everything a resumed run needs to
+        continue byte-for-byte: model/optimizer/scheduler
+        (:func:`~graph_llm.train.checkpoint.save_training_checkpoint`), every RNG
+        stream this trainer draws from (the global torch/CUDA RNG plus this
+        trainer's own ``_sched_rng`` / ``_noise_rng`` generators and the synthetic
+        task sampler's numpy generator), the carried DeltaMemoryState list at ANY
+        length -- shape-agnostic, per :func:`detach_states` / :func:`states_to_device`
+        -- so both the standard per-layer list and the STACKED per-block list
+        (card d05da2db, since commit cda73d0) round-trip identically, the absolute
+        ordered-segment stream position, the segmented-specific diagnostic
+        counters, and the AMP grad-scaler state when fp16 is in use.
+        """
+        rng_state = capture_rng_state(
+            np_rngs={"synthetic_task": self._task_sampler.rng},
+            torch_generators={"sched": self._sched_rng, "noise": self._noise_rng},
+        )
+        extra: dict[str, object] = {
+            "segments_consumed": self._segments_consumed,
+            "carried_state": carried,
+            "carried_segment_count": self.state.carried_segment_count,
+            "detach_count": self.state.detach_count,
+            "state_noise_count": self.state.state_noise_count,
+            "synthetic_task_count": self.state.synthetic_task_count,
+        }
+        if self._scaler is not None:
+            extra["scaler_state"] = self._scaler.state_dict()
+        path = Path(self._checkpoint_dir) / f"segmented_ckpt_step{self.state.step:06d}.pt"
+        ckpt_path = save_training_checkpoint(
+            path,
+            step=self.state.step,
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            rng_state=rng_state,
+            extra=extra,
+        )
+        _log.info("Wrote segmented-trainer checkpoint: %s", ckpt_path)
+        return ckpt_path
+
+    def _load_checkpoint(self, path: str) -> None:
+        """Restore model/optimizer/scheduler/RNG/segmented-specific state.
+
+        Called from ``__init__`` when ``cfg.train.resume_from`` is set, BEFORE
+        ``train()`` runs, so ``train()`` picks up ``self.state.step`` /
+        ``self._segments_consumed`` / ``self._resume_carried_state`` already
+        restored.
+
+        NOTE (the card-69776c3e trap, live again here): loaded on CPU (the
+        :func:`~graph_llm.train.checkpoint.load_training_checkpoint` default) --
+        never ``map_location=self.device`` -- because the payload's RNG-state
+        tensors (the global torch RNG plus this trainer's own named
+        ``torch.Generator`` states) must stay CPU ByteTensors for
+        ``torch.set_rng_state`` / ``Generator.set_state`` to accept them.
+        ``model.load_state_dict`` / ``optimizer.load_state_dict`` both cast the
+        loaded (CPU) tensors onto the live model's/optimizer's own device
+        automatically; the carried DeltaMemoryState is moved onto ``self.device``
+        explicitly (via :func:`states_to_device`) since it is plain tensors this
+        trainer manages directly, not a state_dict.
+        """
+        ckpt = load_training_checkpoint(path)
+        self.model.load_state_dict(ckpt["model_state"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state"])
+        if ckpt.get("scheduler_state") is not None:
+            self.scheduler.load_state_dict(ckpt["scheduler_state"])
+        self.state.step = int(ckpt["step"])
+        if ckpt.get("rng_state") is not None:
+            restore_rng_state(
+                ckpt["rng_state"],
+                np_rngs={"synthetic_task": self._task_sampler.rng},
+                torch_generators={"sched": self._sched_rng, "noise": self._noise_rng},
+            )
+        extra = ckpt.get("extra") or {}
+        self._segments_consumed = int(extra.get("segments_consumed", 0))
+        self._resume_carried_state = states_to_device(extra.get("carried_state"), self.device)
+        self.state.carried_segment_count = int(extra.get("carried_segment_count", 0))
+        self.state.detach_count = int(extra.get("detach_count", 0))
+        self.state.state_noise_count = int(extra.get("state_noise_count", 0))
+        self.state.synthetic_task_count = int(extra.get("synthetic_task_count", 0))
+        if self._scaler is not None and extra.get("scaler_state") is not None:
+            self._scaler.load_state_dict(extra["scaler_state"])
 
     # ------------------------------------------------------------------
     # Unified eval-report hook (card 69776c3e)
@@ -368,6 +541,9 @@ class SegmentedTrainer:
             except StopIteration:
                 segment_iter = iter(self._stream)
                 seg = next(segment_iter)
+            # Absolute count of LM-stream segments drawn so far (card 53e55fd2): the
+            # resumable ordered-segment stream position (see OrderedSegmentStream.iter_from).
+            self._segments_consumed += 1
 
             if seg.stream_reset:
                 # Stream/document boundary: drop the carried state (no gradient and no

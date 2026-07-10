@@ -228,6 +228,13 @@ class CrossSegmentTaskSampler:
         self._encode = encode
         self._rng = np.random.default_rng(seed)
 
+    @property
+    def rng(self) -> np.random.Generator:
+        """The sampler's own draw stream (read-only accessor for checkpoint capture,
+        card 53e55fd2's ``SegmentedTrainer`` resume -- internal draws in
+        :meth:`sample` still go through ``self._rng`` directly)."""
+        return self._rng
+
     def sample(self) -> CrossSegmentTask:
         """Draw one random :class:`CrossSegmentTask`."""
         low = 10 ** (self._key_digits - 1)

@@ -404,6 +404,106 @@ def test_masked_token_loss_scores_only_masked_positions() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Answer-copy leak guard for synthetic-task injection (card 37d25a84)
+# ---------------------------------------------------------------------------
+
+
+def _synth_leak_cfg(stacked: bool) -> ModelConfig:
+    """A tiny tandem delta_memory_lm config for the injection leak probe, in either
+    single-fusion or STACKED (``tandem_blocks=2``, card d05da2db) mode — mirrors
+    ``test_segmented_checkpoint.py``'s ``_mem_cfg(stacked)``."""
+    base: dict[str, Any] = dict(
+        name="delta_memory_lm",
+        vocab_size=64,
+        d_model=16,
+        delta_layers=2,
+        delta_n_heads=1,
+        delta_head_k_dim=8,
+        delta_head_v_dim=8,
+        delta_dropout=0.0,
+        dropout=0.0,
+        max_seq_len=64,
+        front_end="none",
+        segment_len=16,
+        bptt_window=2,
+        tandem_enabled=True,
+        reasoning_segment_len=16,
+        causal_reasoner_steps=2,
+        causal_reasoner_key_dim=8,
+        causal_reasoner_query_window=4,
+        causal_reasoner_conv_kernel=3,
+        causal_reasoner_gru_layers=1,
+    )
+    if stacked:
+        base["tandem_blocks"] = 2
+    return ModelConfig(**base)
+
+
+@pytest.mark.parametrize("stacked", [False, True], ids=["single_fusion", "stacked_blocks2"])
+def test_synthetic_injection_answer_position_is_leak_free(stacked: bool) -> None:
+    """Copy-leak guard (harness convention, mirrors ``test_tandem.py::
+    test_answer_prediction_position_is_leak_free``) for the SYNTHETIC cross-segment
+    injection path that ``SegmentedTrainer._train_synthetic_step`` actually drives.
+
+    ``masked_token_loss(logits, targets, mask)`` scores a masked position ``i`` by
+    gathering ``logits[i]`` — the prediction for ``targets[i] == final_stream[i+1]``
+    computed from context ending at INPUT index ``i``.  The answer byte scored at
+    ``i`` first appears in the INPUT one step later, at index ``i+1`` (the standard
+    next-token shift: ``inputs[j] == final_stream[j]``, ``targets[j] ==
+    final_stream[j+1]``) — so ``logits[i]`` must be EXACTLY independent of
+    ``inputs[i+1]``.
+
+    Proven end-to-end via the actual injection call pattern
+    (``model(inp, None, states, True)``, carrying state across the leading
+    key/filler segments exactly like ``_train_synthetic_step``), for both the
+    single-fusion default and a STACKED tandem model (card d05da2db, dispatched via
+    ``_stacked_lm_forward``): perturbing the input token at ``i+1`` leaves
+    ``logits[i]`` EXACTLY unchanged (leak-free — 0.0), while it DOES change
+    ``logits[i+1]`` (proving the probe is live, not vacuous).
+    """
+    torch.manual_seed(0)
+    cfg = _full_cfg(_synth_leak_cfg(stacked))
+    model = build_model(cfg)
+    model.eval()
+
+    task = make_cross_segment_task(
+        "742", n_segments=3, segment_tokens=16, vocab_size=64, key_digits=3,
+    )
+    mask = task.segment_masks[-1][0]
+    scored = torch.nonzero(mask, as_tuple=True)[0]
+    assert scored.numel() >= 2, "need >= 2 scored answer positions to probe i and i+1"
+    i0 = int(scored[0])
+    final_inp = task.segment_inputs[-1]
+    assert i0 + 1 < final_inp.shape[-1]
+
+    # Carry state through the leading (key + filler) segments, exactly as
+    # _train_synthetic_step does.
+    states: list[DeltaMemoryState] | None = None
+    with torch.no_grad():
+        for inp in task.segment_inputs[:-1]:
+            _, _logits, states = model(inp, None, states, True)
+
+    with torch.no_grad():
+        _, logits0, _ = model(final_inp, None, states, True)
+
+    pert_inp = final_inp.clone()
+    pert_inp[0, i0 + 1] = (final_inp[0, i0 + 1] + 17) % cfg.model.vocab_size
+    with torch.no_grad():
+        _, logits1, _ = model(pert_inp, None, states, True)
+
+    leak_free = (logits0[:, i0] - logits1[:, i0]).abs().max().item()
+    trap = (logits0[:, i0 + 1] - logits1[:, i0 + 1]).abs().max().item()
+    assert leak_free == 0.0, (
+        f"synthetic-injection answer position leaked: perturbing input[{i0 + 1}] "
+        f"(the answer byte scored at target[{i0}]) changed logits[{i0}] by "
+        f"{leak_free:.3e} (must be exactly 0.0)."
+    )
+    assert trap > 0.0, (
+        "logits[i+1] did NOT depend on input[i+1] — the leak probe is toothless."
+    )
+
+
+# ---------------------------------------------------------------------------
 # SegmentedTrainer end-to-end
 # ---------------------------------------------------------------------------
 

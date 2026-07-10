@@ -372,7 +372,7 @@ class SegmentedTrainer:
             self.state.loss_history.append(loss_val)
 
             if self.state.step % self.cfg.train.log_every == 0:
-                lr = self.scheduler.get_last_lr()[0]
+                lr = float(self.scheduler.get_last_lr()[0])
                 log_metrics(self.state.step, loss=round(loss_val, 4), lr=round(lr, 6))
 
             if self._eval_every > 0 and self.state.step % self._eval_every == 0:

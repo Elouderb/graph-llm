@@ -1729,6 +1729,92 @@ def test_stacked_gate_losses_finite_and_gated_by_warmup() -> None:
     assert torch.isfinite(after) and float(after) > 0.0
 
 
+# --- N>=3 stage-wise middle-block warmup (card f7ffe653) ---------------------------------
+# The two-stage C strategy is RETRIEVE@block0 -> WALK@FINAL; for N>=3 the MIDDLE blocks
+# (1..n-2) must pass the retrieved value through to the walk stage.  The middle-block C target
+# is selectable; N=2 has no middle block, so the 2-block stage-wise warmup is byte-for-byte
+# unchanged regardless of the option.
+
+
+def test_stacked_middle_warmup_default_is_reason() -> None:
+    """Default preserves the pre-N-generalisation code path (all inner blocks C->reasoner)."""
+    assert TandemConfig().stacked_middle_warmup == "reason"
+
+
+def _sw_kind_tid() -> tuple[torch.Tensor, torch.Tensor]:
+    kind = torch.tensor([0, 1, 2, 0])  # M->mem, R->reason, P->mlp, C->mem (retrieve)
+    tid = torch.tensor([0, 1, 2, 3])   # ... with the last row a C example (type id 3)
+    return kind, tid
+
+
+def test_stacked_block_controls_3block_workhorse_middle() -> None:
+    """N=3 stage-wise, middle=workhorse: block0 RETRIEVE (C->mem), MIDDLE pass-through
+    (C->mlp workhorse), FINAL WALK (C->reason); M/R/P route to their specialist everywhere."""
+    cfg = TandemConfig(
+        tandem_blocks=3, stagewise_warmup=True, type_warmup=100,
+        stacked_middle_warmup="workhorse",
+    )
+    kind, tid = _sw_kind_tid()
+    fg, gm = _stacked_block_controls(cfg, step=10, kind=kind, type_id=tid)
+    assert fg[0] is not None and fg[0].tolist() == [0, 1, 2, 0]  # RETRIEVE (C->mem)
+    assert fg[1] is not None and fg[1].tolist() == [0, 1, 2, 2]  # MIDDLE (C->workhorse)
+    assert fg[2] is not None and fg[2].tolist() == [0, 1, 2, 1]  # WALK (C->reason)
+    assert gm == [False, False, False]
+    fg2, _ = _stacked_block_controls(cfg, step=200, kind=kind, type_id=tid)
+    assert fg2 == [None, None, None]  # released together at type_warmup
+
+
+def test_stacked_block_controls_3block_unforced_middle() -> None:
+    """N=3 stage-wise, middle=unforced: the middle block is NOT forced for any type (None),
+    while block0 RETRIEVE and FINAL WALK stay forced."""
+    cfg = TandemConfig(
+        tandem_blocks=3, stagewise_warmup=True, type_warmup=100,
+        stacked_middle_warmup="unforced",
+    )
+    kind, tid = _sw_kind_tid()
+    fg, _ = _stacked_block_controls(cfg, step=10, kind=kind, type_id=tid)
+    assert fg[0] is not None and fg[0].tolist() == [0, 1, 2, 0]
+    assert fg[1] is None                                          # middle free
+    assert fg[2] is not None and fg[2].tolist() == [0, 1, 2, 1]
+
+
+def test_stacked_block_controls_3block_reason_is_legacy_all_inner() -> None:
+    """N=3 stage-wise, middle=reason: every inner block forces C->reasoner (the exact pre-
+    generalisation control output)."""
+    cfg = TandemConfig(
+        tandem_blocks=3, stagewise_warmup=True, type_warmup=100,
+        stacked_middle_warmup="reason",
+    )
+    kind, tid = _sw_kind_tid()
+    fg, _ = _stacked_block_controls(cfg, step=10, kind=kind, type_id=tid)
+    assert fg[0] is not None and fg[0].tolist() == [0, 1, 2, 0]
+    assert fg[1] is not None and fg[1].tolist() == [0, 1, 2, 1]  # inner -> reasoner
+    assert fg[2] is not None and fg[2].tolist() == [0, 1, 2, 1]
+
+
+def test_stacked_block_controls_2block_identical_across_middle_warmup() -> None:
+    """N=2 has NO middle block: all three middle-warmup options give the IDENTICAL 2-block
+    control output (block0 C->mem, block1 == FINAL C->reason) — the byte-for-byte guarantee."""
+    kind, tid = _sw_kind_tid()
+    outs = []
+    for mw in ("reason", "workhorse", "unforced"):
+        cfg = TandemConfig(
+            tandem_blocks=2, stagewise_warmup=True, type_warmup=100, stacked_middle_warmup=mw
+        )
+        fg, gm = _stacked_block_controls(cfg, step=10, kind=kind, type_id=tid)
+        outs.append(([None if t is None else t.tolist() for t in fg], gm))
+    assert outs[0] == ([[0, 1, 2, 0], [0, 1, 2, 1]], [False, False])
+    assert all(o == outs[0] for o in outs)
+
+
+def test_resolve_stagewise_release_rejects_bad_middle_warmup() -> None:
+    """An unknown stacked_middle_warmup raises at the runtime guard (no silent bad schedule)."""
+    with pytest.raises(ValueError, match="stacked_middle_warmup"):
+        _resolve_stagewise_release(
+            TandemConfig(stagewise_warmup=True, type_warmup=100, stacked_middle_warmup="bogus")
+        )
+
+
 def test_build_tandem_model_wires_stacked_blocks_and_readback() -> None:
     """The trainer build path forwards tandem_blocks + readback into the model (composes CPU)."""
     from graph_llm.train.tandem import build_tandem_model

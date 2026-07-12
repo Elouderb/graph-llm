@@ -176,6 +176,23 @@ class TandemConfig:
     # REQUIRES ``type_warmup>0`` (the forced-decomposition window) — guarded by
     # ``_resolve_stagewise_release`` so there is no silent broken default.
     stagewise_warmup: bool = False
+    # MIDDLE-block type-warmup target for the compositional C type in a STAGE-WISE stack of
+    # N>=3 blocks (card f7ffe653).  The two-stage C strategy is retrieve@block0 -> walk@FINAL;
+    # for the MIDDLE blocks (1..n-2) the RETRIEVED value must survive to the walk stage.  This
+    # is a NO-OP for tandem_blocks<=2 (a 2-block stack has NO middle block: block 0 retrieves,
+    # block 1 == FINAL walks — so every 2-block stagewise run is byte-for-byte unchanged).
+    # Options (only the compositional C rows differ; M/R/P always route to their specialist at
+    # every forced block):
+    #   "reason"    — C->reasoner at every inner block (the pre-N-generalisation code path).
+    #                 DEFAULT: conservative / byte-for-byte for N>=3 too (nothing shipped ran a
+    #                 stage-wise N>=3 stack, so this preserves the exact prior control output).
+    #   "workhorse" — C->mlp workhorse at the middle blocks: the workhorse residual (h + f(h))
+    #                 PRESERVES the retrieved value through to the FINAL block's reasoner, which
+    #                 decodes WHICH chain to walk (card's try-FIRST design).
+    #   "unforced"  — the middle blocks are NOT forced for ANY type (free from step 0; the gate
+    #                 loss is still gated to type_warmup) — the FALLBACK that lets the middle
+    #                 block self-organise, and the free-routing probe for the REPORT deliverable.
+    stacked_middle_warmup: str = "reason"
     # NON-stagewise inner-gate warmup (rung a, the FAILED mitigation kept for the ablation):
     # inner blocks train under a uniform forced-mix for this many steps, then release.
     inner_mix_warmup: int = 1000
@@ -304,7 +321,9 @@ def _resolve_ramp_delay(cfg: TandemConfig) -> int:
 # type: M->mem(0), R->reason(1), P->mlp(2), C->mem(0) (RETRIEVE); the stage-wise inner blocks
 # force C->reason(1) (WALK the retrieved chain).
 _TYPE_ID_C = 3
-_INNER_C_EXPERT = 1  # reasoner
+_INNER_C_EXPERT = 1   # reasoner (the FINAL block's WALK stage; legacy all-inner target)
+_MIDDLE_C_EXPERT = 2  # mlp workhorse (residual pass-through of the retrieved value)
+_MIDDLE_WARMUP_CHOICES = ("reason", "workhorse", "unforced")
 
 
 def _resolve_stagewise_release(cfg: TandemConfig) -> int:
@@ -328,29 +347,53 @@ def _resolve_stagewise_release(cfg: TandemConfig) -> int:
             "commits BOTH gates at once); with type_warmup=0 the two-stage compositional "
             "strategy cannot bootstrap (card 3ac77deb).  Set a positive type_warmup."
         )
+    if cfg.stacked_middle_warmup not in _MIDDLE_WARMUP_CHOICES:
+        raise ValueError(
+            f"stacked_middle_warmup must be one of {_MIDDLE_WARMUP_CHOICES}, got "
+            f"{cfg.stacked_middle_warmup!r} (card f7ffe653)."
+        )
     return cfg.type_warmup
 
 
 def _stacked_block_controls(
     cfg: TandemConfig, step: int, kind: torch.Tensor, type_id: torch.Tensor
 ) -> tuple[list[torch.Tensor | None], list[bool]]:
-    """Per-block ``(force_gate, gate_mix)`` for a stacked training step (card 3ac77deb).
+    """Per-block ``(force_gate, gate_mix)`` for a stacked training step (card 3ac77deb / f7ffe653).
 
-    STAGE-WISE: during ``type_warmup`` force the KNOWN decomposition at BOTH gates — block 0
-    to ``kind`` (M->mem, R->reason, P->mlp, C->mem RETRIEVE), inner blocks to ``kind`` but
-    with C->reason (WALK the retrieved chain) — then both release together.  DEFAULT (rung a):
-    block 0 type-warmup; inner blocks uniform forced-mix until ``inner_mix_warmup``, then free.
+    STAGE-WISE (N>=2 blocks): during ``type_warmup`` force the KNOWN decomposition at every gate,
+    then release them together at ``type_warmup``.  The compositional C strategy is a TWO-stage
+    pipeline — RETRIEVE the head across the segment boundary (memory), then WALK the chain it
+    heads (reasoner) — so the forced targets are stage-shaped:
+      * block 0 (RETRIEVE): ``kind`` (M->mem, R->reason, P->mlp, C->mem).
+      * FINAL block n-1 (WALK): ``kind`` but C->reasoner (decode which chain to walk).
+      * MIDDLE blocks 1..n-2 (PASS-THROUGH, only for N>=3): the retrieved value must survive to
+        the walk stage; selected by ``cfg.stacked_middle_warmup`` — "workhorse" (C->mlp residual
+        pass-through), "reason" (legacy C->reasoner at every inner block), or "unforced" (the
+        middle blocks are not forced for any type, so they self-organise).
+    For N=2 there is NO middle block (block 0 retrieves, block 1 == FINAL walks), so this is
+    byte-for-byte the shipped 2-block stage-wise warmup regardless of ``stacked_middle_warmup``.
+    DEFAULT (rung a, non-stagewise): block 0 type-warmup; inner blocks uniform forced-mix until
+    ``inner_mix_warmup``, then free.
     """
     n = int(cfg.tandem_blocks)
     force_gate: list[torch.Tensor | None] = [None] * n
     gate_mix: list[bool] = [False] * n
     if cfg.stagewise_warmup:
         if step < cfg.type_warmup:
-            force_gate[0] = kind
-            inner = kind.clone()
-            inner[type_id == _TYPE_ID_C] = _INNER_C_EXPERT  # C -> reasoner at inner blocks
-            for bi in range(1, n):
-                force_gate[bi] = inner
+            force_gate[0] = kind  # RETRIEVE (C -> mem)
+            walk = kind.clone()
+            walk[type_id == _TYPE_ID_C] = _INNER_C_EXPERT  # FINAL block: C -> reasoner (WALK)
+            force_gate[n - 1] = walk
+            # MIDDLE blocks 1..n-2 (only present for N>=3): pass the retrieved value through.
+            if cfg.stacked_middle_warmup != "unforced":
+                mid_expert = (
+                    _MIDDLE_C_EXPERT if cfg.stacked_middle_warmup == "workhorse"
+                    else _INNER_C_EXPERT  # "reason"
+                )
+                mid = kind.clone()
+                mid[type_id == _TYPE_ID_C] = mid_expert
+                for bi in range(1, n - 1):
+                    force_gate[bi] = mid
     else:
         if step < cfg.type_warmup:
             force_gate[0] = kind

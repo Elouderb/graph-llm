@@ -455,6 +455,47 @@ class ModelConfig:
     # default-off flag with no behavioural change.
     stacked_reason_threshold: float = 0.0
 
+    # --- Per-block capacity heterogeneity: capacity ramps across the stack (card 197c6707) ---
+    # OPTIONAL per-block override LISTS for the stacked-tandem stack (tandem_blocks >= 2).  The
+    # depth-mechanism gate (card f7ffe653) found that only the FINAL block reliably learns the
+    # clean type->expert map and that middle-block reasoners atrophy in free LM training — so the
+    # user's design direction is a CAPACITY RAMP: bias MEMORY toward EARLY blocks (heads larger
+    # up front, shrinking with depth) and REASONING toward LATE blocks (absent/minimal early, full
+    # at the final block), with the per-position workhorse/FFN held CONSTANT per block.  These
+    # lists express that ramp without touching the homogeneous default.
+    #
+    # Each list, when not ``None``, must have length == ``tandem_blocks`` and hold values >= 1
+    # (positivity is validated in ``delta_memory_lm._build_stacked`` alongside the length check).
+    # ``None`` (the default for ALL of them) == HOMOGENEOUS: every block reads the shared
+    # ``delta_*``/``causal_reasoner_steps`` scalars exactly as before, so the stacked build is
+    # BYTE-FOR-BYTE (``torch.equal``) the committed backbone (the per-block config object is the
+    # SAME ``ModelConfig`` instance when no list applies -> identical construction + RNG).  They
+    # are inert when the stack is not built (tandem off / tandem_blocks == 1), like every other
+    # ``stacked_*`` flag.  ``d_model`` is NOT per-block (the residual stream + fusion + gate are
+    # shared width); only the memory's internal head geometry and the reasoner's walk depth ramp.
+    #
+    # Per-block MEMORY head geometry — each block's ``GatedDeltaMemory`` reads these instead of the
+    # shared ``delta_n_heads``/``delta_head_k_dim``/``delta_head_v_dim``.  The memory ``out_proj``
+    # still maps back to ``d_model`` at every block, so heterogeneous head counts/dims never change
+    # the fused residual-stream width; the per-block carried :class:`DeltaMemoryState` matrix simply
+    # has a per-block ``(B, H_i, d_k_i, d_v_i)`` shape (the state carry is already shape-agnostic).
+    stacked_mem_heads: list[int] | None = None    # per-block delta_n_heads (memory-heavy early)
+    stacked_mem_k_dim: list[int] | None = None    # per-block delta_head_k_dim (per-head key/query)
+    stacked_mem_v_dim: list[int] | None = None    # per-block delta_head_v_dim (per-head value)
+    # Per-block reasoner PRESENCE.  When not ``None`` this OVERRIDES the ``stacked_inner_mode``
+    # -derived reason flags (``mix`` -> all True; ``asym`` -> [False..False, True]) with an
+    # EXPLICIT per-block boolean list, so an arbitrary ramp is expressible (e.g. depth-4
+    # ``[True, False, False, True]`` = a minimal block-0 reasoner, no walk in the middle blocks,
+    # a full walk at the final block — the HET hypothesis that middle blocks which CANNOT walk
+    # remove the non-composing routing basins depth 4 fell into).  A block with reasoner disabled
+    # builds NO reasoner and its 3-way gate masks the reason expert (the existing ``asym`` path).
+    stacked_reason_blocks: list[bool] | None = None
+    # Per-block reasoner SIZE — walk depth K (``causal_reasoner_steps``) per block, for the "small
+    # early, large late" ramp.  Only meaningful for blocks that actually build a reasoner (a value
+    # for a reason-disabled block is inert); ``None`` == the shared ``causal_reasoner_steps`` at
+    # every block.
+    stacked_reason_steps: list[int] | None = None
+
     # --- Optional bounded cross-attention READBACK between block 0 and block 1 (card 3ac77deb) ---
     # A small bounded strictly-causal cross-attention that re-grounds block-1's input in the
     # surface (front-end) embeddings block-0's fusion may have abstracted away: Q = block-0

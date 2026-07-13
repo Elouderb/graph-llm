@@ -36,6 +36,7 @@ Contracts honoured (zero trainer changes):
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Literal, cast, overload
 
 import torch
@@ -342,6 +343,25 @@ class DeltaMemoryLM(nn.Module):
         reason_flags = [True] * n_blocks
         if inner_mode == "asym" and n_blocks > 1:
             reason_flags = [False] * (n_blocks - 1) + [True]
+        # Per-block capacity heterogeneity (card 197c6707): OPTIONAL per-block override lists for
+        # the memory head geometry, the reasoner presence, and the reasoner walk depth.  Each is
+        # validated (length == n_blocks; values >= 1) here — fail-loud like stacked_inner_mode —
+        # and threaded into the per-block ModelConfig by ``_stacked_block_cfg`` below.  All-None
+        # (the default) leaves ``reason_flags`` and the per-block cfg exactly as the homogeneous
+        # build, so the stacked construction stays byte-for-byte.
+        self._mem_heads = self._validate_block_list(m, "stacked_mem_heads", n_blocks)
+        self._mem_k_dim = self._validate_block_list(m, "stacked_mem_k_dim", n_blocks)
+        self._mem_v_dim = self._validate_block_list(m, "stacked_mem_v_dim", n_blocks)
+        self._reason_steps = self._validate_block_list(m, "stacked_reason_steps", n_blocks)
+        reason_blocks = getattr(m, "stacked_reason_blocks", None)
+        if reason_blocks is not None:
+            if len(reason_blocks) != n_blocks:
+                raise ValueError(
+                    f"stacked_reason_blocks length {len(reason_blocks)} != tandem_blocks "
+                    f"{n_blocks}."
+                )
+            # Explicit per-block presence OVERRIDES the inner_mode-derived flags (arbitrary ramp).
+            reason_flags = [bool(v) for v in reason_blocks]
         reads_hidden = bool(getattr(m, "stacked_reason_reads_hidden", False))
         gate_per_channel = bool(getattr(m, "stacked_gate_per_channel", False))
         gate_input_routed = bool(getattr(m, "stacked_gate_input_routed", False))
@@ -349,7 +369,10 @@ class DeltaMemoryLM(nn.Module):
         self.stacked_blocks = nn.ModuleList(
             [
                 StackedTandemBlock(
-                    m,
+                    # Per-block ModelConfig: the SAME ``m`` when no per-block list applies (-> the
+                    # homogeneous build is byte-for-byte), else ``m`` with this block's memory
+                    # head geometry / reasoner walk depth overridden (card 197c6707).
+                    self._stacked_block_cfg(m, i),
                     reason_enabled=reason_flags[i],
                     gate_bias_init=m.stacked_gate_bias_init,
                     mlp_ff_mult=m.stacked_mlp_ff_mult,
@@ -372,6 +395,52 @@ class DeltaMemoryLM(nn.Module):
         # __init__) — so its construction-time RNG never shifts the deterministic re-init
         # of the shared embed / delta stack / head.  With that isolation + its own zero-init
         # output, readback-on == readback-off at step 0 EXACTLY.
+
+    @staticmethod
+    def _validate_block_list(
+        m: ModelConfig, field: str, n_blocks: int
+    ) -> list[int] | None:
+        """Validate an OPTIONAL per-block positive-int override list (card 197c6707).
+
+        Returns the list unchanged, or ``None`` when the field is unset (the homogeneous
+        default).  A provided list must have length ``n_blocks`` and hold values >= 1 — fail
+        loudly (mirroring ``stacked_inner_mode``) rather than silently truncate/pad or accept a
+        non-positive head/dim/step that would only surface as an opaque shape error later.
+        """
+        value = getattr(m, field, None)
+        if value is None:
+            return None
+        if len(value) != n_blocks:
+            raise ValueError(f"{field} length {len(value)} != tandem_blocks {n_blocks}.")
+        if any(int(v) < 1 for v in value):
+            raise ValueError(f"{field} values must be >= 1, got {list(value)}.")
+        return [int(v) for v in value]
+
+    def _stacked_block_cfg(self, m: ModelConfig, i: int) -> ModelConfig:
+        """The per-block :class:`ModelConfig` for stacked block ``i`` (card 197c6707).
+
+        Returns the SAME ``m`` object when NO per-block override list applies (so the
+        homogeneous build constructs each :class:`StackedTandemBlock` from the identical config
+        -> identical RNG -> byte-for-byte ``torch.equal`` with HEAD).  When any of the memory
+        head-geometry / reasoner-depth lists is set, returns a shallow ``dataclasses.replace`` of
+        ``m`` with THIS block's ``delta_n_heads`` / ``delta_head_k_dim`` / ``delta_head_v_dim`` /
+        ``causal_reasoner_steps`` overridden (``d_model`` and every other field are shared).  The
+        block's ``GatedDeltaMemory`` reads the overridden delta dims; a reason-enabled block's
+        ``ComposableCausalReasoner`` reads the overridden walk depth (inert for a reason-disabled
+        block, which builds no reasoner).
+        """
+        overrides: dict[str, int] = {}
+        if self._mem_heads is not None:
+            overrides["delta_n_heads"] = self._mem_heads[i]
+        if self._mem_k_dim is not None:
+            overrides["delta_head_k_dim"] = self._mem_k_dim[i]
+        if self._mem_v_dim is not None:
+            overrides["delta_head_v_dim"] = self._mem_v_dim[i]
+        if self._reason_steps is not None:
+            overrides["causal_reasoner_steps"] = self._reason_steps[i]
+        if not overrides:
+            return m
+        return replace(m, **overrides)
 
     def _init_weights(self, m: ModelConfig) -> None:
         """GPT-2 style init with depth-aware residual-projection scaling.

@@ -2656,3 +2656,230 @@ def test_build_tandem_model_wires_input_routed_gate() -> None:
     )
     for blk in on.stacked_blocks:  # type: ignore[attr-defined]
         assert blk.gate_input_routed is True and blk.gate.in_features == 3 * on.d_model
+
+
+# ---------------------------------------------------------------------------
+# PER-BLOCK CAPACITY HETEROGENEITY: capacity ramps across the stack (card 197c6707)
+# ---------------------------------------------------------------------------
+# OPTIONAL per-block override lists (memory heads/dims, reasoner presence, reasoner walk depth)
+# for the stacked-tandem stack.  Default None == homogeneous == byte-for-byte the committed
+# backbone; a set list is length-validated (== tandem_blocks) and positivity-validated, and each
+# block's GatedDeltaMemory / reasoner is built from THAT block's overridden dims.  The workhorse/
+# FFN stays constant per block (the user's design sketch).
+
+
+def test_stacked_capacity_lists_default_to_none() -> None:
+    """All five per-block capacity knobs are None (homogeneous) by default."""
+    c = ModelConfig()
+    assert c.stacked_mem_heads is None
+    assert c.stacked_mem_k_dim is None
+    assert c.stacked_mem_v_dim is None
+    assert c.stacked_reason_blocks is None
+    assert c.stacked_reason_steps is None
+
+
+def test_stacked_capacity_redundant_lists_are_byte_for_byte() -> None:
+    """Per-block lists that merely RESTATE the shared scalars build byte-for-byte identical to
+    NOT passing them: ``_stacked_block_cfg`` returns an equal-valued cfg, so construction + RNG +
+    every parameter + the forward logits match (the ``torch.equal`` default-off discipline)."""
+    torch.manual_seed(0)
+    plain = build_model(_full_cfg(_stk_cfg(tandem_blocks=2)))
+    torch.manual_seed(0)
+    redundant = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=2,
+        stacked_mem_heads=[4, 4],       # == _mem_cfg delta_n_heads
+        stacked_mem_k_dim=[16, 16],     # == delta_head_k_dim
+        stacked_mem_v_dim=[16, 16],     # == delta_head_v_dim
+        stacked_reason_steps=[4, 4],    # == _on_cfg causal_reasoner_steps
+    )))
+    assert set(plain.state_dict()) == set(redundant.state_dict())
+    assert plain.num_parameters() == redundant.num_parameters()
+    ps, rs = plain.state_dict(), redundant.state_dict()
+    assert all(torch.equal(ps[k], rs[k]) for k in ps), "redundant capacity lists perturbed a param"
+    plain.eval()
+    redundant.eval()
+    x = torch.randint(1, 256, (2, 24))
+    with torch.no_grad():
+        _, la = plain(x)
+        _, lb = redundant(x)
+    assert torch.equal(la, lb), "redundant per-block capacity lists are not a byte-for-byte no-op"
+
+
+def test_stacked_per_block_mem_heads_and_dims_applied() -> None:
+    """Each block's GatedDeltaMemory is built from THAT block's overridden head geometry (the
+    memory-heavy-early ramp), while the fused residual width (d_model) stays uniform."""
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=3,
+        stacked_mem_heads=[8, 4, 2],
+        stacked_mem_k_dim=[16, 12, 8],
+        stacked_mem_v_dim=[16, 12, 8],
+    )))
+    heads = [blk.mem.n_heads for blk in on.stacked_blocks]
+    dks = [blk.mem.d_k for blk in on.stacked_blocks]
+    dvs = [blk.mem.d_v for blk in on.stacked_blocks]
+    assert heads == [8, 4, 2]
+    assert dks == [16, 12, 8]
+    assert dvs == [16, 12, 8]
+    # the memory out_proj still maps back to the shared residual width at every block.
+    for blk in on.stacked_blocks:
+        assert blk.mem.out_proj.out_features == on.d_model
+
+
+def test_stacked_hetero_state_carry_shapes_roundtrip() -> None:
+    """The per-block carried DeltaMemoryState matrix has this block's OWN (B, H_i, d_k_i, d_v_i)
+    shape, and feeding a heterogeneous states list back in on the next segment runs cleanly (the
+    state carry is shape-agnostic — no homogeneous-head assumption)."""
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=3,
+        stacked_mem_heads=[8, 4, 2],
+        stacked_mem_k_dim=[16, 12, 8],
+        stacked_mem_v_dim=[16, 12, 8],
+    )))
+    on.eval()
+    b, t = 2, 24
+    x = torch.randint(1, 256, (b, t))
+    with torch.no_grad():
+        _loss, _logits, states = on(x, None, None, True)
+    assert len(states) == 3
+    expected = [(b, 8, 16, 16), (b, 4, 12, 12), (b, 2, 8, 8)]
+    assert [tuple(s.memory.shape) for s in states] == expected
+    # roundtrip: the heterogeneous carried states seed the next segment without a shape error.
+    with torch.no_grad():
+        x2 = torch.randint(1, 256, (b, t))
+        _l2, _lg2, states2 = on(x2, None, states, True)
+    assert [tuple(s.memory.shape) for s in states2] == expected
+
+
+def test_stacked_hetero_lm_leak_probe_exactly_zero() -> None:
+    """A heterogeneous stack (memory ramp + reasoner only in the final block) stays EXACTLY
+    causal on the plain LM path — the ramp changes capacity, not causality."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=3, reasoning_segment_len=64,
+        stacked_mem_heads=[8, 4, 2],
+        stacked_reason_blocks=[False, False, True],
+    )))
+    x = torch.randint(1, 256, (2, 48))
+    assert _lm_leak_maxdiff(on, x, t_pert=19) == 0.0
+
+
+def test_stacked_hetero_stacked_step_leak_probe_exactly_zero() -> None:
+    """The heterogeneous stack is leak-free at the prediction position on the stacked_step path
+    (memory ramp + final-block-only reasoner)."""
+    torch.manual_seed(1)
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=3, reasoning_segment_len=64,
+        stacked_mem_heads=[8, 4, 2],
+        stacked_reason_blocks=[False, False, True],
+    )))
+    seg = torch.randint(1, 256, (2, 2, 44))
+    ans = torch.tensor([28, 20])
+    assert _stacked_leak_maxdiff(on, seg, 1, ans, steps=4) == 0.0
+
+
+def test_stacked_reason_blocks_overrides_inner_mode() -> None:
+    """An explicit per-block reasoner-presence list OVERRIDES the inner_mode-derived flags — in
+    both directions (turning an inner block ON under mix; turning inner blocks ON under asym)."""
+    # mix would give [T, T, T]; the list forces the middle block OFF.
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=3, stacked_reason_blocks=[True, False, True],
+    )))
+    assert [blk.reasoner is not None for blk in on.stacked_blocks] == [True, False, True]
+    # asym would give [F, F, T]; the list forces every block ON (the override wins).
+    on2 = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=3, stacked_inner_mode="asym", stacked_reason_blocks=[True, True, True],
+    )))
+    assert [blk.reasoner is not None for blk in on2.stacked_blocks] == [True, True, True]
+
+
+def test_stacked_reason_absent_blocks_build_no_reasoner_params() -> None:
+    """A reason-disabled block builds NO reasoner module and contributes NO reasoner params /
+    state_dict keys (the missing-reasoner middle blocks are genuinely absent, not dead weight)."""
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=3, stacked_reason_blocks=[False, False, True],
+    )))
+    assert on.stacked_blocks[0].reasoner is None
+    assert on.stacked_blocks[1].reasoner is None
+    assert on.stacked_blocks[2].reasoner is not None
+    sd = on.state_dict()
+    assert not any(k.startswith("stacked_blocks.0.reasoner") for k in sd)
+    assert not any(k.startswith("stacked_blocks.1.reasoner") for k in sd)
+    assert any(k.startswith("stacked_blocks.2.reasoner") for k in sd)
+
+
+def test_stacked_per_block_reason_steps_applied() -> None:
+    """The reasoner walk depth K ramps per block (small early, large late); a value for a
+    reason-DISABLED block is inert (no reasoner is built there)."""
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=3,
+        stacked_reason_blocks=[True, False, True],
+        stacked_reason_steps=[3, 9, 12],
+    )))
+    assert on.stacked_blocks[0].reasoner is not None
+    assert on.stacked_blocks[0].reasoner.steps == 3
+    assert on.stacked_blocks[1].reasoner is None            # steps[1]=9 is inert (no reasoner)
+    assert on.stacked_blocks[2].reasoner is not None
+    assert on.stacked_blocks[2].reasoner.steps == 12
+
+
+def test_stacked_hetero_finite_grads_reach_present_modules() -> None:
+    """A stacked answer-CE loss sends finite non-zero grads to EVERY present module: the memory
+    + gate of every block, and the reasoner of the (present) final block; the absent-reasoner
+    blocks have no reasoner to check."""
+    torch.manual_seed(0)
+    on = build_model(_full_cfg(_stk_cfg(
+        tandem_blocks=3,
+        stacked_mem_heads=[8, 4, 2],
+        stacked_reason_blocks=[False, False, True],
+    )))
+    on.train()
+    b, n_seg, length = 4, 2, 32
+    seg = torch.randint(1, 256, (b, n_seg, length))
+    ans = torch.full((b,), length - 2)
+    tgt = torch.randint(0, 256, (b,))
+    out = on.stacked_step(seg, 1, ans, steps=4, tf_seed=ans - 1)
+    loss = torch.nn.functional.cross_entropy(out["logits"], tgt)
+    loss = loss + torch.nn.functional.cross_entropy(
+        out["aux"]["seed_logits"], (ans - 1).clamp(0, length - 1)
+    )
+    loss.backward()
+
+    def _has_grad(mod: torch.nn.Module) -> bool:
+        return any(
+            p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
+            for p in mod.parameters()
+            if p.requires_grad
+        )
+
+    for blk in on.stacked_blocks:
+        assert _has_grad(blk.mem), "no grad reached a heterogeneous block memory"
+        assert _has_grad(blk.gate), "no grad reached a heterogeneous block gate"
+    assert on.stacked_blocks[2].reasoner is not None
+    assert _has_grad(on.stacked_blocks[2].reasoner), "no grad reached the final-block reasoner"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["stacked_mem_heads", "stacked_mem_k_dim", "stacked_mem_v_dim", "stacked_reason_steps"],
+)
+def test_stacked_capacity_list_length_mismatch_raises(field: str) -> None:
+    """A per-block list whose length != tandem_blocks raises (no silent truncate/pad)."""
+    with pytest.raises(ValueError, match=field):
+        build_model(_full_cfg(_stk_cfg(tandem_blocks=3, **{field: [8, 4]})))
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["stacked_mem_heads", "stacked_mem_k_dim", "stacked_mem_v_dim", "stacked_reason_steps"],
+)
+def test_stacked_capacity_list_nonpositive_raises(field: str) -> None:
+    """A per-block list with a value < 1 raises (a zero/negative head/dim/step is caught early,
+    not left to surface as an opaque shape error)."""
+    with pytest.raises(ValueError, match=field):
+        build_model(_full_cfg(_stk_cfg(tandem_blocks=3, **{field: [8, 0, 4]})))
+
+
+def test_stacked_reason_blocks_length_mismatch_raises() -> None:
+    """A per-block reasoner-presence list whose length != tandem_blocks raises."""
+    with pytest.raises(ValueError, match="stacked_reason_blocks"):
+        build_model(_full_cfg(_stk_cfg(tandem_blocks=3, stacked_reason_blocks=[True, False])))

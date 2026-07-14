@@ -2883,3 +2883,28 @@ def test_stacked_reason_blocks_length_mismatch_raises() -> None:
     """A per-block reasoner-presence list whose length != tandem_blocks raises."""
     with pytest.raises(ValueError, match="stacked_reason_blocks"):
         build_model(_full_cfg(_stk_cfg(tandem_blocks=3, stacked_reason_blocks=[True, False])))
+
+
+def test_build_tandem_model_wires_per_block_capacity() -> None:
+    """build_tandem_model forwards the per-block capacity lists (card 197c6707) into the model:
+    the HET-3 shape (memory ramp + reasoner only in the final block) is reflected in the built
+    stacked blocks; default None stays homogeneous."""
+    from graph_llm.train.tandem import build_tandem_model
+
+    het = build_tandem_model(
+        TandemConfig(
+            tandem_blocks=3, stacked_inner_mode="mix", seg_len=32,
+            stacked_mem_heads=(12, 8, 6),
+            stacked_reason_blocks=(False, False, True),
+        ),
+        torch.device("cpu"),
+    )
+    assert [blk.mem.n_heads for blk in het.stacked_blocks] == [12, 8, 6]  # type: ignore[attr-defined]
+    assert [blk.reasoner is not None for blk in het.stacked_blocks] == [False, False, True]  # type: ignore[attr-defined]
+    # default: homogeneous (the shared delta_n_heads at every block, a reasoner everywhere).
+    homo = build_tandem_model(
+        TandemConfig(tandem_blocks=3, stacked_inner_mode="mix", seg_len=32, delta_n_heads=4),
+        torch.device("cpu"),
+    )
+    assert [blk.mem.n_heads for blk in homo.stacked_blocks] == [4, 4, 4]  # type: ignore[attr-defined]
+    assert all(blk.reasoner is not None for blk in homo.stacked_blocks)  # type: ignore[attr-defined]

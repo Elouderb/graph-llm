@@ -193,6 +193,22 @@ class TandemConfig:
     #                 loss is still gated to type_warmup) — the FALLBACK that lets the middle
     #                 block self-organise, and the free-routing probe for the REPORT deliverable.
     stacked_middle_warmup: str = "reason"
+    # --- PER-BLOCK CAPACITY HETEROGENEITY: capacity ramps across the stack (card 197c6707) ---
+    # OPTIONAL per-block override lists forwarded verbatim into the model's ``ModelConfig`` (see
+    # config.py): memory head geometry (``stacked_mem_heads`` / ``_k_dim`` / ``_v_dim``), per-block
+    # reasoner PRESENCE (``stacked_reason_blocks``, overriding the inner_mode-derived flags), and
+    # per-block reasoner walk depth (``stacked_reason_steps``).  ``None`` (default) == HOMOGENEOUS —
+    # every block reads the shared ``delta_n_heads``/``delta_head_dim``/``k_train`` scalars, so the
+    # stacked build is byte-for-byte the committed backbone.  A set list must have length
+    # ``tandem_blocks`` (validated in the model's ``_build_stacked``).  IMPORTANT (card ruling 2):
+    # a reason-DISABLED block cannot walk, so ``_stacked_block_controls`` must not FORCE it to the
+    # reason expert — the harness remaps every reason target (R and C rows) to the workhorse at
+    # reason-less blocks during the stage-wise warmup.
+    stacked_mem_heads: tuple[int, ...] | None = None
+    stacked_mem_k_dim: tuple[int, ...] | None = None
+    stacked_mem_v_dim: tuple[int, ...] | None = None
+    stacked_reason_blocks: tuple[bool, ...] | None = None
+    stacked_reason_steps: tuple[int, ...] | None = None
     # NON-stagewise inner-gate warmup (rung a, the FAILED mitigation kept for the ablation):
     # inner blocks train under a uniform forced-mix for this many steps, then release.
     inner_mix_warmup: int = 1000
@@ -489,6 +505,18 @@ def build_tandem_model(cfg: TandemConfig, device: torch.device) -> torch.nn.Modu
         # Stacked-tandem topology (card 3ac77deb): a no-op at the default tandem_blocks=1.
         tandem_blocks=cfg.tandem_blocks,
         stacked_inner_mode=cfg.stacked_inner_mode,
+        # Per-block capacity heterogeneity (card 197c6707): forwarded verbatim; None == homogeneous
+        # (byte-for-byte).  Lists are validated (length == tandem_blocks, values >= 1) in the
+        # model's ``_build_stacked``.
+        stacked_mem_heads=(list(cfg.stacked_mem_heads) if cfg.stacked_mem_heads is not None else None),
+        stacked_mem_k_dim=(list(cfg.stacked_mem_k_dim) if cfg.stacked_mem_k_dim is not None else None),
+        stacked_mem_v_dim=(list(cfg.stacked_mem_v_dim) if cfg.stacked_mem_v_dim is not None else None),
+        stacked_reason_blocks=(
+            list(cfg.stacked_reason_blocks) if cfg.stacked_reason_blocks is not None else None
+        ),
+        stacked_reason_steps=(
+            list(cfg.stacked_reason_steps) if cfg.stacked_reason_steps is not None else None
+        ),
         # Input-routed stacked gate (card 75ada834): a no-op at the default False.
         stacked_gate_input_routed=cfg.stacked_gate_input_routed,
         tandem_readback=cfg.readback,
